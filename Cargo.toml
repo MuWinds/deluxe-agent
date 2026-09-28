@@ -1,0 +1,110 @@
+[package]
+name = "desktop-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "A lightweight desktop GUI agent that drives local tools with an OpenAI-compatible model."
+license = "MIT"
+
+[[bin]]
+name = "desktop-agent"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui_extras = { version = "0.36", features = ["syntect"] }
+# Tracks egui's major version, and ships the icon font inside the crate — so
+# there is no font asset to vendor and no codepoint table to keep in sync.
+egui-phosphor = "0.14"
+
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "net",
+    "process",
+    "fs",
+    "io-util",
+] }
+tokio-util = "0.7"
+
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Image reading. `read_image` needs to shrink an oversized image before it goes
+# to the provider, which means decoding it — and these two decoders are already
+# compiled into this binary (`eframe` and `arboard` pull them in through
+# `image`/`tiff`), so declaring them directly adds no crate. Only the resample
+# and the re-encode are written here, in `image_ops`.
+base64 = "0.22"
+png = "0.18"
+zune-jpeg = "0.5"
+
+regex = "1"
+globset = "0.4"
+walkdir = "2"
+directories = "6"
+rfd = "0.15"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Clipboard image paste. egui-winit already pulls arboard in for text, but only
+# with `image-data` enabled does `Clipboard::get_image` exist — which is what
+# reading a screenshot out of the clipboard needs. `file_list` (pasted file
+# paths, the CF_HDROP case) is core, no feature needed.
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+# Secret storage is per-platform. Declaring it per target keeps the Linux
+# secret-service stack out of the Windows build, where it would be dead weight.
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+keyring = { version = "3", default-features = false, features = ["sync-secret-service"] }
+
+# Deliberately no `panic = "abort"`: a panic inside a tokio worker would take
+# the whole process down, and this process owns the window.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+strip = true
+
+# Ctrl+V on an image needs the key *press*, and egui-winit 0.36.2 swallows it:
+# its paste branch reads only the clipboard's text format and then `return`s, so
+# with an image on the clipboard nothing reaches egui and the chord is invisible
+# to the app — there is no way to work around it from above.
+#
+# `vendor/egui-winit` is 0.36.2 with that one `return` removed (marked in its
+# `src/lib.rs`), so the press arrives as an ordinary `Event::Key` and
+# `App::intake_pasted_images` reads the image itself. Its text paste is
+# untouched, so nothing else changes.
+#
+# Drop this patch — and the vendored copy — the moment we are on a release
+# carrying https://github.com/emilk/egui/pull/8472: it emits
+# `egui::Event::PasteImage` from that same branch, which is this done upstream.
+[patch.crates-io]
+egui-winit = { path = "vendor/egui-winit" }

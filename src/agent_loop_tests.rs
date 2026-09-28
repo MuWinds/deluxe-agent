@@ -1,0 +1,1469 @@
+//! End-to-end tests for the agent loop, driven by a scripted SSE server.
+//!
+//! The unit tests in `llm` and `tools` cover the pieces in isolation. What is
+//! only testable here is the wiring: that a streamed tool call is reassembled,
+//! executed against the real filesystem, fed back as a `tool` message, and that
+//! the run stops when the model answers without calling a tool.
+//!
+//! The server is a raw `TcpListener` rather than a mock of `LlmClient`, because
+//! the interesting failures — a fragmented `arguments` string, a body that
+//! arrives in several reads — only exist on the wire.
+
+use std::sync::{Arc, Mutex};
+
+use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
+
+use crate::agent::{Agent, EventSink, RunRequest};
+use crate::attachments::ImageRef;
+use crate::context::ContextSettings;
+use crate::error::AgentError;
+use crate::ipc::{AuditOutcome, Event};
+use crate::llm::{LlmClient, Message};
+use crate::plugins::{hooks, LoadedPlugin, PluginManifest, Scope};
+use crate::tools::{to_openai_tools, ToolRegistry, ToolSettings};
+
+/// Collects everything the agent emits, so a test can assert on the sequence.
+#[derive(Default)]
+struct CollectingSink {
+    events: Mutex<Vec<Event>>,
+}
+
+impl CollectingSink {
+    fn events(&self) -> Vec<Event> {
+        self.events
+            .lock()
+            .expect("the sink lock is not poisoned")
+            .clone()
+    }
+
+    /// Every tool outcome, in the order the calls finished.
+    fn outcomes(&self) -> Vec<AuditOutcome> {
+        self.events()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::ToolFinished { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The concatenation of every streamed text fragment.
+    fn transcript(&self) -> String {
+        self.events()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::AssistantDelta { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The outcome and result text of the first finished call with this name.
+    fn tool_output(&self, name: &str) -> Option<(AuditOutcome, String)> {
+        let call_id = self.events().into_iter().find_map(|event| match event {
+            Event::ToolStarted {
+                call_id,
+                name: started,
+                ..
+            } if started == name => Some(call_id),
+            _ => None,
+        })?;
+
+        self.events().into_iter().find_map(|event| match event {
+            Event::ToolFinished {
+                call_id: finished,
+                outcome,
+                output,
+                ..
+            } if finished == call_id => Some((outcome, output)),
+            _ => None,
+        })
+    }
+
+    /// Every image any finished call carried, in the order the calls finished.
+    fn images(&self) -> Vec<ImageRef> {
+        self.events()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::ToolFinished { images, .. } => Some(images),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+}
+
+impl EventSink for CollectingSink {
+    fn emit(&self, event: Event) {
+        self.events
+            .lock()
+            .expect("the sink lock is not poisoned")
+            .push(event);
+    }
+}
+
+/// A fake OpenAI-compatible endpoint that replays one scripted body per request.
+///
+/// Requests are answered in order, so a test scripts the whole conversation up
+/// front: turn one, turn two, and so on.
+struct FakeServer {
+    base_url: String,
+    /// The body of every request received, in order. Tests assert on these to
+    /// check what the agent actually sent, not merely that something was sent.
+    requests: Arc<Mutex<Vec<String>>>,
+    /// The indices whose request is answered with a bare 500 instead of its
+    /// scripted body. Shared with the accept loop, so a test can arm it after
+    /// `start` returns.
+    failing: Arc<Mutex<Vec<usize>>>,
+}
+
+impl FakeServer {
+    /// Starts the server and returns it alongside a task that must stay alive
+    /// for the duration of the test.
+    async fn start(bodies: Vec<String>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port must be available");
+        let port = listener
+            .local_addr()
+            .expect("the listener has an address")
+            .port();
+
+        let requests: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = requests.clone();
+        let failing: Arc<Mutex<Vec<usize>>> = Arc::default();
+        let failure_gate = failing.clone();
+
+        tokio::spawn(async move {
+            for body in bodies {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                // The whole request must be drained before the socket closes:
+                // closing with unread bytes pending resets the connection on
+                // Windows, and the client would never see the response.
+                let request_body = read_request(&mut socket).await;
+                let index = {
+                    let mut requests = sink.lock().expect("the request lock is not poisoned");
+                    requests.push(request_body);
+                    requests.len() - 1
+                };
+                let failing = failure_gate
+                    .lock()
+                    .expect("the failure lock is not poisoned")
+                    .contains(&index);
+                let response = format!(
+                    "HTTP/1.1 {}\r\n\
+                     Content-Type: text/event-stream\r\n\
+                     Cache-Control: no-cache\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    if failing { "500 Internal Server Error" } else { "200 OK" },
+                    if failing { 0 } else { body.len() },
+                    if failing { "" } else { body.as_str() }
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        Self {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            requests,
+            failing,
+        }
+    }
+
+    /// Answers the request at each of `indices` with a 500, and every other
+    /// request with its scripted body.
+    fn fail(&self, indices: &[usize]) {
+        *self.failing.lock().expect("the failure lock is not poisoned") = indices.to_vec();
+    }
+
+    /// The body of the `index`-th request (0-based), or `""` if fewer requests
+    /// arrived than the test expected — which is itself what the assertion is
+    /// about.
+    fn request_body(&self, index: usize) -> String {
+        self.requests
+            .lock()
+            .expect("the request lock is not poisoned")
+            .get(index)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Reads a full HTTP request: the head, then `Content-Length` bytes of body.
+///
+/// Returns the body: the head is boilerplate, and what the tests want to see is
+/// the JSON conversation the agent sent.
+async fn read_request(socket: &mut TcpStream) -> String {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    let head_end = loop {
+        let read = socket.read(&mut chunk).await.unwrap_or(0);
+        if read == 0 {
+            return String::new();
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+
+    let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+    let declared = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+
+    let mut remaining = declared.saturating_sub(buffer.len() - head_end);
+    while remaining > 0 {
+        let read = socket.read(&mut chunk).await.unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        let take = read.min(remaining);
+        buffer.extend_from_slice(&chunk[..take]);
+        remaining -= take;
+    }
+
+    String::from_utf8_lossy(&buffer[head_end..]).to_string()
+}
+
+/// Renders events as an SSE body, terminated the way a provider terminates one.
+fn sse(events: &[Value]) -> String {
+    let mut body = String::new();
+    for event in events {
+        body.push_str("data: ");
+        body.push_str(&serde_json::to_string(event).expect("events are serialisable"));
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+/// A turn that calls one tool, then a turn that answers and stops.
+fn two_turns(call: Value, answer: &str) -> Vec<String> {
+    vec![
+        sse(&[
+            json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [call] } }] }),
+            json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] }),
+            json!({
+                "choices": [],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 },
+            }),
+        ]),
+        sse(&[
+            json!({ "choices": [{ "index": 0, "delta": { "content": answer } }] }),
+            json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
+            json!({
+                "choices": [],
+                "usage": { "prompt_tokens": 20, "completion_tokens": 3, "total_tokens": 23 },
+            }),
+        ]),
+    ]
+}
+
+/// Builds an agent pointed at `server`, with tools rooted at `directory`.
+///
+/// `context` enables the context-window manager; the tests that do not care
+/// pass the default, which is compaction off.
+fn agent_for_with_context(
+    server: &FakeServer,
+    directory: &std::path::Path,
+    context: ContextSettings,
+) -> Agent {
+    agent_with_registry(ToolRegistry::with_builtins(), server, directory, context)
+}
+
+/// Builds an agent over an explicit registry, so a test can add `read_image`
+/// the way the worker does for a model that declares image input.
+fn agent_with_registry(
+    registry: ToolRegistry,
+    server: &FakeServer,
+    directory: &std::path::Path,
+    context: ContextSettings,
+) -> Agent {
+    let client =
+        LlmClient::new(&server.base_url, "test-model", "test-key", None)
+            .expect("the client builds");
+    let settings = ToolSettings {
+        working_directory: directory.to_path_buf(),
+        ..ToolSettings::default()
+    };
+    Agent::new(
+        client,
+        Arc::new(registry),
+        Arc::new(RwLock::new(settings)),
+        directory.to_path_buf(),
+        context,
+        // No plugins: these tests are about the tool loop, and an empty list is
+        // the shape an install with no plugins enabled sees.
+        &[],
+    )
+}
+
+fn agent_for(server: &FakeServer, directory: &std::path::Path) -> Agent {
+    agent_for_with_context(server, directory, ContextSettings::default())
+}
+
+/// Builds an agent over an explicit registry and set of plugins.
+///
+/// The plugin-carrying twin of [`agent_with_registry`], for the parts of the
+/// loop a plugin drives — currently the `PostToolUse` hooks.
+fn agent_with_plugins(
+    registry: ToolRegistry,
+    server: &FakeServer,
+    directory: &std::path::Path,
+    plugins: &[&LoadedPlugin],
+) -> Agent {
+    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None)
+        .expect("the client builds");
+    let settings = ToolSettings {
+        working_directory: directory.to_path_buf(),
+        ..ToolSettings::default()
+    };
+    Agent::new(
+        client,
+        Arc::new(registry),
+        Arc::new(RwLock::new(settings)),
+        directory.to_path_buf(),
+        ContextSettings::default(),
+        plugins,
+    )
+}
+
+/// A plugin with one `PostToolUse` hook, built the way discovery builds one.
+///
+/// The hook is read from a real `hooks.json` rather than assembled by hand,
+/// because `Hook` keeps its compiled matcher private — and because loading it is
+/// what the running agent does.
+fn plugin_with_hook(root: &std::path::Path, matcher: &str, command: &str) -> LoadedPlugin {
+    std::fs::write(
+        root.join("hooks.json"),
+        format!(
+            r#"{{"hooks":{{"PostToolUse":[{{"matcher":"{matcher}","hooks":[
+                 {{"type":"command","command":"{command}"}}]}}]}}}}"#
+        ),
+    )
+    .expect("the hooks file is written");
+
+    LoadedPlugin {
+        id: "hooky@test".into(),
+        scope: Scope::Global,
+        root: root.to_path_buf(),
+        manifest: PluginManifest {
+            name: "hooky".into(),
+            version: None,
+            description: None,
+            skills: None,
+            interface: None,
+        },
+        skills: Vec::new(),
+        commands: Vec::new(),
+        hooks: hooks::load("hooky@test", root),
+        agents: Vec::new(),
+        mcp_servers: Default::default(),
+    }
+}
+
+/// A command that prints `hook-ran` in whichever shell this platform defaults
+/// to, so the hook test runs the way a real hook would.
+fn echo_hook_command() -> &'static str {
+    if cfg!(windows) {
+        "Write-Output 'hook-ran'"
+    } else {
+        "echo hook-ran"
+    }
+}
+
+#[tokio::test]
+async fn a_run_with_tool_calls_reports_each_turns_usage_as_it_lands() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+    std::fs::write(directory.path().join("note.txt"), "hello\n").expect("the file is written");
+
+    // Two requests: the first calls a tool, the second answers. Their usage
+    // figures are 10 and 20 prompt tokens respectively.
+    let server = FakeServer::start(two_turns(
+        json!({
+            "index": 0,
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "read_file", "arguments": "{\"path\":\"note.txt\"}" },
+        }),
+        "done",
+    ))
+    .await;
+
+    // The window has to be active: `record_usage` deliberately ignores a
+    // measurement when no context limit is configured — see
+    // `context::tests::a_zero_limit_disables_everything` — so the default
+    // settings would sample nothing. The limit is high enough that no
+    // compaction fires over these two tiny turns.
+    let agent = agent_for_with_context(
+        &server,
+        directory.path(),
+        ContextSettings {
+            context_limit: 100_000,
+            threshold_percent: 60,
+        },
+    );
+    let sink = CollectingSink::default();
+
+    let _ = agent
+        .run(
+            1,
+            "read it".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes");
+
+    // The first turn's sample must arrive *before* the tool ran — that is the
+    // whole point: the gauge moves while the run is still working, not after
+    // it. The final turn has no tool calls, so the run's own RunFinished is
+    // what carries its figure; no sample follows it.
+    let events = sink.events();
+    let sample_position = events.iter().position(|event| matches!(
+        event,
+        Event::UsageSampled { measurement: Some((10, _)), .. }
+    ));
+    let tool_position = events
+        .iter()
+        .position(|event| matches!(event, Event::ToolFinished { .. }));
+    let finish_position = events
+        .iter()
+        .position(|event| matches!(event, Event::RunFinished { .. }));
+
+    let sample_position = sample_position.expect("the tool turn sampled its usage");
+    let tool_position = tool_position.expect("the tool ran");
+    assert!(
+        sample_position < tool_position,
+        "the sample must precede the tool call it priced, got: {events:?}"
+    );
+    assert!(
+        finish_position.expect("the run finished") > sample_position,
+        "the run finishes after its sample"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            Event::UsageSampled { measurement: Some((20, _)), .. }
+        )),
+        "the final turn has no tool calls, so it must not sample again, got: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_post_tool_use_hook_runs_and_its_output_joins_the_tool_result() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+    std::fs::write(directory.path().join("note.txt"), "hello\n").expect("the file is written");
+
+    // `Read` is the Codex spelling of this agent's `read_file`, so this proves
+    // the alias table on the wire, not only in the unit test beside it.
+    let plugin_root = tempfile::tempdir().expect("a temp directory is available");
+    let plugin = plugin_with_hook(plugin_root.path(), "Read", echo_hook_command());
+
+    let server = FakeServer::start(two_turns(
+        json!({
+            "index": 0,
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "read_file", "arguments": "{\"path\":\"note.txt\"}" },
+        }),
+        "done",
+    ))
+    .await;
+
+    let agent = agent_with_plugins(
+        ToolRegistry::with_builtins(),
+        &server,
+        directory.path(),
+        &[&plugin],
+    );
+    let sink = CollectingSink::default();
+
+    let _ = agent
+        .run(
+            1,
+            "read it".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes");
+
+    let (outcome, output) = sink.tool_output("read_file").expect("the call finished");
+    assert_eq!(outcome, AuditOutcome::Executed);
+    assert!(output.contains("hello"), "the tool's own output survives: {output}");
+    assert!(
+        output.contains("PostToolUse hook"),
+        "the hook is named in the result the model reads: {output}"
+    );
+    assert!(
+        output.contains("hook-ran"),
+        "the hook's own output joins the result: {output}"
+    );
+}
+
+#[tokio::test]
+async fn a_hook_whose_matcher_does_not_match_the_tool_stays_out() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+    std::fs::write(directory.path().join("note.txt"), "hello\n").expect("the file is written");
+
+    // `Bash` is `exec`'s Codex name, so this hook must not fire for a read.
+    let plugin_root = tempfile::tempdir().expect("a temp directory is available");
+    let plugin = plugin_with_hook(plugin_root.path(), "Bash", echo_hook_command());
+
+    let server = FakeServer::start(two_turns(
+        json!({
+            "index": 0,
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "read_file", "arguments": "{\"path\":\"note.txt\"}" },
+        }),
+        "done",
+    ))
+    .await;
+
+    let agent = agent_with_plugins(
+        ToolRegistry::with_builtins(),
+        &server,
+        directory.path(),
+        &[&plugin],
+    );
+    let sink = CollectingSink::default();
+
+    let _ = agent
+        .run(
+            1,
+            "read it".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes");
+
+    let (_, output) = sink.tool_output("read_file").expect("the call finished");
+    assert!(
+        !output.contains("hook-ran"),
+        "a hook must not run for a tool it does not match: {output}"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_call_does_not_fire_its_hook() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+
+    // `Bash` is `exec`'s Codex name, so this hook *would* fire for the command
+    // below — if the guard ever let the command run.
+    let plugin_root = tempfile::tempdir().expect("a temp directory is available");
+    let plugin = plugin_with_hook(plugin_root.path(), "Bash", echo_hook_command());
+
+    let server = FakeServer::start(two_turns(
+        json!({
+            "index": 0,
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "exec", "arguments": "{\"command\":\"rm -rf /\"}" },
+        }),
+        "stopping there",
+    ))
+    .await;
+
+    let agent = agent_with_plugins(
+        ToolRegistry::with_builtins(),
+        &server,
+        directory.path(),
+        &[&plugin],
+    );
+    let sink = CollectingSink::default();
+
+    let _ = agent
+        .run(
+            1,
+            "delete everything".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes");
+
+    let (outcome, output) = sink.tool_output("exec").expect("the call finished");
+    assert_eq!(outcome, AuditOutcome::Denied, "the guard must have refused it");
+    assert!(
+        !output.contains("hook-ran"),
+        "a refused call is not a tool use, so its hook must not describe one: {output}"
+    );
+}
+
+/// A small valid PNG, built with the same encoder `read_image` re-encodes with.
+fn png_fixture(width: u32, height: u32) -> Vec<u8> {
+    crate::image_ops::encode_png(&crate::image_ops::Raster {
+        width,
+        height,
+        rgba: vec![200u8; (width * height * 4) as usize],
+    })
+    .expect("the fixture encodes")
+}
+
+#[tokio::test]
+async fn the_system_prompt_carries_the_project_context() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+    std::fs::write(
+        directory.path().join("AGENTS.md"),
+        "Always answer in Chinese.\n",
+    )
+    .expect("the fixture is written");
+
+    let server = FakeServer::start(vec![sse(&[
+        json!({ "choices": [{ "index": 0, "delta": { "content": "好的" } }] }),
+        json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
+    ])])
+    .await;
+
+    let agent = agent_for(&server, directory.path());
+    let sink = CollectingSink::default();
+
+    let _ = agent
+        .run(
+            1,
+            "hi".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes");
+
+    let body = server.request_body(0);
+    assert!(
+        // The body arrives as raw JSON, so the quotes around the path are
+        // escaped on the wire; asserting on the tag name, the file name, and
+        // the content side-steps the escaping without weakening the check.
+        body.contains("project_instructions")
+            && body.contains("AGENTS.md")
+            && body.contains("Always answer in Chinese."),
+        "the project context must reach the model, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_chosen_thinking_level_reaches_the_request() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+    let server = FakeServer::start(vec![answered(10, "ok")]).await;
+
+    let agent = agent_for(&server, directory.path());
+    let sink = CollectingSink::default();
+
+    let _ = agent
+        .run(
+            1,
+            "hi".into(),
+            RunRequest {
+                history: &[],
+                thinking: Some(crate::llm::ThinkingLevel::High),
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes");
+
+    let body = server.request_body(0);
+    assert!(
+        body.contains(r#""reasoning_effort":"high""#),
+        "the chosen level must go out on the wire, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn no_thinking_level_sends_no_reasoning_effort() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+    let server = FakeServer::start(vec![answered(10, "ok")]).await;
+
+    let agent = agent_for(&server, directory.path());
+    let sink = CollectingSink::default();
+
+    let _ = agent
+        .run(
+            1,
+            "hi".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes");
+
+    let body = server.request_body(0);
+    assert!(
+        !body.contains("reasoning_effort"),
+        "an unset level must leave the parameter out, got: {body}"
+    );
+}
+
+/// A turn that answers and reports the prompt size the provider measured.
+fn answered(prompt_tokens: u64, answer: &str) -> String {
+    sse(&[
+        json!({ "choices": [{ "index": 0, "delta": { "content": answer } }] }),
+        json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
+        json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": 3,
+                "total_tokens": prompt_tokens + 3,
+            },
+        }),
+    ])
+}
+
+#[tokio::test]
+async fn crossing_the_threshold_compacts_the_history_before_the_next_turn() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+
+    // Run one measures 90 tokens against a limit of 100 with a trigger of 60%,
+    // so the first request of run two must go out compacted: a summary request,
+    // then the real turn carrying nothing but that summary.
+    let server = FakeServer::start(vec![
+        answered(90, "first answer"),
+        // The summariser is a non-streaming call, so its reply is one plain
+        // JSON body rather than an SSE stream.
+        serde_json::to_string(&json!({
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "the user asked about files" },
+                "finish_reason": "stop",
+            }],
+        }))
+        .expect("the summary reply is serialisable"),
+        answered(70, "second answer"),
+    ])
+    .await;
+
+    let agent = agent_for_with_context(
+        &server,
+        directory.path(),
+        ContextSettings {
+            context_limit: 100,
+            threshold_percent: 60,
+        },
+    );
+
+    // Run one: a bare prompt. It hands back the measurement run two seeds its
+    // window with — the window itself lives on the frame, so a fresh run
+    // starts blank and would never notice it is over the limit.
+    let sink = CollectingSink::default();
+    let carried = agent
+        .run(
+            1,
+            "list files".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the first run completes");
+
+    // Run two: the follow-up, continuing the conversation run one started.
+    let history = vec![
+        Message::user("list files"),
+        Message::assistant("first answer".into(), Vec::new()),
+        Message::user("and the second thing"),
+        Message::assistant("second answer".into(), Vec::new()),
+        Message::user("and a third"),
+        Message::assistant("third answer".into(), Vec::new()),
+    ];
+    let sink = CollectingSink::default();
+    let _ = agent
+        .run(
+            2,
+            "hello again".into(),
+            RunRequest {
+                history: &history,
+                thinking: None,
+                carried,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the follow-up completes");
+
+    let events = sink.events();
+    // Everything goes: the system prompt, the history, and the prompt that
+    // started this run — all of it is what the brief replaces.
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::CompactionStarted { dropping: 8, .. })),
+        "compaction must be announced, got: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Event::Compacted { summary, .. } if summary.contains("the user asked about files")
+        )),
+        "the summary must be surfaced to the user, got: {events:?}"
+    );
+
+    // Request 0 is run one's turn, request 1 the summariser, request 2 the
+    // compacted turn.
+    let summary_request = server.request_body(1);
+    assert!(
+        summary_request.contains("list files") && summary_request.contains("hello again"),
+        "the summariser must be given the whole conversation, including the prompt \
+         that started this run, got: {summary_request}"
+    );
+
+    let second = server.request_body(2);
+    assert!(
+        second.contains("Here is a summary of our conversation so far")
+            && second.contains("the user asked about files")
+            && second.contains("Continue from where it left off"),
+        "the compacted request must carry the brief and a turn to answer, got: {second}"
+    );
+    assert!(
+        !second.contains("list files") && !second.contains("hello again"),
+        "nothing survives verbatim, so neither the history nor the original prompt \
+         may ride along, got: {second}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_summary_request_still_lets_the_run_finish() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+
+    // Request 1 — the summariser — is answered with a bare 500; the run must
+    // shrug it off and send the follow-up with its history intact.
+    let server = FakeServer::start(vec![
+        answered(95, "first answer"),
+        String::new(),
+        answered(95, "second answer"),
+    ])
+    .await;
+    server.fail(&[1]);
+
+    let agent = agent_for_with_context(
+        &server,
+        directory.path(),
+        ContextSettings {
+            context_limit: 100,
+            threshold_percent: 60,
+        },
+    );
+
+    let sink = CollectingSink::default();
+    let carried = agent
+        .run(
+            1,
+            "list files".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the first run completes");
+
+    // Six messages: more than the recent window keeps, so there is something
+    // to summarise.
+    let history = vec![
+        Message::user("list files"),
+        Message::assistant("first answer".into(), Vec::new()),
+        Message::user("and the second thing"),
+        Message::assistant("second answer".into(), Vec::new()),
+        Message::user("and a third"),
+        Message::assistant("third answer".into(), Vec::new()),
+    ];
+    let sink = CollectingSink::default();
+    let _ = agent
+        .run(
+            2,
+            "hello again".into(),
+            RunRequest {
+                history: &history,
+                thinking: None,
+                carried,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes despite the failed summary");
+
+    assert!(
+        sink.events()
+            .iter()
+            .any(|event| matches!(event, Event::Compacted { summary, .. } if summary.is_empty())),
+        "the failure must be surfaced as an empty summary, got: {:?}",
+        sink.events()
+    );
+    // The follow-up went out full-length: nothing was dropped.
+    assert!(
+        server.request_body(2).contains("list files"),
+        "the original history must survive a failed compaction, got: {}",
+        server.request_body(2)
+    );
+}
+
+#[tokio::test]
+async fn without_a_limit_the_history_is_never_touched() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+
+    let server = FakeServer::start(vec![
+        answered(999_999, "first answer"),
+        answered(999_999, "second answer"),
+    ])
+    .await;
+
+    let agent = agent_for(&server, directory.path());
+
+    let sink = CollectingSink::default();
+    let carried = agent
+        .run(
+            1,
+            "list files".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the first run completes");
+
+    // Six messages: more than the recent window keeps, so there is something
+    // to summarise.
+    let history = vec![
+        Message::user("list files"),
+        Message::assistant("first answer".into(), Vec::new()),
+        Message::user("and the second thing"),
+        Message::assistant("second answer".into(), Vec::new()),
+        Message::user("and a third"),
+        Message::assistant("third answer".into(), Vec::new()),
+    ];
+    let sink = CollectingSink::default();
+    let _ = agent
+        .run(
+            2,
+            "hello again".into(),
+            RunRequest {
+                history: &history,
+                thinking: None,
+                carried,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the follow-up completes");
+
+    assert!(
+        !sink
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::CompactionStarted { .. })),
+        "no limit means no compaction"
+    );
+    assert!(
+        server.request_body(1).contains("list files"),
+        "the follow-up must carry the whole history, got: {}",
+        server.request_body(1)
+    );
+}
+
+#[tokio::test]
+async fn a_streamed_tool_call_is_executed_and_fed_back() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+    std::fs::write(directory.path().join("note.txt"), "42\n").expect("the fixture is written");
+
+    // `arguments` is split across two deltas on purpose: that is the shape that
+    // breaks an implementation which parses each chunk as it arrives, because
+    // the string is not valid JSON until the second fragment lands.
+    let server = FakeServer::start(vec![
+        sse(&[
+            json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "read_file", "arguments": "{\"path\":\"no" },
+            }] } }] }),
+            json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{
+                "index": 0,
+                "function": { "arguments": "te.txt\"}" },
+            }] } }] }),
+            json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] }),
+        ]),
+        sse(&[
+            json!({ "choices": [{ "index": 0, "delta": { "content": "the file says 42" } }] }),
+            json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
+            json!({
+                "choices": [],
+                "usage": { "prompt_tokens": 20, "completion_tokens": 3, "total_tokens": 23 },
+            }),
+        ]),
+    ])
+    .await;
+
+    let agent = agent_for(&server, directory.path());
+    let sink = CollectingSink::default();
+
+    let _ = agent
+        .run(
+            1,
+            "read note.txt".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes");
+
+    let (outcome, output) = sink
+        .tool_output("read_file")
+        .expect("read_file was called and finished");
+    assert_eq!(outcome, AuditOutcome::Executed, "got: {output}");
+    assert!(
+        output.contains("42"),
+        "the file body must reach the model: {output}"
+    );
+    assert_eq!(sink.outcomes(), vec![AuditOutcome::Executed]);
+    assert_eq!(sink.transcript(), "the file says 42");
+}
+
+#[tokio::test]
+async fn a_refused_command_is_reported_as_a_refusal() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+    let server = FakeServer::start(two_turns(
+        json!({
+            "index": 0,
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "exec", "arguments": "{\"command\":\"rm -rf /\"}" },
+        }),
+        "stopping there",
+    ))
+    .await;
+
+    let agent = agent_for(&server, directory.path());
+    let sink = CollectingSink::default();
+
+    let _ = agent
+        .run(
+            1,
+            "wipe everything".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes");
+
+    let (outcome, output) = sink.tool_output("exec").expect("exec was called");
+    assert_eq!(
+        outcome,
+        AuditOutcome::Denied,
+        "a refused command must be recorded as a refusal, not a failure"
+    );
+    assert!(
+        output.starts_with("Refused:"),
+        "the model must be told this was a refusal, not a failure: {output}"
+    );
+    assert_eq!(sink.outcomes(), vec![AuditOutcome::Denied]);
+}
+
+#[tokio::test]
+async fn turning_the_guard_off_lets_a_destructive_command_through() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+    std::fs::write(directory.path().join("doomed.txt"), "bye\n").expect("the fixture is written");
+
+    let server = FakeServer::start(two_turns(
+        json!({
+            "index": 0,
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "exec", "arguments": "{\"command\":\"rm doomed.txt\"}" },
+        }),
+        "deleted",
+    ))
+    .await;
+
+    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None)
+        .expect("builds");
+    let settings = ToolSettings {
+        working_directory: directory.path().to_path_buf(),
+        block_destructive_commands: false,
+        ..ToolSettings::default()
+    };
+    let agent = Agent::new(
+        client,
+        Arc::new(ToolRegistry::with_builtins()),
+        Arc::new(RwLock::new(settings)),
+        directory.path().to_path_buf(),
+        ContextSettings::default(),
+        &[],
+    );
+    let sink = CollectingSink::default();
+
+    let _ = agent
+        .run(
+            1,
+            "delete it".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes");
+
+    assert_eq!(sink.outcomes(), vec![AuditOutcome::Executed]);
+    assert!(
+        !directory.path().join("doomed.txt").exists(),
+        "the command must actually have run"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_tool_is_a_failure_not_a_crash() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+    let server = FakeServer::start(two_turns(
+        json!({
+            "index": 0,
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "launch_missiles", "arguments": "{}" },
+        }),
+        "understood",
+    ))
+    .await;
+
+    let agent = agent_for(&server, directory.path());
+    let sink = CollectingSink::default();
+
+    let _ = agent
+        .run(
+            1,
+            "do something".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes");
+
+    let (outcome, output) = sink
+        .tool_output("launch_missiles")
+        .expect("it was attempted");
+    assert_eq!(outcome, AuditOutcome::Failed);
+    assert!(output.contains("Unknown tool"), "got: {output}");
+    assert_eq!(sink.outcomes(), vec![AuditOutcome::Failed]);
+}
+
+#[tokio::test]
+async fn malformed_arguments_are_reported_back_to_the_model() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+    let server = FakeServer::start(two_turns(
+        json!({
+            "index": 0,
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "read_file", "arguments": "{\"path\":" },
+        }),
+        "let me retry",
+    ))
+    .await;
+
+    let agent = agent_for(&server, directory.path());
+    let sink = CollectingSink::default();
+
+    let _ = agent
+        .run(
+            1,
+            "read something".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes despite the bad call");
+
+    let (outcome, output) = sink.tool_output("read_file").expect("it was attempted");
+    assert_eq!(outcome, AuditOutcome::Failed);
+    assert!(
+        output.contains("Could not parse"),
+        "the model needs to know why, got: {output}"
+    );
+    assert_eq!(sink.outcomes(), vec![AuditOutcome::Failed]);
+}
+
+#[tokio::test]
+async fn a_cancelled_run_stops_without_finishing() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+    // Only one turn is scripted, and it is never consumed: the run is cancelled
+    // before the request can be answered.
+    let server = FakeServer::start(vec![sse(&[json!({
+        "choices": [{ "index": 0, "delta": { "content": "too late" } }],
+    })])])
+    .await;
+
+    let agent = agent_for(&server, directory.path());
+    let sink = CollectingSink::default();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let error = agent
+        .run(
+            1,
+            "anything".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            cancel,
+            &sink,
+        )
+        .await
+        .expect_err("a cancelled run must not report success");
+
+    assert_eq!(error.code, AgentError::cancelled().code);
+    assert!(
+        !sink
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::RunFinished { .. })),
+        "a cancelled run must not be marked finished"
+    );
+}
+
+#[tokio::test]
+async fn a_follow_up_run_replays_the_conversation_it_continues() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+    // The same scripted answer for both runs: the assertions read the *requests*,
+    // so what the server says does not matter, and a scripted third turn would
+    // be dead weight.
+    let answer = sse(&[
+        json!({ "choices": [{ "index": 0, "delta": { "content": "it is empty" } }] }),
+        json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
+    ]);
+    let server = FakeServer::start(vec![answer.clone(), answer]).await;
+
+    let agent = agent_for(&server, directory.path());
+
+    // Run one: a bare prompt, nothing to replay.
+    let sink = CollectingSink::default();
+    let carried = agent
+        .run(
+            1,
+            "list the directory".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the first run completes");
+
+    // Run two: the follow-up, carrying the transcript of run one. This is the
+    // shape the GUI builds for a second prompt in the same session.
+    let history = vec![
+        Message::user("list the directory"),
+        Message::assistant("it is empty".into(), Vec::new()),
+    ];
+    let sink = CollectingSink::default();
+    let _ = agent
+        .run(
+            2,
+            "now what did it contain?".into(),
+            RunRequest {
+                history: &history,
+                thinking: None,
+                carried,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the follow-up completes");
+
+    let first = server.request_body(0);
+    let second = server.request_body(1);
+    assert!(
+        first.contains("list the directory") && !first.contains("it is empty"),
+        "the first run has nothing behind it to replay, got: {first}"
+    );
+    assert!(
+        second.contains("list the directory")
+            && second.contains("it is empty")
+            && second.contains("now what did it contain?"),
+        "the follow-up must carry the earlier turns plus the new prompt, got: {second}"
+    );
+}
+
+#[test]
+fn read_image_is_offered_only_to_a_model_that_declares_image_input() {
+    // The gate the worker applies: a text-only model must never see the tool,
+    // because a picture it cannot read is a wasted call and a provider error.
+    let text_only = to_openai_tools(&ToolRegistry::with_builtins()).to_string();
+    assert!(
+        !text_only.contains("read_image"),
+        "a text-only model must not be offered read_image: {text_only}"
+    );
+
+    let multimodal = to_openai_tools(&ToolRegistry::with_image_input()).to_string();
+    assert!(
+        multimodal.contains("read_image"),
+        "a model that declares image input must be offered read_image: {multimodal}"
+    );
+}
+
+#[tokio::test]
+async fn a_read_image_call_hands_the_picture_to_the_model() {
+    // The copy `read_image` stores must not land in the user's real attachment
+    // store, so the config directory is redirected for the length of the test.
+    let config_dir = tempfile::tempdir().expect("a temp directory is available");
+    std::env::set_var(crate::config::CONFIG_DIR_ENV, config_dir.path());
+
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+    std::fs::write(directory.path().join("shot.png"), png_fixture(4, 4))
+        .expect("the fixture is written");
+
+    let server = FakeServer::start(two_turns(
+        json!({
+            "index": 0,
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "read_image", "arguments": "{\"path\":\"shot.png\"}" },
+        }),
+        "a grey square",
+    ))
+    .await;
+
+    let agent = agent_with_registry(
+        ToolRegistry::with_image_input(),
+        &server,
+        directory.path(),
+        ContextSettings::default(),
+    );
+    let sink = CollectingSink::default();
+
+    let _ = agent
+        .run(
+            1,
+            "what is in shot.png?".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes");
+
+    // The tool handed a picture back, not just a description of one.
+    let (outcome, output) = sink
+        .tool_output("read_image")
+        .expect("read_image was called and finished");
+    assert_eq!(outcome, AuditOutcome::Executed, "got: {output}");
+    assert!(
+        output.contains("image/png"),
+        "the envelope names the media type: {output}"
+    );
+
+    let images = sink.images();
+    assert_eq!(images.len(), 1, "the finished call must carry one image");
+    assert_eq!(images[0].media_type, "image/png");
+    assert_eq!((images[0].width, images[0].height), (4, 4));
+
+    // The picture reaches the model in the *follow-up* request: the tool result
+    // is a content array whose second part is an `image_url` data URL.
+    let follow_up = server.request_body(1);
+    assert!(
+        follow_up.contains("\"type\":\"image_url\"")
+            && follow_up.contains("data:image/png;base64,"),
+        "the picture must ride in the follow-up request, got: {follow_up}"
+    );
+    // …and it must not have been inlined into a text field, where it would eat
+    // the context window on every later turn.
+    assert!(
+        !sink.transcript().contains("base64"),
+        "base64 must never reach the transcript"
+    );
+}

@@ -1,0 +1,12 @@
+# Rust build artifacts — `target/` is several GB, never commit it.
+/target
+
+# Stray build logs left at the repo root.
+/build.log
+/build_err.log
+
+# Editor and OS noise.
+.DS_Store
+Thumbs.db
+*.swp
+*~

@@ -1,0 +1,14 @@
+# Every source file in this repo is stored with LF, and rustfmt and the
+# patch tooling both care: `apply_patch` rewrites a CRLF file as CRLF, so a
+# checkout that silently converts line endings would make every hunk fail.
+* text=auto eol=lf
+
+# Binary assets, so Git never tries to diff or convert them.
+*.otf binary
+*.ttf binary
+*.png binary
+*.jpg binary
+*.ico binary
+
+# `Cargo.lock` is a generated artifact; keep it out of diff noise and merges.
+Cargo.lock -diff
