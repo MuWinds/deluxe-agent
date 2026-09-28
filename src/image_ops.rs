@@ -201,7 +201,7 @@ fn expand_to_rgba(samples: &[u8], color_type: png::ColorType) -> Result<Vec<u8>,
         }
         png::ColorType::GrayscaleAlpha => {
             let mut out = Vec::with_capacity(samples.len() / 2 * 4);
-            for pixel in samples.chunks_exact(2) {
+            for pixel in samples.as_chunks::<2>().0 {
                 out.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
             }
             out
@@ -216,7 +216,7 @@ fn expand_to_rgba(samples: &[u8], color_type: png::ColorType) -> Result<Vec<u8>,
 
 fn to_rgba_from_rgb(samples: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(samples.len() / 3 * 4);
-    for pixel in samples.chunks_exact(3) {
+    for pixel in samples.as_chunks::<3>().0 {
         out.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
     }
     out

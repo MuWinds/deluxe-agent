@@ -253,6 +253,11 @@ pub fn finish_tool(steps: &mut [Step], call_id: &str, result: ToolResult) {
 }
 
 impl Session {
+    /// A fresh session rooted at `project`.
+    ///
+    /// Starts in [`RunState::Running`], because a session only exists once its
+    /// first prompt is in flight — `App::start_run` creates it as it dispatches
+    /// the turn, so there is no window in which it is idle-but-saved.
     pub fn new(project: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4(),

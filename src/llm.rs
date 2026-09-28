@@ -231,6 +231,8 @@ impl Message {
         }
     }
 
+    /// A `system` message — the assembled prompt, sent once at the head of a
+    /// request.
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".into(),
@@ -240,6 +242,10 @@ impl Message {
         }
     }
 
+    /// A `user` message whose whole content is one block of text.
+    ///
+    /// For the text-only case; [`Message::user_with_images`] wraps an
+    /// attachment into a multimodal parts array.
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
@@ -249,6 +255,11 @@ impl Message {
         }
     }
 
+    /// An `assistant` message: what the model said, and any tool calls it made.
+    ///
+    /// Empty text and an empty call list both serialise as `null` rather than
+    /// as `""` / `[]`, because a provider that round-trips this message rejects
+    /// a present-but-empty field where an absent one is expected.
     pub fn assistant(content: String, tool_calls: Vec<ToolCall>) -> Self {
         Self {
             role: "assistant".into(),
@@ -266,6 +277,7 @@ impl Message {
         }
     }
 
+    /// A `tool` message: the result of one call, addressed back to it by id.
     pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: "tool".into(),
@@ -416,6 +428,13 @@ pub struct LlmClient {
 }
 
 impl LlmClient {
+    /// Builds a client for one OpenAI-compatible `/chat/completions` endpoint.
+    ///
+    /// The URL is stored without a trailing slash so request paths join cleanly.
+    /// No overall request timeout is set — a streamed turn runs for minutes and
+    /// is bounded by cancellation instead — only a connect timeout, so a dead
+    /// host fails fast. Returns [`AgentError::internal`] if the HTTP client
+    /// itself cannot be built.
     pub fn new(
         base_url: impl Into<String>,
         model: impl Into<String>,

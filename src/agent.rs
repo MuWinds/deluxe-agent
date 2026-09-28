@@ -214,6 +214,7 @@ fn render_project_context(context: &[(String, String)]) -> String {
 /// The GUI implements this by pushing into a channel and asking egui to repaint;
 /// tests implement it by collecting into a `Vec`.
 pub trait EventSink: Send + Sync {
+    /// Delivers one event. Called from the worker thread, so it must not block.
     fn emit(&self, event: Event);
 }
 

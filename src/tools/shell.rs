@@ -47,6 +47,8 @@ pub struct Exec {
 }
 
 impl Exec {
+    /// Shares the registry `task` and the `job_*` readers use, so a job started
+    /// by `exec` is visible to every reader.
     pub fn new(jobs: Arc<JobRegistry>) -> Self {
         Self { jobs }
     }
@@ -74,6 +76,10 @@ enum ShellKind {
 }
 
 impl ShellKind {
+    /// Parses a configured shell name, defaulting to the platform's own.
+    ///
+    /// The default is `powershell` on Windows and `sh` elsewhere. A name the
+    /// platform does not support is an [`AgentError::invalid_params`].
     fn parse(value: Option<&str>) -> Result<Self> {
         let default = if cfg!(windows) { "powershell" } else { "sh" };
         match value.unwrap_or(default) {
@@ -99,6 +105,7 @@ impl ShellKind {
         }
     }
 
+    /// The canonical name this backend is persisted and reported under.
     fn name(self) -> &'static str {
         match self {
             #[cfg(windows)]

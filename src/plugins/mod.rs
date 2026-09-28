@@ -145,10 +145,12 @@ pub struct LoadedPlugin {
 }
 
 impl LoadedPlugin {
+    /// The plugin's own display name, falling back to its manifest name.
     pub fn display_name(&self) -> &str {
         self.manifest.display_name()
     }
 
+    /// The manifest's one-line summary, when it carries one.
     pub fn summary(&self) -> Option<&str> {
         self.manifest.summary()
     }
@@ -228,6 +230,7 @@ impl PluginCatalogue {
         &self.disabled
     }
 
+    /// Files a plugin under its scope: global, or the project that owns it.
     fn insert(&mut self, plugin: LoadedPlugin) {
         match &plugin.scope {
             Scope::Global => self.global.push(plugin),
@@ -614,11 +617,12 @@ fn offered_ids(marketplaces: &[Marketplace]) -> Vec<String> {
     let mut ids: Vec<String> = marketplaces
         .iter()
         .flat_map(|marketplace| {
-            marketplace.manifest.plugins.iter().filter_map(|entry| {
-                entry
-                    .is_offered()
-                    .then(|| format!("{}@{}", entry.name, marketplace.name))
-            })
+            marketplace
+                .manifest
+                .plugins
+                .iter()
+                .filter(|&entry| entry.is_offered())
+                .map(|entry| format!("{}@{}", entry.name, marketplace.name))
         })
         .collect();
     ids.sort();

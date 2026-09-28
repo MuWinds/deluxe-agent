@@ -77,6 +77,7 @@ impl JobStatus {
         matches!(self, Self::Completed | Self::Killed | Self::Failed)
     }
 
+    /// The lowercase word the status is printed as in tool output.
     pub fn label(&self) -> &'static str {
         match self {
             Self::Running => "running",
@@ -163,10 +164,12 @@ struct Job {
 }
 
 impl Job {
+    /// The job's current status, read through the `watch` channel.
     fn status(&self) -> JobStatus {
         self.status.borrow().clone()
     }
 
+    /// A point-in-time copy of this job for `job_list` and the window.
     fn snapshot(&self) -> JobSnapshot {
         JobSnapshot {
             id: self.id.clone(),
@@ -196,6 +199,7 @@ impl Default for JobRegistry {
 }
 
 impl JobRegistry {
+    /// An empty registry: one that has neither started nor recorded a job.
     pub fn new() -> Self {
         Self {
             jobs: Mutex::new(Vec::new()),
@@ -325,6 +329,10 @@ impl JobRegistry {
         job.id.clone()
     }
 
+    /// Allocates an id, records the job and returns it.
+    ///
+    /// The id is `{kind}-{n}` with `n` from a relaxed counter — uniqueness is
+    /// all that is needed, not ordering across threads.
     fn register(
         &self,
         kind: &'static str,
@@ -388,6 +396,7 @@ impl JobRegistry {
         }
     }
 
+    /// The job with `id`, or an [`AgentError::invalid_params`] naming it.
     fn get(&self, id: &str) -> Result<Arc<Job>> {
         self.jobs
             .lock()
@@ -446,6 +455,7 @@ impl JobRegistry {
         })
     }
 
+    /// Snapshots every job, in registration order (oldest first).
     pub fn list(&self) -> Vec<JobSnapshot> {
         self.jobs
             .lock()
@@ -597,7 +607,6 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
-/// A one-line summary for `job_list`.
 fn list_line(snapshot: &JobSnapshot) -> String {
     format!(
         "{} [{}] {} — {}",
@@ -623,6 +632,7 @@ pub struct JobOutput {
 }
 
 impl JobOutput {
+    /// Reads against the shared job registry.
     pub fn new(jobs: Arc<JobRegistry>) -> Self {
         Self { jobs }
     }
@@ -705,6 +715,7 @@ pub struct JobList {
 }
 
 impl JobList {
+    /// Lists against the shared job registry.
     pub fn new(jobs: Arc<JobRegistry>) -> Self {
         Self { jobs }
     }
@@ -746,6 +757,7 @@ pub struct JobKill {
 }
 
 impl JobKill {
+    /// Cancels against the shared job registry.
     pub fn new(jobs: Arc<JobRegistry>) -> Self {
         Self { jobs }
     }

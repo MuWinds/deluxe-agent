@@ -70,6 +70,9 @@ pub struct Task {
 }
 
 impl Task {
+    /// Wires a `task` tool to the model client, the roles it may delegate to,
+    /// the sub-agent registry it hands them, and the sink their events are
+    /// forwarded through.
     pub fn new(
         llm: LlmClient,
         roles: Vec<AgentRole>,

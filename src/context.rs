@@ -43,6 +43,8 @@ impl Default for ContextSettings {
 }
 
 impl ContextSettings {
+    /// Whether compaction is configured at all. A zero limit or a zero
+    /// threshold turns the whole mechanism off rather than compacting always.
     fn is_active(&self) -> bool {
         self.context_limit > 0 && self.threshold_percent > 0
     }
@@ -81,6 +83,7 @@ pub struct ContextWindow {
 }
 
 impl ContextWindow {
+    /// A window with no measurement yet; the first request of a run seeds it.
     pub fn new(settings: ContextSettings) -> Self {
         Self {
             settings,

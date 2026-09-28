@@ -76,6 +76,7 @@ pub struct Span {
 }
 
 impl Span {
+    /// A span with default styling and no link.
     fn plain(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),

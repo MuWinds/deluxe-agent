@@ -84,6 +84,7 @@ pub enum ContentBlock {
 }
 
 impl ContentBlock {
+    /// A text block, the shape almost every tool returns.
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text { text: text.into() }
     }
@@ -133,6 +134,8 @@ pub struct ToolOutput {
 }
 
 impl ToolOutput {
+    /// A failed call. `is_error` is what tells the model the block is a
+    /// complaint rather than a result.
     pub fn error(text: impl Into<String>) -> Self {
         Self {
             content: vec![ContentBlock::text(text)],
@@ -229,7 +232,17 @@ impl ToolOutput {
 
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
+    /// The catalogue entry the model sees: name, summary, schema and any
+    /// cross-tool guidelines.
     fn descriptor(&self) -> ToolDescriptor;
+
+    /// Runs one call.
+    ///
+    /// `arguments` is the raw JSON the model produced — validated against the
+    /// descriptor's `input_schema` first unless `host_validates_arguments` is
+    /// off. Returns [`AgentError`] for a call that could not run at all; a call
+    /// that ran but failed is reported as an `is_error` [`ToolOutput`] instead,
+    /// so the model sees the failure inside the conversation.
     async fn execute(&self, arguments: Value, settings: &ToolSettings) -> Result<ToolOutput>;
 
     /// Whether this tool bounds its own wall-clock time.
@@ -264,6 +277,8 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    /// The registry every agent starts from: `read_file`, `list_dir`, `exec`,
+    /// `apply_patch` and the three `job_*` tools, sharing one job runtime.
     pub fn with_builtins() -> Self {
         let job_registry = Arc::new(JobRegistry::new());
         let mut registry = Self {
@@ -297,19 +312,25 @@ impl ToolRegistry {
         &self.jobs
     }
 
+    /// Adds (or replaces) a tool, keyed by the name its descriptor declares.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         self.tools.insert(tool.descriptor().name, tool);
     }
 
+    /// The tool registered under `name`, if any.
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.get(name)
     }
 
+    /// Like [`get`](Self::get), but an unknown name is an
+    /// [`AgentError::tool_not_found`] rather than `None`.
     pub fn require(&self, name: &str) -> Result<&Arc<dyn Tool>> {
         self.get(name)
             .ok_or_else(|| AgentError::tool_not_found(name))
     }
 
+    /// Every registered tool's descriptor, in name order (the registry is a
+    /// `BTreeMap`), which is what keeps the system prompt byte-stable.
     pub fn descriptors(&self) -> Vec<ToolDescriptor> {
         self.tools.values().map(|tool| tool.descriptor()).collect()
     }
@@ -426,6 +447,10 @@ pub fn validate_arguments(schema: &ObjectSchema, arguments: &Value) -> Result<()
     Ok(())
 }
 
+/// Reads a required string argument.
+///
+/// Errs when the key is absent or is not a string. A number where a string was
+/// promised is a model mistake worth reporting, not something to coerce.
 pub fn required_str(arguments: &Value, key: &str) -> Result<String> {
     arguments
         .get(key)
@@ -436,6 +461,8 @@ pub fn required_str(arguments: &Value, key: &str) -> Result<String> {
         })
 }
 
+/// Reads an optional string argument; `None` when the key is absent or is not a
+/// string.
 pub fn optional_str(arguments: &Value, key: &str) -> Option<String> {
     arguments
         .get(key)
@@ -443,6 +470,8 @@ pub fn optional_str(arguments: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Reads an optional unsigned integer argument, falling back to `default` when
+/// the key is absent or the wrong type.
 pub fn optional_u64(arguments: &Value, key: &str, default: u64) -> u64 {
     arguments
         .get(key)
@@ -450,6 +479,8 @@ pub fn optional_u64(arguments: &Value, key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Reads an optional boolean argument, falling back to `default` when the key
+/// is absent or the wrong type.
 pub fn optional_bool(arguments: &Value, key: &str, default: bool) -> bool {
     arguments
         .get(key)
@@ -457,6 +488,12 @@ pub fn optional_bool(arguments: &Value, key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// Clamps `value` into `min..=max`. The bounds are assumed ordered; a reversed
+/// pair panics, as [`u64::clamp`] does.
+///
+/// # Panics
+///
+/// Panics if `min > max`.
 pub fn clamp_u64(value: u64, min: u64, max: u64) -> u64 {
     value.clamp(min, max)
 }

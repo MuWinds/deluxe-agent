@@ -188,6 +188,8 @@ pub fn config_dir() -> Option<PathBuf> {
         .map(|dirs| dirs.config_dir().to_path_buf())
 }
 
+/// The `config.toml` path, or `None` when the system offers no config
+/// directory.
 pub fn config_path() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join("config.toml"))
 }
@@ -309,8 +311,10 @@ mod tests {
 
     #[test]
     fn normalize_drops_blank_and_duplicate_projects() {
-        let mut config = Config::default();
-        config.projects = vec!["/a".into(), "  ".into(), "/a".into(), "/b".into()];
+        let mut config = Config {
+            projects: vec!["/a".into(), "  ".into(), "/a".into(), "/b".into()],
+            ..Default::default()
+        };
 
         config.normalize();
 
@@ -330,8 +334,10 @@ mod tests {
 
     #[test]
     fn projects_round_trip_through_toml() {
-        let mut config = Config::default();
-        config.projects = vec!["/a".into(), "/b".into()];
+        let config = Config {
+            projects: vec!["/a".into(), "/b".into()],
+            ..Default::default()
+        };
 
         let text = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();

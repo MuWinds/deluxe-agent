@@ -59,6 +59,11 @@ pub struct McpTool {
 }
 
 impl McpTool {
+    /// Wraps one tool an MCP server advertised.
+    ///
+    /// The server's own schema is narrowed to this crate's [`ObjectSchema`]; any
+    /// keyword it cannot express is folded into the description rather than
+    /// dropped, so the model still learns the constraint.
     pub fn new(server: &str, spec: ToolSpec, client: SharedClient) -> Self {
         let (input_schema, leftover) = split_schema(&spec.input_schema);
         let description = describe(&spec, leftover.as_ref());

@@ -18,6 +18,7 @@ pub enum ThemeChoice {
 }
 
 impl ThemeChoice {
+    /// The Chinese word shown in the menu's theme toggle.
     pub fn label(self) -> &'static str {
         match self {
             Self::Dark => "深色",
@@ -130,6 +131,11 @@ impl Palette {
     }
 }
 
+/// The palette for the chosen theme.
+///
+/// A free function rather than a method so the caller can pick a palette before
+/// it has a `ThemeChoice` value in hand — the menu reads the choice only after
+/// the frame that draws with the palette.
 pub fn palette(choice: ThemeChoice) -> Palette {
     match choice {
         ThemeChoice::Dark => Palette::dark(),

@@ -121,6 +121,8 @@ where
     R: AsyncBufRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
+    /// A transport speaking JSON-RPC over a line-delimited reader/writer pair —
+    /// the stdio server case.
     pub fn new(reader: R, writer: W) -> Self {
         Self { reader, writer }
     }
@@ -255,6 +257,11 @@ pub struct HttpTransport {
 }
 
 impl HttpTransport {
+    /// A transport speaking JSON-RPC over HTTP POST to `url`.
+    ///
+    /// Returns an error if the HTTP client cannot be built. No overall request
+    /// timeout — a tool call may run for minutes and the host bounds it — only a
+    /// connect timeout, so a dead host fails fast.
     pub fn new(url: &str) -> Result<Self> {
         // No overall timeout: a tool call can legitimately run for minutes, and
         // the host bounds each call itself. This only stops a dead host from
@@ -318,7 +325,6 @@ impl HttpTransport {
     }
 }
 
-/// One response header, as a `String`.
 fn header(response: &reqwest::Response, name: &str) -> Option<String> {
     response
         .headers()

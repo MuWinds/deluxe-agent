@@ -134,6 +134,8 @@ pub struct PluginSource {
 impl PluginSource {
     pub const LOCAL: &'static str = "local";
 
+    /// Whether the source points at a local directory (a working copy) rather
+    /// than a fetched/cached copy. Decides whether an uninstall may delete it.
     pub fn is_local(&self) -> bool {
         self.source == Self::LOCAL
     }

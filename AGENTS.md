@@ -10,7 +10,7 @@ crate 的模块。
 
 ---
 
-## Commands（可执行命令）
+## Commands
 
 ```bash
 # 构建
@@ -40,7 +40,7 @@ cargo clippy --all-targets -- -D warnings
 
 ---
 
-## Testing（测试能力）
+## Testing
 
 本仓库是**单元测试为主的原地测试**：没有 `tests/` 目录（因为没有 `lib` target），
 测试与被测代码在同一个文件。
@@ -71,7 +71,7 @@ cargo clippy --all-targets -- -D warnings
 
 ---
 
-## Project Structure（项目结构）
+## Project Structure
 
 ```
 desktop-agent/
@@ -82,7 +82,9 @@ desktop-agent/
 ├── vendor/egui-winit/     # 0.36.2 的本地补丁副本（见 Boundaries，勿删）
 └── src/
     ├── main.rs            # 入口：tracing、config/session/plugin 预加载、tokio runtime、eframe
-    ├── app.rs             # egui 界面与状态机（最大的文件）
+    ├── app/               # 桌面外壳：视图状态、事件折叠与 egui 绘制
+    │   ├── mod.rs         # 视图状态与状态机（Cmd 下行 / Event 上行），不画控件
+    │   └── ui.rs          # 全部 egui 绘制：布局、调色板取用与自由函数
     ├── agent.rs           # agent 循环：system prompt 组装、工具分发、流式回合
     ├── agent_loop_tests.rs# 循环层的端到端测试
     ├── llm.rs             # OpenAI 兼容客户端与流式解析
@@ -118,7 +120,7 @@ prompt 的 `<tools>` / `<rules>` 段落（不需要手抄一份工具清单）�
 
 ---
 
-## Code Style（代码示例）
+## Code Style
 
 遵循 <https://doc.rust-lang.org/style-guide/>，并按 **rustfmt 默认配置**格式化
 （仓库没有 `rustfmt.toml`）：4 空格缩进、行宽 100、尾随逗号、`use` 分组排序。
@@ -137,6 +139,35 @@ prompt 的 `<tools>` / `<rules>` 段落（不需要手抄一份工具清单）�
 - **异步**：工具实现 `#[async_trait::async_trait] impl Tool`；可取消的耗时路径传入
   `CancellationToken`。
 - 注释与文档里的标识符用反引号包裹（rustdoc 风格）。
+
+### 注释规范
+
+注释是读者的成本，不是免费的礼貌。**只有下面四种用途才值得写**，其余情况一律不写 ——
+多余的注释会和代码一起腐化，把阅读量翻倍却不提供信息。
+
+1. **非常难理解的代码段**：算法、位运算、协议字节序、`unsafe` 的安全前提、
+   平台差异的绕行。读者盯着看三遍还不确定的，才配一段注释。
+2. **分类用**：一段字段、一列分支或一份常量表太长时，用注释标出每一组是什么，
+   让读者能跳读。
+3. **特殊情况**：必须交代的前提、约束、已知坑，或"为什么不能写成更直观的那种写法"。
+4. **数字代表枚举的地方必须写注释**，写明每个取值的含义：
+
+   ```rust
+   const CREATE_NO_WINDOW: u32 = 0x0800_0000; // 以无窗口的控制台启动子进程
+   let tier = 100; // 100 = 钻石
+   ```
+
+另外：**通用工具方法类的函数必须写 `///` 文档注释**，说明它做什么、参数、返回值、
+以及在什么条件下返回 `Err`（会 panic 的要专门写 `# Panics`）。这是公共 API 的契约，
+不属于上面"可以不写"的范畴。
+
+**严禁**
+
+- 整行的 `// ====`、`// ----`、`// ****`、`// ~~~~` 之类的分隔注释 —— 零信息量。
+- `// 增加计数`、`// 返回结果`、`// 循环遍历列表` 这类复述代码的注释 —— 看一眼代码
+  就知道，纯噪声。
+- 注释掉的死代码。删掉它，版本历史会记得。
+- 注释与代码不一致。改了代码就同步改注释，宁可删掉注释。
 
 模块文档、错误处理与工具实现的骨架（照这个写）：
 
@@ -222,7 +253,7 @@ mod tests {
 
 ---
 
-## Git Workflow（版本与提交规范）
+## Git Workflow
 
 默认分支 `main`。`.gitignore` 已经就位，至少忽略：
 
@@ -257,7 +288,7 @@ mod tests {
 
 ---
 
-## Boundaries（操作边界）
+## Boundaries
 
 **必须遵守**
 

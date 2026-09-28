@@ -267,6 +267,8 @@ pub enum AuditOutcome {
 }
 
 impl AuditOutcome {
+    /// The Chinese word this outcome shows in the audit row.
+    /// The Chinese word this state shows in a task row.
     pub fn label(self) -> &'static str {
         match self {
             Self::Executed => "已执行",
@@ -314,6 +316,7 @@ impl JobState {
         matches!(self, Self::Completed | Self::Killed | Self::Failed)
     }
 
+    /// The Chinese word this state shows in a task row.
     pub fn label(self) -> &'static str {
         match self {
             Self::Running => "运行中",
@@ -357,6 +360,7 @@ impl JobView {
 }
 
 impl From<JobSnapshot> for JobView {
+    /// Projects a worker-side snapshot onto the window's owned vocabulary.
     fn from(snapshot: JobSnapshot) -> Self {
         let state = match snapshot.status {
             JobStatus::Running => JobState::Running,

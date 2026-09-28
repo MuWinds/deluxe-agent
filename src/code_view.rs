@@ -1,9 +1,9 @@
 //! How one tool call is drawn.
 //!
-//! `app.rs` owns the collapsed row and the fold state; everything below the fold
-//! lives here, because a panel's shape depends on which tool produced it — a
-//! patch is a diff, an `exec` is a terminal, a file read is just text. Keeping
-//! that mapping in one module is what stops `app.rs` from growing an arm per
+//! `app::ui` owns the collapsed row and the fold state; everything below the
+//! fold lives here, because a panel's shape depends on which tool produced it —
+//! a patch is a diff, an `exec` is a terminal, a file read is just text. Keeping
+//! that mapping in one module is what stops the window from growing an arm per
 //! tool.
 //!
 //! The body is shared with `markdown`: a fenced code block in a message is the
@@ -75,6 +75,7 @@ pub struct Line {
 }
 
 impl Line {
+    /// A line with no file position — a header, a marker or a plain output line.
     fn new(kind: LineKind, text: impl Into<String>) -> Self {
         Self {
             kind,
@@ -83,6 +84,7 @@ impl Line {
         }
     }
 
+    /// A line carrying the real file number it resolved to.
     fn numbered(kind: LineKind, text: impl Into<String>, num: usize) -> Self {
         Self {
             kind,
