@@ -277,7 +277,6 @@ impl AuditOutcome {
         }
     }
 
-    /// The icon drawn beside the label.
     pub fn icon(self) -> &'static str {
         match self {
             Self::Executed => crate::icons::CHECK_CIRCLE,

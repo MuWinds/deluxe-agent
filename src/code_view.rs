@@ -297,7 +297,6 @@ pub fn patch_title(patch: &str) -> String {
     }
 }
 
-/// Plain output, one `Line` per line.
 pub fn text_lines(text: &str) -> Vec<Line> {
     text.lines()
         .map(|line| Line::new(LineKind::Plain, line))
@@ -331,7 +330,6 @@ pub struct PanelSpec {
     /// Owned rather than borrowed because the patch case derives it (a file
     /// name, or a count of them) instead of having one to hand.
     pub title: String,
-    /// The title bar's leading glyph.
     pub icon: &'static str,
     /// `+n -m`. Both zero hides the pair, which is what every non-patch wants.
     pub added: usize,

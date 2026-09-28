@@ -46,7 +46,6 @@ pub trait Transport: Send {
     fn negotiated(&mut self, _version: &str) {}
 }
 
-/// The id a JSON-RPC request carries.
 fn request_id(message: &Value) -> Option<u64> {
     message.get("id").and_then(Value::as_u64)
 }
