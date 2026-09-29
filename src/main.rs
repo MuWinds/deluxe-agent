@@ -1,5 +1,3 @@
-//! `deluxe-agent` — a lightweight desktop GUI agent.
-//!
 //! Threading model, which the rest of the code assumes:
 //!
 //! * the egui window owns the main thread and never blocks;
@@ -101,10 +99,7 @@ fn main() -> eframe::Result<()> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<Event>();
 
-    let worker = Worker {
-        settings,
-        plugins,
-    };
+    let worker = Worker { settings, plugins };
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -262,7 +257,9 @@ fn spawn_worker(
                     // Only cancel the run this was meant for: a stale click must
                     // not kill a newer run. Each run has its own token, so the
                     // one named here is the only one stopped.
-                    let guard = active.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let guard = active
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if let Some(token) = guard.get(&run_id) {
                         token.cancel();
                     }

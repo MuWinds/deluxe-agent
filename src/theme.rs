@@ -295,7 +295,11 @@ mod tests {
 
     fn contrast(one: Color32, other: Color32) -> f32 {
         let (one, other) = (luminance(one), luminance(other));
-        let (lighter, darker) = if one > other { (one, other) } else { (other, one) };
+        let (lighter, darker) = if one > other {
+            (one, other)
+        } else {
+            (other, one)
+        };
         (lighter + 0.05) / (darker + 0.05)
     }
 

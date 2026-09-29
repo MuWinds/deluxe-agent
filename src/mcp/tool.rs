@@ -8,12 +8,12 @@
 //!
 //! # Two things worth knowing
 //!
-//! * **The host does not validate the arguments.** A server's JSON Schema can
+//! * The host does not validate the arguments. A server's JSON Schema can
 //!   use keywords [`ObjectSchema`] cannot express, and the server validates the
 //!   call itself, so [`ToolDescriptor::host_validates_arguments`] is `false`.
 //!   What does not fit the narrow schema is appended to the description, where
 //!   the model still reads it.
-//! * **An image a server returns is not shown.** This host's image blocks are
+//! * An image a server returns is not shown. This host's image blocks are
 //!   references to files on disk; MCP sends a picture inline as base64. Rather
 //!   than drop it silently, the block is replaced by a line saying a picture
 //!   came back, so the model knows the call produced one.
@@ -241,7 +241,10 @@ fn render_result(result: Value) -> ToolOutput {
             // model can decide to read it with `read_file`.
             Some("resource") => {
                 let resource = block.get("resource");
-                match resource.and_then(|value| value.get("text")).and_then(Value::as_str) {
+                match resource
+                    .and_then(|value| value.get("text"))
+                    .and_then(Value::as_str)
+                {
                     Some(text) => content.push(ContentBlock::text(text)),
                     None => {
                         let uri = resource
@@ -350,8 +353,7 @@ mod tests {
             "a property's own subschema survives verbatim"
         );
         assert_eq!(
-            descriptor.input_schema.properties["nested"]["items"]["$ref"],
-            "#/$defs/thing",
+            descriptor.input_schema.properties["nested"]["items"]["$ref"], "#/$defs/thing",
             "including a reference the narrow schema cannot resolve"
         );
     }
@@ -408,7 +410,10 @@ mod tests {
             built.descriptor().description,
             "This tool's server gave no description."
         );
-        assert_eq!(built.descriptor().summary, "This tool's server gave no description.");
+        assert_eq!(
+            built.descriptor().summary,
+            "This tool's server gave no description."
+        );
     }
 
     #[test]
@@ -419,7 +424,11 @@ mod tests {
         }));
 
         let summary = built.descriptor().summary;
-        assert_eq!(summary.chars().count(), MAX_SUMMARY_CHARS + 1, "capped plus the ellipsis");
+        assert_eq!(
+            summary.chars().count(),
+            MAX_SUMMARY_CHARS + 1,
+            "capped plus the ellipsis"
+        );
         assert!(summary.ends_with('…'));
         assert!(!summary.contains("second line"));
     }
@@ -466,7 +475,11 @@ mod tests {
         let pointer = render_result(json!({
             "content": [{"type": "resource", "resource": {"uri": "file:///a"}}],
         }));
-        assert!(pointer.as_text().contains("file:///a"), "{}", pointer.as_text());
+        assert!(
+            pointer.as_text().contains("file:///a"),
+            "{}",
+            pointer.as_text()
+        );
     }
 
     #[test]

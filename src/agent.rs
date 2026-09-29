@@ -122,10 +122,13 @@ fn rule_section(registry: &ToolRegistry, host_rules: &str) -> String {
 /// project — see [`crate::plugins::PluginCatalogue::for_project`]. `agents` are
 /// the delegation targets those plugins offer, and are empty when `task` is not
 /// registered, so the prompt never points at a tool the model does not have.
-fn build_system_prompt(registry: &ToolRegistry, skills: &[&Skill], agents: &[&AgentRole]) -> String {
-    let mut prompt = String::from(
-        "You are a useful coding agent running on the user's own machine.\n\n",
-    );
+fn build_system_prompt(
+    registry: &ToolRegistry,
+    skills: &[&Skill],
+    agents: &[&AgentRole],
+) -> String {
+    let mut prompt =
+        String::from("You are a useful coding agent running on the user's own machine.\n\n");
 
     prompt.push_str(&tool_section(registry));
 
@@ -767,7 +770,11 @@ impl Agent {
     /// to run a command the model did not ask for, so each goes through `exec`
     /// and inherits its shell backend, timeout, and destructive-command guard.
     async fn run_hooks(&self, tool: &str, cancel: &CancellationToken, text: &mut String) {
-        let hooks: Vec<&Hook> = self.hooks.iter().filter(|hook| hook.matches(tool)).collect();
+        let hooks: Vec<&Hook> = self
+            .hooks
+            .iter()
+            .filter(|hook| hook.matches(tool))
+            .collect();
         if hooks.is_empty() {
             return;
         }
@@ -998,7 +1005,10 @@ mod tests {
         );
         // The role's own instructions belong to the sub-agent, not here: this
         // prompt only offers the delegation target.
-        assert!(!prompt.contains("You are the Figma Implementation Agent."), "{prompt}");
+        assert!(
+            !prompt.contains("You are the Figma Implementation Agent."),
+            "{prompt}"
+        );
     }
 
     #[test]

@@ -349,6 +349,7 @@ impl App {
         // The first project is where the window opens, so a prompt typed before
         // anything is clicked still lands somewhere sensible.
         let active_project = config.projects.first().cloned();
+        let selected = sessions.first().map(|s| s.id);
 
         Self {
             cmd_tx,
@@ -358,7 +359,7 @@ impl App {
             catalogue,
             paths,
             sessions,
-            selected: None,
+            selected,
             active_project,
             active: HashMap::new(),
             next_run_id: 1,

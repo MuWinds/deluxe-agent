@@ -152,7 +152,11 @@ pub fn load(plugin: &str, root: &Path) -> Vec<Hook> {
     let mut hooks = Vec::new();
     for (event, groups) in &file.hooks {
         if event != POST_TOOL_USE {
-            tracing::debug!(plugin, event, "ignoring a hook event this agent does not support");
+            tracing::debug!(
+                plugin,
+                event,
+                "ignoring a hook event this agent does not support"
+            );
             continue;
         }
 
@@ -249,9 +253,16 @@ mod tests {
 
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks[0].pattern, "Write|Edit");
-        assert_eq!(hooks[0].command, "./scripts/post_write_figma_parity_check.sh");
+        assert_eq!(
+            hooks[0].command,
+            "./scripts/post_write_figma_parity_check.sh"
+        );
         assert_eq!(hooks[0].plugin, "figma@openai-curated");
-        assert_eq!(hooks[0].root, temp.path(), "the command runs from the plugin root");
+        assert_eq!(
+            hooks[0].root,
+            temp.path(),
+            "the command runs from the plugin root"
+        );
     }
 
     #[test]
@@ -263,8 +274,14 @@ mod tests {
         write_hooks(temp.path(), FIGMA);
         let hook = &load("figma@openai-curated", temp.path())[0];
 
-        assert!(hook.matches("apply_patch"), "Write|Edit must reach apply_patch");
-        assert!(!hook.matches("read_file"), "a write hook must not fire on a read");
+        assert!(
+            hook.matches("apply_patch"),
+            "Write|Edit must reach apply_patch"
+        );
+        assert!(
+            !hook.matches("read_file"),
+            "a write hook must not fire on a read"
+        );
         assert!(!hook.matches("exec"));
     }
 
@@ -392,9 +409,15 @@ mod tests {
     #[test]
     fn a_missing_or_broken_file_yields_no_hooks() {
         let temp = tempfile::tempdir().unwrap();
-        assert!(load("p@m", temp.path()).is_empty(), "most plugins ship no hooks");
+        assert!(
+            load("p@m", temp.path()).is_empty(),
+            "most plugins ship no hooks"
+        );
 
         write_hooks(temp.path(), "{ not json");
-        assert!(load("p@m", temp.path()).is_empty(), "a broken file must not panic");
+        assert!(
+            load("p@m", temp.path()).is_empty(),
+            "a broken file must not panic"
+        );
     }
 }

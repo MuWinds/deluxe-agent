@@ -162,7 +162,11 @@ impl FakeServer {
                      Cache-Control: no-cache\r\n\
                      Content-Length: {}\r\n\
                      Connection: close\r\n\r\n{}",
-                    if failing { "500 Internal Server Error" } else { "200 OK" },
+                    if failing {
+                        "500 Internal Server Error"
+                    } else {
+                        "200 OK"
+                    },
                     if failing { 0 } else { body.len() },
                     if failing { "" } else { body.as_str() }
                 );
@@ -181,7 +185,10 @@ impl FakeServer {
     /// Answers the request at each of `indices` with a 500, and every other
     /// request with its scripted body.
     fn fail(&self, indices: &[usize]) {
-        *self.failing.lock().expect("the failure lock is not poisoned") = indices.to_vec();
+        *self
+            .failing
+            .lock()
+            .expect("the failure lock is not poisoned") = indices.to_vec();
     }
 
     /// The body of the `index`-th request (0-based), or `""` if fewer requests
@@ -295,9 +302,8 @@ fn agent_with_registry(
     directory: &std::path::Path,
     context: ContextSettings,
 ) -> Agent {
-    let client =
-        LlmClient::new(&server.base_url, "test-model", "test-key", None)
-            .expect("the client builds");
+    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None)
+        .expect("the client builds");
     let settings = ToolSettings {
         working_directory: directory.to_path_buf(),
         ..ToolSettings::default()
@@ -441,10 +447,15 @@ async fn a_run_with_tool_calls_reports_each_turns_usage_as_it_lands() {
     // it. The final turn has no tool calls, so the run's own RunFinished is
     // what carries its figure; no sample follows it.
     let events = sink.events();
-    let sample_position = events.iter().position(|event| matches!(
-        event,
-        Event::UsageSampled { measurement: Some((10, _)), .. }
-    ));
+    let sample_position = events.iter().position(|event| {
+        matches!(
+            event,
+            Event::UsageSampled {
+                measurement: Some((10, _)),
+                ..
+            }
+        )
+    });
     let tool_position = events
         .iter()
         .position(|event| matches!(event, Event::ToolFinished { .. }));
@@ -465,7 +476,10 @@ async fn a_run_with_tool_calls_reports_each_turns_usage_as_it_lands() {
     assert!(
         !events.iter().any(|event| matches!(
             event,
-            Event::UsageSampled { measurement: Some((20, _)), .. }
+            Event::UsageSampled {
+                measurement: Some((20, _)),
+                ..
+            }
         )),
         "the final turn has no tool calls, so it must not sample again, got: {events:?}"
     );
@@ -517,7 +531,10 @@ async fn a_post_tool_use_hook_runs_and_its_output_joins_the_tool_result() {
 
     let (outcome, output) = sink.tool_output("read_file").expect("the call finished");
     assert_eq!(outcome, AuditOutcome::Executed);
-    assert!(output.contains("hello"), "the tool's own output survives: {output}");
+    assert!(
+        output.contains("hello"),
+        "the tool's own output survives: {output}"
+    );
     assert!(
         output.contains("PostToolUse hook"),
         "the hook is named in the result the model reads: {output}"
@@ -622,7 +639,11 @@ async fn a_refused_call_does_not_fire_its_hook() {
         .expect("the run completes");
 
     let (outcome, output) = sink.tool_output("exec").expect("the call finished");
-    assert_eq!(outcome, AuditOutcome::Denied, "the guard must have refused it");
+    assert_eq!(
+        outcome,
+        AuditOutcome::Denied,
+        "the guard must have refused it"
+    );
     assert!(
         !output.contains("hook-ran"),
         "a refused call is not a tool use, so its hook must not describe one: {output}"
@@ -1148,8 +1169,7 @@ async fn turning_the_guard_off_lets_a_destructive_command_through() {
     ))
     .await;
 
-    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None)
-        .expect("builds");
+    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None).expect("builds");
     let settings = ToolSettings {
         working_directory: directory.path().to_path_buf(),
         block_destructive_commands: false,

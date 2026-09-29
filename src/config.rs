@@ -390,7 +390,8 @@ mod tests {
     fn a_config_still_carrying_the_removed_reasoning_toggle_loads() {
         // The toggle is gone — reasoning is always rendered — so an old file
         // that still names it must load rather than fail on the stray key.
-        let parsed: Config = toml::from_str("[llm]\nmodel = \"m\"\nshowReasoning = false\n").unwrap();
+        let parsed: Config =
+            toml::from_str("[llm]\nmodel = \"m\"\nshowReasoning = false\n").unwrap();
         assert_eq!(parsed.llm.model, "m");
     }
 
@@ -455,10 +456,10 @@ mod tests {
         let mut config = Config::default();
         config.plugins.set_enabled("figma@openai-curated", true);
         config.plugins.set_enabled("chrome@openai-bundled", false);
-        config.plugins.projects.insert(
-            "/work/repo".into(),
-            vec!["repo-triage@my-team".into()],
-        );
+        config
+            .plugins
+            .projects
+            .insert("/work/repo".into(), vec!["repo-triage@my-team".into()]);
 
         let text = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
@@ -531,6 +532,9 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
         assert_eq!(parsed.llm.model, "some-model");
-        assert!(path.parent().unwrap().is_dir(), "the parent directory is created");
+        assert!(
+            path.parent().unwrap().is_dir(),
+            "the parent directory is created"
+        );
     }
 }

@@ -206,9 +206,11 @@ impl Tool for ListDir {
             description: "Returns names and sizes for a directory. Non-recursive by default; \
                           set `recursive` with a `glob` to walk a tree."
                 .into(),
-            guidelines: vec!["Explore a directory with `list_dir` rather than `exec` running \
+            guidelines: vec![
+                "Explore a directory with `list_dir` rather than `exec` running \
                               `ls` or `dir`."
-                .into()],
+                    .into(),
+            ],
             host_validates_arguments: true,
             mutating: false,
             input_schema: schema(

@@ -50,11 +50,11 @@ pub struct ImageRef {
 impl ImageRef {
     /// The stored bytes as a `data:` URL, which is what the wire format wants.
     pub fn data_url(&self) -> Result<String> {
-        let dir = store_dir()
-            .ok_or_else(|| AgentError::internal("No config directory is available on this system"))?;
-        let bytes = std::fs::read(self.path_in(&dir)).map_err(|error| {
-            AgentError::from_io("Failed to read a stored image", error)
+        let dir = store_dir().ok_or_else(|| {
+            AgentError::internal("No config directory is available on this system")
         })?;
+        let bytes = std::fs::read(self.path_in(&dir))
+            .map_err(|error| AgentError::from_io("Failed to read a stored image", error))?;
         Ok(data_url_from(&bytes, &self.media_type))
     }
 
@@ -71,9 +71,8 @@ impl ImageRef {
 pub fn load_bytes(image: &ImageRef) -> Result<Vec<u8>> {
     let dir = store_dir()
         .ok_or_else(|| AgentError::internal("No config directory is available on this system"))?;
-    std::fs::read(image.path_in(&dir)).map_err(|error| {
-        AgentError::from_io("Failed to read a stored image", error)
-    })
+    std::fs::read(image.path_in(&dir))
+        .map_err(|error| AgentError::from_io("Failed to read a stored image", error))
 }
 
 /// Encodes bytes as the `data:` URL the OpenAI image part expects.
@@ -197,12 +196,7 @@ pub struct Prepared {
 /// byte-for-byte; an over-budget PNG or JPEG is decoded, downscaled, and
 /// re-encoded, with the budget halved and retried a bounded number of times —
 /// a lossless re-encode of a photograph can still land over the byte cap.
-pub fn prepare(
-    media_type: &str,
-    bytes: &[u8],
-    width: u32,
-    height: u32,
-) -> Result<Prepared> {
+pub fn prepare(media_type: &str, bytes: &[u8], width: u32, height: u32) -> Result<Prepared> {
     if bytes.len() > MAX_IMAGE_BYTES {
         return Err(AgentError::invalid_params(format!(
             "the image is {} bytes, over the {MAX_IMAGE_BYTES} byte attachment limit",
@@ -440,7 +434,10 @@ mod tests {
 
     #[test]
     fn sniffs_each_supported_signature() {
-        assert_eq!(sniff(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0]), Some("image/png"));
+        assert_eq!(
+            sniff(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0]),
+            Some("image/png")
+        );
         assert_eq!(sniff(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
         assert_eq!(sniff(b"GIF89a...."), Some("image/gif"));
         let mut webp = b"RIFF".to_vec();
@@ -462,8 +459,7 @@ mod tests {
     fn a_stored_image_round_trips_through_a_data_url() {
         let dir = tempfile::tempdir().expect("a temp directory is available");
         let bytes = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-        let image = save_in(dir.path(), &bytes, "image/png", None, 1, 1)
-            .expect("the image stores");
+        let image = save_in(dir.path(), &bytes, "image/png", None, 1, 1).expect("the image stores");
 
         assert_eq!(image.bytes, 8);
         assert_eq!(image.media_type, "image/png");
@@ -481,5 +477,4 @@ mod tests {
         let error = store_from_bytes(b"not an image", None).unwrap_err();
         assert!(error.to_string().contains("supported"), "{error}");
     }
-
 }

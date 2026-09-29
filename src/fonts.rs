@@ -75,12 +75,14 @@ fn definitions() -> FontDefinitions {
     // discard the rest.
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
 
-    fonts
-        .font_data
-        .insert(CJK_FACE.to_owned(), Arc::new(FontData::from_static(CJK_FONT)));
-    fonts
-        .font_data
-        .insert(BOLD_FACE.to_owned(), Arc::new(FontData::from_static(BOLD_FONT)));
+    fonts.font_data.insert(
+        CJK_FACE.to_owned(),
+        Arc::new(FontData::from_static(CJK_FONT)),
+    );
+    fonts.font_data.insert(
+        BOLD_FACE.to_owned(),
+        Arc::new(FontData::from_static(BOLD_FONT)),
+    );
 
     // Appended rather than prepended: Latin keeps egui's own metrics, and only
     // the codepoints the earlier faces lack — Chinese, and the symbols egui's

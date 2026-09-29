@@ -220,7 +220,11 @@ impl JobRegistry {
         mut child: Child,
         stdin: Option<String>,
     ) -> JobId {
-        let job = self.register(kind, label, JobPayload::Stream(Mutex::new(StreamBuffer::default())));
+        let job = self.register(
+            kind,
+            label,
+            JobPayload::Stream(Mutex::new(StreamBuffer::default())),
+        );
         let registry = Arc::clone(self);
         let reader = Arc::clone(&job);
         let cancel = job.cancel.clone();
@@ -311,12 +315,18 @@ impl JobRegistry {
 
             let (status, detail, text) = match outcome {
                 Ok(text) => (JobStatus::Completed, None, text),
-                Err(_error) if cancel.is_cancelled() => {
-                    (JobStatus::Killed, Some("cancelled".to_string()), String::new())
-                }
+                Err(_error) if cancel.is_cancelled() => (
+                    JobStatus::Killed,
+                    Some("cancelled".to_string()),
+                    String::new(),
+                ),
                 Err(error) => {
                     let message = error.to_string();
-                    (JobStatus::Failed, Some(message.clone()), format!("Error: {message}"))
+                    (
+                        JobStatus::Failed,
+                        Some(message.clone()),
+                        format!("Error: {message}"),
+                    )
                 }
             };
 
@@ -427,7 +437,9 @@ impl JobRegistry {
 
         let (text, truncated, bytes) = match &job.payload {
             JobPayload::Stream(buffer) => {
-                let mut buffer = buffer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut buffer = buffer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let text = take_delta(&mut buffer);
                 let truncated = buffer.stdout.truncated || buffer.stderr.truncated;
                 let bytes = buffer.stdout.bytes.len() + buffer.stderr.bytes.len();
@@ -535,7 +547,9 @@ async fn pump<R: AsyncRead + Unpin>(reader: Option<R>, job: Arc<Job>, side: Stre
                 let JobPayload::Stream(buffer) = &job.payload else {
                     break;
                 };
-                let mut buffer = buffer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut buffer = buffer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let stream = match side {
                     StreamSide::Stdout => &mut buffer.stdout,
                     StreamSide::Stderr => &mut buffer.stderr,
@@ -742,11 +756,7 @@ impl Tool for JobList {
         if jobs.is_empty() {
             return Ok(ToolOutput::text("(no background jobs)"));
         }
-        let body = jobs
-            .iter()
-            .map(list_line)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let body = jobs.iter().map(list_line).collect::<Vec<_>>().join("\n");
         Ok(ToolOutput::text(body))
     }
 }
@@ -794,7 +804,11 @@ impl Tool for JobKill {
         let snapshot = self.jobs.kill(&id, reason.as_deref())?;
 
         let text = if snapshot.status.is_settled() {
-            format!("job {} is already finished [{}]", snapshot.id, snapshot.status_line())
+            format!(
+                "job {} is already finished [{}]",
+                snapshot.id,
+                snapshot.status_line()
+            )
         } else {
             format!(
                 "requested cancellation of job {} [{}]",
@@ -859,7 +873,10 @@ mod tests {
             .await
             .expect("read the job");
 
-        assert!(read.snapshot.status.is_settled(), "the job should have finished");
+        assert!(
+            read.snapshot.status.is_settled(),
+            "the job should have finished"
+        );
         assert_eq!(read.snapshot.exit_code, Some(0));
         assert!(read.text.contains("hello"), "output was: {:?}", read.text);
         assert_eq!(read.snapshot.kind, "bash");
@@ -955,12 +972,18 @@ mod tests {
 
         let first = jobs.drain_notifications();
         assert_eq!(first.len(), 1, "one completion should be queued: {first:?}");
-        assert!(first[0].contains(&id), "the notice names the job: {first:?}");
+        assert!(
+            first[0].contains(&id),
+            "the notice names the job: {first:?}"
+        );
 
         // Draining again yields nothing, and a second read does not re-queue.
         assert!(jobs.drain_notifications().is_empty());
         let _ = jobs.read(&id, false, Duration::ZERO).await.unwrap();
-        assert!(jobs.drain_notifications().is_empty(), "a read reports the job");
+        assert!(
+            jobs.drain_notifications().is_empty(),
+            "a read reports the job"
+        );
     }
 
     #[tokio::test]

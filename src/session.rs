@@ -412,9 +412,9 @@ impl Session {
     /// A marker carrying no summary is a compaction that failed: that run went
     /// out with its history intact, so the replay must keep it too.
     fn last_compaction(&self) -> Option<usize> {
-        self.steps.iter().rposition(|step| {
-            matches!(step, Step::Compaction { summary } if !summary.trim().is_empty())
-        })
+        self.steps.iter().rposition(
+            |step| matches!(step, Step::Compaction { summary } if !summary.trim().is_empty()),
+        )
     }
 }
 
@@ -513,7 +513,9 @@ fn push_tool_turn(messages: &mut Vec<Message>, text: &str, tools: &[Step]) {
     let tool_calls = calls
         .iter()
         .filter_map(|(id, tool)| match tool {
-            Step::Tool { name, arguments, .. } => Some(ToolCall {
+            Step::Tool {
+                name, arguments, ..
+            } => Some(ToolCall {
                 id: id.clone(),
                 call_type: "function".into(),
                 function: FunctionCall {
@@ -825,12 +827,17 @@ mod tests {
     #[test]
     fn to_messages_replays_the_conversation_in_order() {
         let session = session_with(vec![
-            Step::User { text: "list the directory".into(), images: Vec::new() },
+            Step::User {
+                text: "list the directory".into(),
+                images: Vec::new(),
+            },
             Step::Reasoning {
                 id: Uuid::new_v4(),
                 text: "thinking out loud".into(),
             },
-            Step::Assistant { text: "I will look.".into() },
+            Step::Assistant {
+                text: "I will look.".into(),
+            },
             Step::Tool {
                 call_id: "call_1".into(),
                 name: "list_dir".into(),
@@ -843,7 +850,9 @@ mod tests {
                     duration_ms: 3,
                 }),
             },
-            Step::Assistant { text: "it is empty".into() },
+            Step::Assistant {
+                text: "it is empty".into(),
+            },
         ]);
 
         let messages = session.to_messages();
@@ -865,7 +874,10 @@ mod tests {
         // The prose and its call are one assistant turn on the wire: the
         // result answers a call that turn actually carries, or the provider
         // rejects the whole request.
-        let calls = messages[1].tool_calls.as_ref().expect("the turn carries its call");
+        let calls = messages[1]
+            .tool_calls
+            .as_ref()
+            .expect("the turn carries its call");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[0].function.name, "list_dir");
@@ -879,14 +891,18 @@ mod tests {
                 id: Uuid::new_v4(),
                 text: "private".into(),
             },
-            Step::Assistant { text: "calling a tool".into() },
+            Step::Assistant {
+                text: "calling a tool".into(),
+            },
             Step::Tool {
                 call_id: "call_1".into(),
                 name: "read_file".into(),
                 arguments: serde_json::json!({}),
                 result: None,
             },
-            Step::Notice { text: "上次运行被中断".into() },
+            Step::Notice {
+                text: "上次运行被中断".into(),
+            },
         ]);
 
         let messages = session.to_messages();
@@ -894,7 +910,10 @@ mod tests {
         // replays. The call that never finished still needs a reply — an
         // assistant `tool_calls` entry with no `tool` message is rejected just
         // as an orphan `tool` message is — so its result is synthesised.
-        let roles: Vec<&str> = messages.iter().map(|message| message.role.as_str()).collect();
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect();
         assert_eq!(roles, vec!["assistant", "tool"]);
         assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_1"));
         assert!(
@@ -929,10 +948,16 @@ mod tests {
         ]);
 
         let messages = session.to_messages();
-        let roles: Vec<&str> = messages.iter().map(|message| message.role.as_str()).collect();
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect();
         assert_eq!(roles, vec!["user", "assistant", "tool"]);
 
-        let calls = messages[1].tool_calls.as_ref().expect("the turn carries its call");
+        let calls = messages[1]
+            .tool_calls
+            .as_ref()
+            .expect("the turn carries its call");
         assert_eq!(calls[0].id, "call_7");
         assert_eq!(calls[0].function.arguments, r#"{"path":"a.txt"}"#);
         assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_7"));
@@ -1163,13 +1188,18 @@ mod tests {
             Step::Compaction {
                 summary: "Earlier: the user wants the build fixed.".into(),
             },
-            Step::Assistant { text: "on it".into() },
+            Step::Assistant {
+                text: "on it".into(),
+            },
         ]);
 
         // The transcript keeps everything: the marker is what explains where
         // the older turns went.
         let text = session.as_text();
-        assert!(text.contains("上下文压缩"), "the marker must render: {text}");
+        assert!(
+            text.contains("上下文压缩"),
+            "the marker must render: {text}"
+        );
         assert!(
             text.contains("fix the build"),
             "the transcript is not truncated: {text}"
@@ -1217,7 +1247,9 @@ mod tests {
             Step::Compaction {
                 summary: String::new(),
             },
-            Step::Assistant { text: "on it".into() },
+            Step::Assistant {
+                text: "on it".into(),
+            },
         ]);
 
         let rendered: Vec<String> = session

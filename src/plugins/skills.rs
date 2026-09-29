@@ -200,7 +200,10 @@ mod tests {
         let skills = load("latex@openai-bundled", temp.path(), Some("./skills/"));
 
         assert_eq!(
-            skills.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>(),
+            skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["computer-use", "latex-compile"],
             "sorted by name, so the prompt is byte-stable"
         );
@@ -212,7 +215,11 @@ mod tests {
     #[test]
     fn a_skill_without_frontmatter_falls_back_to_its_directory_name() {
         let temp = tempfile::tempdir().unwrap();
-        skill_file(temp.path(), "skills/repo-triage", "# Repo Triage\n\nDo the thing.");
+        skill_file(
+            temp.path(),
+            "skills/repo-triage",
+            "# Repo Triage\n\nDo the thing.",
+        );
 
         let skills = load("p@m", temp.path(), None);
 
@@ -269,7 +276,10 @@ mod tests {
         let skills = load("p@m", temp.path(), Some("./extra"));
 
         assert_eq!(skills.len(), 1, "the same name is one skill, not two");
-        assert_eq!(skills[0].description.as_deref(), Some("from the standard location"));
+        assert_eq!(
+            skills[0].description.as_deref(),
+            Some("from the standard location")
+        );
     }
 
     #[test]
@@ -293,7 +303,11 @@ mod tests {
         let skills = load("p@m", temp.path(), None);
 
         let description = skills[0].description.as_ref().unwrap();
-        assert_eq!(description.chars().count(), MAX_DESCRIPTION_CHARS + 1, "capped plus the ellipsis");
+        assert_eq!(
+            description.chars().count(),
+            MAX_DESCRIPTION_CHARS + 1,
+            "capped plus the ellipsis"
+        );
         assert!(description.ends_with('…'));
     }
 
@@ -312,14 +326,21 @@ mod tests {
             section.contains("computer-use@openai-bundled"),
             "the plugin is named, so two marketplaces cannot be confused: {section}"
         );
-        assert!(section.contains("Control Windows apps from Codex"), "{section}");
+        assert!(
+            section.contains("Control Windows apps from Codex"),
+            "{section}"
+        );
 
         // The path in the prompt has to be one the model can actually read, so
         // it is checked against the filesystem rather than against a second
         // hand-built string — building that string independently is how a
         // separator mismatch would slip through unnoticed.
         let path = &skills[0].path;
-        assert!(path.is_file(), "the advertised path must exist: {}", path.display());
+        assert!(
+            path.is_file(),
+            "the advertised path must exist: {}",
+            path.display()
+        );
         assert!(section.contains(&path.display().to_string()), "{section}");
 
         // Progressive disclosure: the body is not inlined.

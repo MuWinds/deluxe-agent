@@ -2,14 +2,14 @@
 //!
 //! Two things here are easy to get wrong and are worth reading before editing:
 //!
-//! 1. **Tool-call streaming.** `delta.tool_calls` arrives as fragments keyed by
+//! 1. Tool-call streaming. `delta.tool_calls` arrives as fragments keyed by
 //!    `index`, and `function.arguments` is a *string* that must be concatenated
 //!    across chunks — it is not valid JSON until the turn ends. Accumulating it
 //!    into a `Value` per chunk silently produces a truncated call.
-//! 2. **Line decoding.** The byte stream is split on `\n` *before* being decoded
+//! 2. Line decoding. The byte stream is split on `\n` *before* being decoded
 //!    to UTF-8. Decoding each chunk as it arrives would split a multi-byte
 //!    character that straddles a chunk boundary and corrupt the text.
-//! 3. **Reasoning.** DeepSeek-R1-style models stream the chain of thought in
+//! 3. Reasoning. DeepSeek-R1-style models stream the chain of thought in
 //!    `delta.reasoning_content`; other providers spell it `reasoning`. Both are
 //!    surfaced as [`StreamFragment::Reasoning`] and must never be mixed into
 //!    the answer text.
@@ -929,8 +929,8 @@ mod tests {
 
     #[test]
     fn a_configured_output_budget_is_sent_as_max_tokens() {
-        let client = LlmClient::new("http://localhost/v1", "m", "k", Some(8192))
-            .expect("the client builds");
+        let client =
+            LlmClient::new("http://localhost/v1", "m", "k", Some(8192)).expect("the client builds");
         let body = client.turn_body(&[], &json!([]), None);
         assert_eq!(body["max_tokens"], 8192);
     }

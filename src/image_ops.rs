@@ -1,5 +1,3 @@
-//! Decode → resample → re-encode, without an image-processing library.
-//!
 //! `read_image` has to shrink an oversized image before it reaches the
 //! provider, and a provider only accepts a real encoded image — so shrinking
 //! means decode, resample, and re-encode. The resample and the encode are
@@ -285,11 +283,7 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         }
         // SOF0..SOF15, minus DHT (C4), JPG (C8) and DAC (CC), which sit in the
         // same numeric range but are not frame headers.
-        if (0xC0..=0xCF).contains(&marker)
-            && marker != 0xC4
-            && marker != 0xC8
-            && marker != 0xCC
-        {
+        if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC {
             if index + 9 > bytes.len() {
                 return None;
             }
@@ -422,7 +416,9 @@ mod tests {
         let raster = Raster {
             width: 2,
             height: 2,
-            rgba: vec![0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255],
+            rgba: vec![
+                0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+            ],
         };
         let scaled = downsample(&raster, 1, 1);
         assert_eq!((scaled.width, scaled.height), (1, 1));

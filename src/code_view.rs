@@ -413,7 +413,9 @@ fn draw_title_bar(ui: &mut egui::Ui, p: &Palette, spec: &PanelSpec) {
                     if ui
                         .add(
                             Button::new(
-                                RichText::new(icons::COPY).size(TITLE_SIZE).color(p.text_muted),
+                                RichText::new(icons::COPY)
+                                    .size(TITLE_SIZE)
+                                    .color(p.text_muted),
                             )
                             .frame(false),
                         )
@@ -427,11 +429,8 @@ fn draw_title_bar(ui: &mut egui::Ui, p: &Palette, spec: &PanelSpec) {
         });
 
     let rect = bar.response.rect;
-    ui.painter().hline(
-        rect.x_range(),
-        rect.bottom(),
-        Stroke::new(1.0, p.border),
-    );
+    ui.painter()
+        .hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, p.border));
 }
 
 fn draw_body(ui: &mut egui::Ui, p: &Palette, call_id: &str, spec: &PanelSpec) {
@@ -593,17 +592,23 @@ mod tests {
         let lines = patch_lines(PATCH, None);
         assert!(!lines.iter().any(|line| line.text.contains("Begin Patch")));
         assert!(!lines.iter().any(|line| line.text.contains("End Patch")));
-        assert!(lines
-            .iter()
-            .any(|line| line.kind == LineKind::Meta && line.text == "*** Update File: src/agent.rs"));
+        assert!(lines.iter().any(
+            |line| line.kind == LineKind::Meta && line.text == "*** Update File: src/agent.rs"
+        ));
     }
 
     #[test]
     fn patch_lines_strips_the_hunk_markers() {
         let lines = patch_lines(PATCH, None);
-        let add = lines.iter().find(|line| line.text == "new").expect("the added line");
+        let add = lines
+            .iter()
+            .find(|line| line.text == "new")
+            .expect("the added line");
         assert_eq!(add.kind, LineKind::Add);
-        let del = lines.iter().find(|line| line.text == "old").expect("the removed line");
+        let del = lines
+            .iter()
+            .find(|line| line.text == "old")
+            .expect("the removed line");
         assert_eq!(del.kind, LineKind::Del);
         // The context line's leading space is a marker too, and must go.
         let context = lines
@@ -616,8 +621,10 @@ mod tests {
 
     #[test]
     fn a_blank_line_is_kept_rather_than_treated_as_a_marker() {
-        let lines =
-            patch_lines("*** Begin Patch\n*** Update File: a\n@@\n\n+x\n*** End Patch", None);
+        let lines = patch_lines(
+            "*** Begin Patch\n*** Update File: a\n@@\n\n+x\n*** End Patch",
+            None,
+        );
         assert!(lines.iter().any(|line| line.text.is_empty()));
     }
 
@@ -629,14 +636,20 @@ mod tests {
             .find(|line| line.text == "history:")
             .expect("the context line");
         assert_eq!(context.num, Some(1));
-        let del = lines.iter().find(|line| line.text == "old").expect("the removed line");
+        let del = lines
+            .iter()
+            .find(|line| line.text == "old")
+            .expect("the removed line");
         assert_eq!(del.num, Some(2));
     }
 
     #[test]
     fn an_added_line_takes_the_number_it_sits_at_without_moving_the_count() {
         let lines = patch_lines(PATCH, None);
-        let add = lines.iter().find(|line| line.text == "new").expect("the added line");
+        let add = lines
+            .iter()
+            .find(|line| line.text == "new")
+            .expect("the added line");
         // It replaces the removed line at position 2, so it carries 2 — and the
         // next section's count is not pushed on by it.
         assert_eq!(add.num, Some(2));
@@ -655,7 +668,10 @@ mod tests {
     #[test]
     fn scaffolding_carries_no_number() {
         let lines = patch_lines(PATCH, None);
-        let header = lines.iter().find(|line| line.kind == LineKind::Meta).expect("a header");
+        let header = lines
+            .iter()
+            .find(|line| line.kind == LineKind::Meta)
+            .expect("a header");
         assert_eq!(header.num, None);
         assert!(lines
             .iter()
@@ -689,7 +705,8 @@ mod tests {
 
     #[test]
     fn a_move_is_not_a_second_file() {
-        let patch = "*** Begin Patch\n*** Update File: a\n*** Move to: b\n@@\n-x\n+y\n*** End Patch";
+        let patch =
+            "*** Begin Patch\n*** Update File: a\n*** Move to: b\n@@\n-x\n+y\n*** End Patch";
         assert_eq!(patch_title(patch), "a");
     }
 
@@ -697,7 +714,8 @@ mod tests {
     fn the_execution_time_table_supplies_real_file_numbers() {
         // A hunk matched at line 40: context is 40, the removal 41, the two
         // inserted lines take 41 and 42.
-        let patch = "*** Begin Patch\n*** Update File: a\n@@\n ctx\n-old\n+new\n+newer\n*** End Patch";
+        let patch =
+            "*** Begin Patch\n*** Update File: a\n@@\n ctx\n-old\n+new\n+newer\n*** End Patch";
         let lines = patch_lines(patch, Some(&[Some(40), Some(41), Some(41), Some(42)]));
         let numbered: Vec<Option<usize>> = lines
             .iter()

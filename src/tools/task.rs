@@ -160,7 +160,8 @@ impl Tool for Task {
             .iter()
             .find(|role| role.name == name)
             .ok_or_else(|| {
-                let available: Vec<&str> = self.roles.iter().map(|role| role.name.as_str()).collect();
+                let available: Vec<&str> =
+                    self.roles.iter().map(|role| role.name.as_str()).collect();
                 AgentError::invalid_params(format!(
                     "Unknown agent `{name}`. Available: {}",
                     available.join(", ")
@@ -182,18 +183,21 @@ impl Tool for Task {
             let context_settings = self.context_settings;
             let forwarder = self.forwarder.clone();
 
-            let job_id = self.registry.jobs().start_result("subagent", label, move |job_id| {
-                run_delegation(
-                    llm,
-                    registry,
-                    settings,
-                    working_directory,
-                    context_settings,
-                    role,
-                    prompt,
-                    SubagentSink::live(job_id, forwarder),
-                )
-            });
+            let job_id = self
+                .registry
+                .jobs()
+                .start_result("subagent", label, move |job_id| {
+                    run_delegation(
+                        llm,
+                        registry,
+                        settings,
+                        working_directory,
+                        context_settings,
+                        role,
+                        prompt,
+                        SubagentSink::live(job_id, forwarder),
+                    )
+                });
             return Ok(ToolOutput::text(format!(
                 "started background job {job_id}\nThe `{name}` agent is running in the \
                  background. Read its answer with job_output(jobId=\"{job_id}\")."
@@ -423,9 +427,15 @@ mod tests {
 
         let description = task.descriptor().description;
 
-        assert!(description.contains("`figma-implementation-agent`"), "{description}");
+        assert!(
+            description.contains("`figma-implementation-agent`"),
+            "{description}"
+        );
         assert!(description.contains("Write the code"), "{description}");
-        assert!(description.contains("`design-parity-review-agent`"), "{description}");
+        assert!(
+            description.contains("`design-parity-review-agent`"),
+            "{description}"
+        );
     }
 
     #[tokio::test]
@@ -436,7 +446,10 @@ mod tests {
         let task = task_with(vec![role("figma-implementation-agent", None)]);
 
         let error = task
-            .execute(json!({"agent": "no-such-agent", "prompt": "do it"}), &ToolSettings::default())
+            .execute(
+                json!({"agent": "no-such-agent", "prompt": "do it"}),
+                &ToolSettings::default(),
+            )
             .await
             .unwrap_err();
 
@@ -453,7 +466,10 @@ mod tests {
         let task = task_with(vec![role("figma-implementation-agent", None)]);
 
         let error = task
-            .execute(json!({"agent": "figma-implementation-agent"}), &ToolSettings::default())
+            .execute(
+                json!({"agent": "figma-implementation-agent"}),
+                &ToolSettings::default(),
+            )
             .await
             .unwrap_err();
 
@@ -521,7 +537,11 @@ mod tests {
             "{:?}",
             events[1]
         );
-        assert_eq!(sink.answer(), "the answer", "forwarding must not lose the answer");
+        assert_eq!(
+            sink.answer(),
+            "the answer",
+            "forwarding must not lose the answer"
+        );
     }
 
     #[test]
@@ -552,7 +572,10 @@ mod tests {
             sub.get("task").is_none(),
             "a sub-agent cannot delegate again, or delegation would be unbounded"
         );
-        assert!(sub.get("apply_patch").is_some(), "the sub-agent keeps the real tools");
+        assert!(
+            sub.get("apply_patch").is_some(),
+            "the sub-agent keeps the real tools"
+        );
     }
 
     #[tokio::test]
@@ -576,7 +599,9 @@ mod tests {
 
         assert!(!output.is_error, "{}", output.as_text());
         assert!(
-            output.as_text().contains("started background job subagent-1"),
+            output
+                .as_text()
+                .contains("started background job subagent-1"),
             "{}",
             output.as_text()
         );

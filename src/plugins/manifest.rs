@@ -110,7 +110,9 @@ impl MarketplaceEntry {
     /// withdraw a plugin without deleting the entry.
     pub fn is_offered(&self) -> bool {
         !matches!(
-            self.policy.as_ref().and_then(|policy| policy.installation.as_deref()),
+            self.policy
+                .as_ref()
+                .and_then(|policy| policy.installation.as_deref()),
             Some("NOT_AVAILABLE")
         )
     }
@@ -234,8 +236,9 @@ pub const MCP_FILE: &str = ".mcp.json";
 /// Reads and parses a plugin manifest from a plugin root.
 pub fn read_plugin(root: &Path) -> Result<PluginManifest> {
     let path = root.join(MANIFEST_DIR).join(MANIFEST_FILE);
-    let text = std::fs::read_to_string(&path)
-        .map_err(|error| AgentError::from_io(&format!("Failed to read {}", path.display()), error))?;
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        AgentError::from_io(&format!("Failed to read {}", path.display()), error)
+    })?;
     parse_plugin(&text, &path)
 }
 
@@ -250,8 +253,9 @@ fn parse_plugin(text: &str, path: &Path) -> Result<PluginManifest> {
 
 /// Reads and parses a `marketplace.json`.
 pub fn read_marketplace(path: &Path) -> Result<MarketplaceManifest> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| AgentError::from_io(&format!("Failed to read {}", path.display()), error))?;
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        AgentError::from_io(&format!("Failed to read {}", path.display()), error)
+    })?;
     serde_json::from_str(&text).map_err(|error| {
         AgentError::internal(format!(
             "{} is not a valid marketplace manifest: {error}",
@@ -271,8 +275,9 @@ pub fn read_mcp_servers(root: &Path) -> Result<BTreeMap<String, McpServerConfig>
     if !path.is_file() {
         return Ok(BTreeMap::new());
     }
-    let text = std::fs::read_to_string(&path)
-        .map_err(|error| AgentError::from_io(&format!("Failed to read {}", path.display()), error))?;
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        AgentError::from_io(&format!("Failed to read {}", path.display()), error)
+    })?;
     Ok(parse_mcp_servers(&text, &path)?.servers)
 }
 
@@ -401,7 +406,11 @@ mod tests {
         // `name` is the one required field: it is the namespace every other
         // component is keyed by, so there is nothing sensible to fall back to.
         let error = parse_plugin(r#"{"version":"1.0.0"}"#, std::path::Path::new("p")).unwrap_err();
-        assert!(error.message.contains("plugin manifest"), "{}", error.message);
+        assert!(
+            error.message.contains("plugin manifest"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
@@ -423,7 +432,10 @@ mod tests {
         assert_eq!(marketplace.name, "openai-curated");
         assert_eq!(marketplace.plugins.len(), 3);
         assert!(marketplace.plugins[0].source.is_local());
-        assert_eq!(marketplace.plugins[0].source.path.as_deref(), Some("./plugins/linear"));
+        assert_eq!(
+            marketplace.plugins[0].source.path.as_deref(),
+            Some("./plugins/linear")
+        );
         assert!(!marketplace.plugins[1].source.is_local());
         assert!(marketplace.plugins[1].policy.is_none());
     }
@@ -441,7 +453,10 @@ mod tests {
 
         assert!(offered("AVAILABLE"));
         assert!(offered("INSTALLED_BY_DEFAULT"));
-        assert!(!offered("NOT_AVAILABLE"), "withdrawn entries must be skipped");
+        assert!(
+            !offered("NOT_AVAILABLE"),
+            "withdrawn entries must be skipped"
+        );
     }
 
     #[test]
@@ -533,7 +548,10 @@ mod tests {
         assert_eq!(scheduler.command.as_deref(), Some("python"));
         assert_eq!(scheduler.args, vec!["./scripts/mcp_server.py"]);
         assert_eq!(scheduler.cwd.as_deref(), Some("."));
-        assert_eq!(scheduler.env.get("PYTHONUTF8").map(String::as_str), Some("1"));
+        assert_eq!(
+            scheduler.env.get("PYTHONUTF8").map(String::as_str),
+            Some("1")
+        );
         assert_eq!(
             scheduler.startup_timeout_sec,
             Some(20),
@@ -563,8 +581,14 @@ mod tests {
     fn the_transport_defaults_to_stdio_and_an_explicit_type_wins() {
         let kind = |text: &str| servers(text).into_values().next().unwrap().is_http();
 
-        assert!(!kind(r#"{"mcpServers":{"x":{"command":"node"}}}"#), "no type means stdio");
-        assert!(kind(r#"{"mcpServers":{"x":{"url":"https://x/mcp"}}}"#), "a url with no command can only be http");
+        assert!(
+            !kind(r#"{"mcpServers":{"x":{"command":"node"}}}"#),
+            "no type means stdio"
+        );
+        assert!(
+            kind(r#"{"mcpServers":{"x":{"url":"https://x/mcp"}}}"#),
+            "a url with no command can only be http"
+        );
         assert!(
             !kind(r#"{"mcpServers":{"x":{"type":"stdio","url":"https://x/mcp"}}}"#),
             "an explicit type is not overruled by a stray url"
@@ -574,7 +598,11 @@ mod tests {
     #[test]
     fn a_file_that_is_not_an_mcp_file_is_an_error() {
         let error = parse_mcp_servers("{", std::path::Path::new(".mcp.json")).unwrap_err();
-        assert!(error.message.contains("MCP server file"), "{}", error.message);
+        assert!(
+            error.message.contains("MCP server file"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

@@ -187,7 +187,9 @@ mod tests {
             "with no frontmatter the first line of prose is the summary"
         );
         assert!(
-            roles[0].instructions.contains("Always get `get_design_context`"),
+            roles[0]
+                .instructions
+                .contains("Always get `get_design_context`"),
             "the body is carried whole, since it becomes the system prompt"
         );
         assert!(roles[0].path.is_absolute() || roles[0].path.is_file());
@@ -274,7 +276,10 @@ mod tests {
             section.contains("figma@openai-curated"),
             "the plugin is named, so two marketplaces cannot be confused: {section}"
         );
-        assert!(section.contains("You are the Figma Implementation Agent"), "{section}");
+        assert!(
+            section.contains("You are the Figma Implementation Agent"),
+            "{section}"
+        );
     }
 
     #[test]

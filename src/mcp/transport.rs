@@ -178,14 +178,12 @@ impl StdioTransport {
         // would otherwise open one of its own over the app.
         crate::process::hide_console(&mut cmd);
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|error| {
-                AgentError::from_io(
-                    &format!("Failed to start the `{server}` MCP server (`{command}`)"),
-                    error,
-                )
-            })?;
+        let mut child = cmd.spawn().map_err(|error| {
+            AgentError::from_io(
+                &format!("Failed to start the `{server}` MCP server (`{command}`)"),
+                error,
+            )
+        })?;
 
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             // Unreachable — both pipes were asked for just above — but a child
@@ -467,7 +465,11 @@ mod tests {
 
         let got = transport.round_trip(&request()).await.unwrap();
 
-        assert_eq!(got, answer(), "the notification carries no id and is not ours");
+        assert_eq!(
+            got,
+            answer(),
+            "the notification carries no id and is not ours"
+        );
     }
 
     #[tokio::test]
@@ -506,7 +508,11 @@ mod tests {
         let error = read_answer(&mut BufReader::new(read), Some(1))
             .await
             .unwrap_err();
-        assert!(error.message.contains("closed its output"), "{}", error.message);
+        assert!(
+            error.message.contains("closed its output"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

@@ -205,7 +205,9 @@ mod tests {
             Some("Create or update parserless Figma Code Connect template files for components."),
             "with no frontmatter the first line of prose is the summary"
         );
-        assert!(commands[0].template.starts_with("# /connect-figma-components"));
+        assert!(commands[0]
+            .template
+            .starts_with("# /connect-figma-components"));
     }
 
     #[test]
@@ -250,8 +252,16 @@ mod tests {
         // `vercel/commands/_conventions.md` is authoring guidance for the
         // other commands, not something to type.
         let temp = tempfile::tempdir().unwrap();
-        write_command(temp.path(), "_conventions.md", "# Command Conventions\n\nEvery command follows this structure.\n");
-        write_command(temp.path(), "deploy.md", "---\ndescription: Deploy\n---\n\nBody.\n");
+        write_command(
+            temp.path(),
+            "_conventions.md",
+            "# Command Conventions\n\nEvery command follows this structure.\n",
+        );
+        write_command(
+            temp.path(),
+            "deploy.md",
+            "---\ndescription: Deploy\n---\n\nBody.\n",
+        );
 
         let commands = load("vercel", temp.path());
 
@@ -266,8 +276,16 @@ mod tests {
     fn a_template_source_beside_its_command_is_not_a_second_command() {
         // `vercel/commands/` really does hold `deploy.md` and `deploy.md.tmpl`.
         let temp = tempfile::tempdir().unwrap();
-        write_command(temp.path(), "deploy.md", "---\ndescription: Deploy\n---\n\nBody.\n");
-        write_command(temp.path(), "deploy.md.tmpl", "---\ndescription: Deploy\n---\n\nBody.\n");
+        write_command(
+            temp.path(),
+            "deploy.md",
+            "---\ndescription: Deploy\n---\n\nBody.\n",
+        );
+        write_command(
+            temp.path(),
+            "deploy.md.tmpl",
+            "---\ndescription: Deploy\n---\n\nBody.\n",
+        );
 
         let commands = load("vercel", temp.path());
 
@@ -279,7 +297,11 @@ mod tests {
         // Nothing to send, so a name in the composer would do nothing.
         let temp = tempfile::tempdir().unwrap();
         write_command(temp.path(), "empty.md", "---\ndescription: nothing\n---\n");
-        write_command(temp.path(), "real.md", "---\ndescription: real\n---\n\nBody.\n");
+        write_command(
+            temp.path(),
+            "real.md",
+            "---\ndescription: real\n---\n\nBody.\n",
+        );
 
         let commands = load("p", temp.path());
 
@@ -296,8 +318,16 @@ mod tests {
     #[test]
     fn commands_are_sorted_by_name() {
         let temp = tempfile::tempdir().unwrap();
-        write_command(temp.path(), "zebra.md", "---\ndescription: z\n---\n\nBody.\n");
-        write_command(temp.path(), "alpha.md", "---\ndescription: a\n---\n\nBody.\n");
+        write_command(
+            temp.path(),
+            "zebra.md",
+            "---\ndescription: z\n---\n\nBody.\n",
+        );
+        write_command(
+            temp.path(),
+            "alpha.md",
+            "---\ndescription: a\n---\n\nBody.\n",
+        );
 
         let commands = load("p", temp.path());
 
@@ -324,7 +354,10 @@ mod tests {
 
         let expanded = expand("/p:do fix the build", &refs).unwrap();
 
-        assert_eq!(expanded, "The user invoked this command with: fix the build\n");
+        assert_eq!(
+            expanded,
+            "The user invoked this command with: fix the build\n"
+        );
     }
 
     #[test]
@@ -348,7 +381,10 @@ mod tests {
 
         let expanded = expand("/p:do https://figma.com/x?node-id=1", &refs).unwrap();
 
-        assert!(expanded.starts_with("# /do\n\nImplement the design."), "{expanded}");
+        assert!(
+            expanded.starts_with("# /do\n\nImplement the design."),
+            "{expanded}"
+        );
         assert!(
             expanded.contains("https://figma.com/x?node-id=1"),
             "the url reaches the model: {expanded}"
@@ -363,7 +399,10 @@ mod tests {
         let expanded = expand("/p:do", &refs).unwrap();
 
         assert_eq!(expanded, "With: \n");
-        assert!(!expanded.contains("$ARGUMENTS"), "a literal placeholder would reach the model");
+        assert!(
+            !expanded.contains("$ARGUMENTS"),
+            "a literal placeholder would reach the model"
+        );
     }
 
     #[test]
@@ -409,7 +448,10 @@ mod tests {
         }];
         let refs = commands.iter().collect::<Vec<_>>();
 
-        assert_eq!(expand("/boss:plan the thing", &refs).unwrap(), "Plan: the thing\n");
+        assert_eq!(
+            expand("/boss:plan the thing", &refs).unwrap(),
+            "Plan: the thing\n"
+        );
     }
 
     #[test]
@@ -418,7 +460,10 @@ mod tests {
         // encode are the shapes that ship. Skipped where figma is absent, so
         // the suite still passes on a machine that has never run Codex.
         let root = directories::UserDirs::new()
-            .map(|dirs| dirs.home_dir().join(".codex/plugins/cache/openai-curated/figma"))
+            .map(|dirs| {
+                dirs.home_dir()
+                    .join(".codex/plugins/cache/openai-curated/figma")
+            })
             .filter(|path| path.is_dir());
         let Some(root) = root else {
             return;

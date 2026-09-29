@@ -200,9 +200,7 @@ impl PluginCatalogue {
 
     /// Every loaded plugin, global first, for logging.
     pub fn all(&self) -> impl Iterator<Item = &LoadedPlugin> {
-        self.global
-            .iter()
-            .chain(self.by_project.values().flatten())
+        self.global.iter().chain(self.by_project.values().flatten())
     }
 
     /// The global plugins alone: the personal marketplace's, and the ones
@@ -543,7 +541,10 @@ fn read_marketplaces(home: &Path, projects: &[PathBuf]) -> Vec<Marketplace> {
     // The personal marketplace, and the ones shipped with Codex: both global.
     push_marketplace(
         &mut found,
-        &home.join(".agents").join("plugins").join("marketplace.json"),
+        &home
+            .join(".agents")
+            .join("plugins")
+            .join("marketplace.json"),
         Scope::Global,
     );
 
@@ -557,7 +558,10 @@ fn read_marketplaces(home: &Path, projects: &[PathBuf]) -> Vec<Marketplace> {
     for bundle in bundles {
         push_marketplace(
             &mut found,
-            &bundle.join(".agents").join("plugins").join("marketplace.json"),
+            &bundle
+                .join(".agents")
+                .join("plugins")
+                .join("marketplace.json"),
             Scope::Global,
         );
     }
@@ -570,7 +574,10 @@ fn read_marketplaces(home: &Path, projects: &[PathBuf]) -> Vec<Marketplace> {
         }
         push_marketplace(
             &mut found,
-            &project.join(".agents").join("plugins").join("marketplace.json"),
+            &project
+                .join(".agents")
+                .join("plugins")
+                .join("marketplace.json"),
             Scope::Project(project.clone()),
         );
     }
@@ -636,7 +643,10 @@ fn offered_ids(marketplaces: &[Marketplace]) -> Vec<String> {
 /// browser in this agent, so the log is where a user learns the spelling.
 fn warn_unresolved(id: &str, offered: &[String]) {
     if offered.is_empty() {
-        tracing::warn!(id, "enabled plugin not found, and no marketplace was readable");
+        tracing::warn!(
+            id,
+            "enabled plugin not found, and no marketplace was readable"
+        );
     } else {
         tracing::warn!(
             id,
@@ -718,12 +728,26 @@ mod tests {
 
         // Personal (global): `figma` at `home/plugins/figma`.
         write_marketplace(home.path(), "personal", &[("figma", "./plugins/figma")]);
-        write_plugin(&home.path().join("plugins/figma"), "figma", Some("figma-use"));
+        write_plugin(
+            &home.path().join("plugins/figma"),
+            "figma",
+            Some("figma-use"),
+        );
 
         // Bundled (global): `computer-use`.
-        let bundle = home.path().join(".codex/bundled-marketplaces/openai-bundled");
-        write_marketplace(&bundle, "openai-bundled", &[("computer-use", "./plugins/computer-use")]);
-        write_plugin(&bundle.join("plugins/computer-use"), "computer-use", Some("computer-use"));
+        let bundle = home
+            .path()
+            .join(".codex/bundled-marketplaces/openai-bundled");
+        write_marketplace(
+            &bundle,
+            "openai-bundled",
+            &[("computer-use", "./plugins/computer-use")],
+        );
+        write_plugin(
+            &bundle.join("plugins/computer-use"),
+            "computer-use",
+            Some("computer-use"),
+        );
 
         // The project's own marketplace, which resolves against the project root.
         write_marketplace(
@@ -731,9 +755,17 @@ mod tests {
             "my-team",
             &[("repo-triage", "./plugins/repo-triage")],
         );
-        write_plugin(&project.path().join("plugins/repo-triage"), "repo-triage", Some("repo-triage"));
+        write_plugin(
+            &project.path().join("plugins/repo-triage"),
+            "repo-triage",
+            Some("repo-triage"),
+        );
 
-        Fixture { home, project, other }
+        Fixture {
+            home,
+            project,
+            other,
+        }
     }
 
     fn ids<'a>(plugins: &[&'a LoadedPlugin]) -> Vec<&'a str> {
@@ -749,8 +781,14 @@ mod tests {
         };
         let catalogue = discover(fixture.home.path(), &[], &settings);
 
-        assert_eq!(ids(&catalogue.for_project(fixture.project.path())), vec!["figma@personal"]);
-        assert_eq!(ids(&catalogue.for_project(fixture.other.path())), vec!["figma@personal"]);
+        assert_eq!(
+            ids(&catalogue.for_project(fixture.project.path())),
+            vec!["figma@personal"]
+        );
+        assert_eq!(
+            ids(&catalogue.for_project(fixture.other.path())),
+            vec!["figma@personal"]
+        );
     }
 
     #[test]
@@ -767,11 +805,17 @@ mod tests {
         };
         let catalogue = discover(
             fixture.home.path(),
-            &[fixture.project.path().to_path_buf(), fixture.other.path().to_path_buf()],
+            &[
+                fixture.project.path().to_path_buf(),
+                fixture.other.path().to_path_buf(),
+            ],
             &settings,
         );
 
-        assert_eq!(ids(&catalogue.for_project(fixture.project.path())), vec!["repo-triage@my-team"]);
+        assert_eq!(
+            ids(&catalogue.for_project(fixture.project.path())),
+            vec!["repo-triage@my-team"]
+        );
         assert!(
             catalogue.for_project(fixture.other.path()).is_empty(),
             "a project-scoped plugin must not leak into another project"
@@ -788,11 +832,19 @@ mod tests {
                 vec!["repo-triage@my-team".into()],
             )]),
         };
-        let catalogue = discover(fixture.home.path(), &[fixture.project.path().to_path_buf()], &settings);
+        let catalogue = discover(
+            fixture.home.path(),
+            &[fixture.project.path().to_path_buf()],
+            &settings,
+        );
 
         assert_eq!(
             ids(&catalogue.for_project(fixture.project.path())),
-            vec!["computer-use@openai-bundled", "figma@personal", "repo-triage@my-team"],
+            vec![
+                "computer-use@openai-bundled",
+                "figma@personal",
+                "repo-triage@my-team"
+            ],
             "global plus project, sorted by id"
         );
         assert_eq!(
@@ -846,9 +898,16 @@ mod tests {
                 vec!["figma@personal".into()],
             )]),
         };
-        let catalogue = discover(fixture.home.path(), &[fixture.project.path().to_path_buf()], &settings);
+        let catalogue = discover(
+            fixture.home.path(),
+            &[fixture.project.path().to_path_buf()],
+            &settings,
+        );
 
-        assert_eq!(ids(&catalogue.for_project(fixture.project.path())), vec!["figma@personal"]);
+        assert_eq!(
+            ids(&catalogue.for_project(fixture.project.path())),
+            vec!["figma@personal"]
+        );
         assert!(catalogue.for_project(fixture.other.path()).is_empty());
     }
 
@@ -862,7 +921,11 @@ mod tests {
             plugins: settings::entries(&["repo-triage@my-team"]),
             projects: BTreeMap::new(),
         };
-        let catalogue = discover(fixture.home.path(), &[fixture.project.path().to_path_buf()], &settings);
+        let catalogue = discover(
+            fixture.home.path(),
+            &[fixture.project.path().to_path_buf()],
+            &settings,
+        );
 
         let resolved = catalogue.for_project(fixture.project.path());
         assert!(resolved.is_empty(), "got {:?}", ids(&resolved));
@@ -887,13 +950,16 @@ mod tests {
                 vec!["pinned@personal".into()],
             )]),
         };
-        let catalogue = discover(fixture.home.path(), &[fixture.project.path().to_path_buf()], &settings);
+        let catalogue = discover(
+            fixture.home.path(),
+            &[fixture.project.path().to_path_buf()],
+            &settings,
+        );
 
         let resolved = catalogue.for_project(fixture.project.path());
         assert_eq!(resolved.len(), 1, "one id is one plugin, not two");
         assert_eq!(
-            resolved[0].root,
-            project_plugin,
+            resolved[0].root, project_plugin,
             "the project's own copy wins, so a repository can pin its build"
         );
         // The project's marketplace is named `personal` too, and it is scoped to
@@ -908,7 +974,9 @@ mod tests {
         // nowhere on disk, so the cache is the only source.
         let home = tempfile::tempdir().unwrap();
         write_plugin(
-            &home.path().join(".codex/plugins/cache/openai-curated/figma/1dc19589"),
+            &home
+                .path()
+                .join(".codex/plugins/cache/openai-curated/figma/1dc19589"),
             "figma",
             Some("figma-use"),
         );
@@ -919,13 +987,18 @@ mod tests {
         };
         let catalogue = discover(home.path(), &[], &settings);
 
-        assert_eq!(ids(&catalogue.for_project(Path::new("/any"))), vec!["figma@openai-curated"]);
+        assert_eq!(
+            ids(&catalogue.for_project(Path::new("/any"))),
+            vec!["figma@openai-curated"]
+        );
     }
 
     #[test]
     fn the_newest_cached_version_wins() {
         let home = tempfile::tempdir().unwrap();
-        let cache = home.path().join(".codex/plugins/cache/openai-bundled/computer-use");
+        let cache = home
+            .path()
+            .join(".codex/plugins/cache/openai-bundled/computer-use");
         write_plugin(&cache.join("26.616.51431"), "computer-use", None);
         write_plugin(&cache.join("27.1.1"), "computer-use", None);
 
@@ -946,7 +1019,10 @@ mod tests {
         let fixture = fixture();
         // A cached copy of the same plugin, which the working copy must beat.
         write_plugin(
-            &fixture.home.path().join(".codex/plugins/cache/personal/figma/9.9.9"),
+            &fixture
+                .home
+                .path()
+                .join(".codex/plugins/cache/personal/figma/9.9.9"),
             "figma",
             None,
         );
@@ -977,7 +1053,9 @@ mod tests {
         )
         .unwrap();
         write_plugin(
-            &home.path().join(".codex/plugins/cache/personal/withdrawn/1.0.0"),
+            &home
+                .path()
+                .join(".codex/plugins/cache/personal/withdrawn/1.0.0"),
             "withdrawn",
             None,
         );
@@ -1034,7 +1112,13 @@ mod tests {
         let fixture = fixture();
         let broken = fixture.home.path().join("plugins/broken");
         fs::create_dir_all(broken.join(manifest::MANIFEST_DIR)).unwrap();
-        fs::write(broken.join(manifest::MANIFEST_DIR).join(manifest::MANIFEST_FILE), "{ not json").unwrap();
+        fs::write(
+            broken
+                .join(manifest::MANIFEST_DIR)
+                .join(manifest::MANIFEST_FILE),
+            "{ not json",
+        )
+        .unwrap();
         write_marketplace(
             fixture.home.path(),
             "personal",
@@ -1047,7 +1131,10 @@ mod tests {
         };
         let catalogue = discover(fixture.home.path(), &[], &settings);
 
-        assert_eq!(ids(&catalogue.for_project(Path::new("/any"))), vec!["figma@personal"]);
+        assert_eq!(
+            ids(&catalogue.for_project(Path::new("/any"))),
+            vec!["figma@personal"]
+        );
     }
 
     #[test]
@@ -1138,9 +1225,10 @@ mod tests {
         // to anything that would run it.
         let fixture = fixture();
         let mut config = PluginSettings::default();
-        config
-            .plugins
-            .insert("figma@personal".into(), settings::PluginEntry { enabled: false });
+        config.plugins.insert(
+            "figma@personal".into(),
+            settings::PluginEntry { enabled: false },
+        );
 
         let catalogue = discover(fixture.home.path(), &[], &config);
 
@@ -1170,9 +1258,10 @@ mod tests {
         // The leftover row is silent: the user asked for nothing to happen.
         let fixture = fixture();
         let mut config = PluginSettings::default();
-        config
-            .plugins
-            .insert("gone@personal".into(), settings::PluginEntry { enabled: false });
+        config.plugins.insert(
+            "gone@personal".into(),
+            settings::PluginEntry { enabled: false },
+        );
 
         let catalogue = discover(fixture.home.path(), &[], &config);
 
@@ -1194,9 +1283,10 @@ mod tests {
                 vec!["figma@personal".into()],
             )]),
         };
-        config
-            .plugins
-            .insert("figma@personal".into(), settings::PluginEntry { enabled: false });
+        config.plugins.insert(
+            "figma@personal".into(),
+            settings::PluginEntry { enabled: false },
+        );
 
         let catalogue = discover(
             fixture.home.path(),
@@ -1241,7 +1331,11 @@ mod tests {
             plugins: BTreeMap::new(),
             projects: BTreeMap::from([(with_separator, vec!["repo-triage@my-team".into()])]),
         };
-        let catalogue = discover(fixture.home.path(), &[fixture.project.path().to_path_buf()], &settings);
+        let catalogue = discover(
+            fixture.home.path(),
+            &[fixture.project.path().to_path_buf()],
+            &settings,
+        );
 
         assert_eq!(
             ids(&catalogue.for_project(fixture.project.path())),
@@ -1260,7 +1354,10 @@ mod tests {
         else {
             return;
         };
-        if !home.join(".codex/plugins/cache/openai-curated/figma").is_dir() {
+        if !home
+            .join(".codex/plugins/cache/openai-curated/figma")
+            .is_dir()
+        {
             return;
         }
 
@@ -1270,13 +1367,20 @@ mod tests {
         };
         let catalogue = discover(&home, &[], &settings);
         let plugins = catalogue.for_project(Path::new("/any"));
-        let Some(figma) = plugins.iter().find(|plugin| plugin.id == "figma@openai-curated") else {
+        let Some(figma) = plugins
+            .iter()
+            .find(|plugin| plugin.id == "figma@openai-curated")
+        else {
             return;
         };
 
         // The four roles figma ships, named by their files and sorted.
         assert_eq!(
-            figma.agents.iter().map(|role| role.name.as_str()).collect::<Vec<_>>(),
+            figma
+                .agents
+                .iter()
+                .map(|role| role.name.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "design-parity-review-agent",
                 "design-system-rules-agent",
@@ -1285,7 +1389,10 @@ mod tests {
             ]
         );
         assert!(
-            figma.agents.iter().all(|role| !role.instructions.is_empty()),
+            figma
+                .agents
+                .iter()
+                .all(|role| !role.instructions.is_empty()),
             "each role's body becomes a sub-agent's system prompt"
         );
 

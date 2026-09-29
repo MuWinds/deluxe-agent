@@ -309,7 +309,11 @@ impl Tool for Exec {
         // registered and the model reads it on with `job_output`.
         if !read.snapshot.status.is_settled() {
             let output = read.text.trim_end();
-            let output = if output.is_empty() { "(no output yet)" } else { output };
+            let output = if output.is_empty() {
+                "(no output yet)"
+            } else {
+                output
+            };
             return Ok(ToolOutput::text(format!(
                 "[still running after {timeout_ms}ms; moved to background job {job_id}]\n\
                  [{}] $ {command}\n  (cwd: {})\n{output}\n\
@@ -396,7 +400,10 @@ mod tests {
         let settings = ToolSettings::default();
 
         let output = exec
-            .execute(json!({ "command": "echo hello", "runInBackground": true }), &settings)
+            .execute(
+                json!({ "command": "echo hello", "runInBackground": true }),
+                &settings,
+            )
             .await
             .expect("the call returns");
 
@@ -434,7 +441,10 @@ mod tests {
         let settings = ToolSettings::default();
 
         let output = exec
-            .execute(json!({ "command": long_command(), "timeoutMs": 100 }), &settings)
+            .execute(
+                json!({ "command": long_command(), "timeoutMs": 100 }),
+                &settings,
+            )
             .await
             .expect("the call returns");
 

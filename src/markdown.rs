@@ -45,8 +45,19 @@ const BODY_SIZE: f32 = theme::font(14.0);
 const TABLE_SIZE: f32 = theme::font(13.0);
 /// Between two table columns, and between the cells of a row.
 const TABLE_SPACING: f32 = 12.0;
-/// A floor for a column whose cells are all empty, so the column still shows.
+/// The vertical padding a grid rule is inset by.
+const TABLE_V_PAD: f32 = 4.0;
+/// The widest a table column is measured at, so a very long cell does not
+/// starve the proportional shrink of budget to give the others.
+const TABLE_CELL_CAP: f32 = 320.0;
+/// The narrowest a column may be before the table stops being a grid.
 const TABLE_MIN_COLUMN: f32 = 24.0;
+/// A token at least this long marks the cell holding it as path-shaped.
+const TABLE_LONG_TOKEN: usize = 20;
+/// Average words per body cell at which a column reads as prose.
+const TABLE_PROSE_WORDS: f32 = 4.0;
+/// The most times `fit_widths` takes a step, as a bound on an impossible fit.
+const TABLE_SHRINK_STEPS: usize = 512;
 /// How far a nested list item is pushed right of its parent.
 const LIST_INDENT: f32 = 16.0;
 /// The width of a list item's marker column. Fixed, so that `9.` and `10.`
@@ -136,6 +147,9 @@ pub enum Block {
         align: Vec<ColumnAlign>,
         header: Vec<Vec<Span>>,
         rows: Vec<Vec<Vec<Span>>>,
+        /// The table as it was written, kept so that a bubble too narrow for a
+        /// grid can redraw the source instead of breaking it.
+        text: String,
     },
 }
 
@@ -392,7 +406,8 @@ fn split_row(line: &str) -> Vec<String> {
 /// The header row at `start` and every following row, as a `Block::Table`.
 ///
 /// Rows are cut or padded to the delimiter row's width so that a table with a
-/// ragged source still has rectangular columns to draw.
+/// ragged source still has rectangular columns to draw. The source lines are
+/// kept alongside the parsed cells, for the narrow-bubble fallback.
 fn read_table(lines: &[&str], start: usize, align: Vec<ColumnAlign>) -> (Block, usize) {
     let width = align.len();
     let header = fit_row(split_row(lines[start]), width);
@@ -404,7 +419,16 @@ fn read_table(lines: &[&str], start: usize, align: Vec<ColumnAlign>) -> (Block, 
         i += 1;
     }
 
-    (Block::Table { align, header, rows }, i)
+    let text = lines[start..i].join("\n");
+    (
+        Block::Table {
+            align,
+            header,
+            rows,
+            text,
+        },
+        i,
+    )
 }
 
 fn fit_row(cells: Vec<String>, width: usize) -> Vec<Vec<Span>> {
@@ -431,11 +455,12 @@ fn list_item(line: &str) -> Option<(usize, Marker, &str)> {
     let (marker, rest) = match trimmed.as_bytes().first()? {
         b'-' | b'*' | b'+' => (Marker::Bullet, &trimmed[1..]),
         b'0'..=b'9' => {
-            let digits = trimmed.bytes().take_while(|byte| byte.is_ascii_digit()).count();
+            let digits = trimmed
+                .bytes()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
             let rest = &trimmed[digits..];
-            let rest = rest
-                .strip_prefix('.')
-                .or_else(|| rest.strip_prefix(')'))?;
+            let rest = rest.strip_prefix('.').or_else(|| rest.strip_prefix(')'))?;
             (Marker::Ordered(trimmed[..digits].parse().ok()?), rest)
         }
         _ => return None,
@@ -618,7 +643,12 @@ fn emphasis(text: &str, i: usize, ch: char) -> Option<(&str, SpanStyle, usize)> 
 
     // `_` inside a word is not emphasis: `snake_case_name` and `__init__` are
     // both ordinary text. This is the one rule a naive scanner always misses.
-    if ch == '_' && text[..i].chars().next_back().is_some_and(char::is_alphanumeric) {
+    if ch == '_'
+        && text[..i]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+    {
         return None;
     }
 
@@ -626,7 +656,12 @@ fn emphasis(text: &str, i: usize, ch: char) -> Option<(&str, SpanStyle, usize)> 
     let close = find_run(text, open_end, ch, run)?;
     let close_end = close + run * ch.len_utf8();
 
-    if ch == '_' && text[close_end..].chars().next().is_some_and(char::is_alphanumeric) {
+    if ch == '_'
+        && text[close_end..]
+            .chars()
+            .next()
+            .is_some_and(char::is_alphanumeric)
+    {
         return None;
     }
 
@@ -784,7 +819,8 @@ fn draw_block(ui: &mut egui::Ui, p: &Palette, block: &Block, salt: u64) {
             align,
             header,
             rows,
-        } => draw_table(ui, p, align, header, rows),
+            text,
+        } => draw_table(ui, p, align, header, rows, text),
     }
 }
 
@@ -817,7 +853,11 @@ fn span_format(p: &Palette, span: &Span, size: f32, colour: Color32) -> TextForm
         FontId::proportional(size)
     };
 
-    let colour = if span.link.is_some() { p.accent } else { colour };
+    let colour = if span.link.is_some() {
+        p.accent
+    } else {
+        colour
+    };
     let inline_code = span.style.code;
 
     TextFormat {
@@ -908,11 +948,7 @@ fn draw_item(ui: &mut egui::Ui, p: &Palette, depth: usize, marker: Marker, spans
             // Right-aligned, so `9.` and `10.` share an edge.
             Layout::top_down(Align::Max),
             |ui| {
-                ui.label(
-                    RichText::new(token)
-                        .size(BODY_SIZE)
-                        .color(p.text_muted),
-                );
+                ui.label(RichText::new(token).size(BODY_SIZE).color(p.text_muted));
             },
         );
         draw_spans(ui, p, spans, BODY_SIZE, p.text);
@@ -942,133 +978,558 @@ fn draw_quote(ui: &mut egui::Ui, p: &Palette, blocks: &[Block], salt: u64) {
         .vline(rect.left(), rect.y_range(), Stroke::new(3.0, p.text_muted));
 }
 
-/// A table, laid out as a stack of rows of fixed-width cells.
+/// How a table column reads, which decides what it gives up first when the
+/// table is too wide for the bubble.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnKind {
+    /// Paths, URLs and hashes: a few very long unbreakable tokens.
+    TokenHeavy,
+    /// Prose. Wants its width most, but wraps cleanly when it does not get it.
+    Narrative,
+    /// Short values — a count, a status, a date.
+    Compact,
+}
+
+/// A column's measured shape, the input to [`fit_widths`].
+struct ColumnMetrics {
+    /// The widest cell, so a column never grows past what it holds.
+    max: f32,
+    /// The widest single token. A column narrower than this breaks a word.
+    token: f32,
+    kind: ColumnKind,
+}
+
+/// A drawn cell: its laid-out galley and the width that galley needs.
+struct CellText {
+    galley: std::sync::Arc<egui::Galley>,
+    width: f32,
+    height: f32,
+}
+
+/// A table, laid out as a stack of cells of a computed width.
+///
+/// The widths follow the approach in `codex-rs/tui`: columns are measured,
+/// classified by how they read, and shrunk by priority when the table is too
+/// wide. A table that cannot be made legible as a grid — see
+/// [`should_render_records`] — is transposed into label/value records instead,
+/// and one too narrow even for that is redrawn as its source.
 ///
 /// Hand-laid rather than an `egui::Grid`: the grid sizes columns from its
 /// content, which lets a wide table overflow the bubble, and aligning a cell
-/// inside its column is not something `Label::halign` can do. Pre-measured
-/// widths settle both, at the cost of `Grid`'s first-frame `request_discard`.
+/// inside its column is not something `Label::halign` can do.
 fn draw_table(
     ui: &mut egui::Ui,
     p: &Palette,
     align: &[ColumnAlign],
     header: &[Vec<Span>],
     rows: &[Vec<Vec<Span>>],
+    source: &str,
 ) {
     let columns = align.len();
     if columns == 0 {
         return;
     }
-    let widths = column_widths(ui, header, rows, columns);
-    let total: f32 = widths.iter().sum::<f32>() + TABLE_SPACING * (columns - 1) as f32;
 
-    // A sub-`Ui` of the table's own width, so the rule under the header stops
-    // at the table rather than running on to the edge of the bubble.
-    ui.allocate_ui_with_layout(
-        Vec2::new(total, 0.0),
-        Layout::top_down(Align::Min),
-        |ui| {
-            draw_row(ui, p, header, &widths, align, true);
-            ui.add_space(3.0);
-            ui.separator();
-            ui.add_space(3.0);
-            for row in rows {
-                draw_row(ui, p, row, &widths, align, false);
+    let regular = FontId::proportional(TABLE_SIZE);
+    let bold = fonts::bold(TABLE_SIZE);
+    let metrics = measure_columns(ui, header, rows, &regular, &bold, columns);
+
+    let gap_total = TABLE_SPACING * (columns - 1) as f32;
+    let available = (ui.available_width() - gap_total).max(1.0);
+
+    // Three shapes for the same data, widest first. `codex-rs` picks between
+    // them the same way; the grid is the goal, records are what a grid becomes
+    // when a column would otherwise be a stub, and the source is what a table
+    // becomes when the bubble is too narrow to hold even a record.
+    let widths = fit_widths(&metrics, available);
+    let Some(widths) = widths else {
+        record_or_source(ui, p, header, rows, source, &bold);
+        return;
+    };
+    if should_render_records(rows, &widths, &metrics) {
+        record_or_source(ui, p, header, rows, source, &bold);
+        return;
+    }
+
+    let total: f32 = widths.iter().sum::<f32>() + gap_total;
+    // A sub-`Ui` of the table's own width, so the separator rules stop at the
+    // table rather than running on to the edge of the bubble.
+    ui.allocate_ui_with_layout(Vec2::new(total, 0.0), Layout::top_down(Align::Min), |ui| {
+        draw_grid_row(ui, p, header, &widths, align, &bold);
+        ui.add_space(TABLE_V_PAD);
+        draw_rule(ui, p, total);
+        ui.add_space(TABLE_V_PAD);
+        for (index, row) in rows.iter().enumerate() {
+            draw_grid_row(ui, p, row, &widths, align, &regular);
+            if index < rows.len() - 1 {
+                ui.add_space(TABLE_V_PAD);
+                draw_rule(ui, p, total);
+                ui.add_space(TABLE_V_PAD);
             }
-        },
+        }
+    });
+}
+
+/// Records when they fit, the source when even those do not.
+fn record_or_source(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    header: &[Vec<Span>],
+    rows: &[Vec<Vec<Span>>],
+    source: &str,
+    bold: &FontId,
+) {
+    let labels: Vec<String> = header
+        .iter()
+        .map(|cell| cell.iter().map(|span| span.text.as_str()).collect())
+        .collect();
+    let label_width = labels
+        .iter()
+        .map(|label| measure_spans(ui, &[Span::plain(label.clone())], bold))
+        .fold(0.0f32, f32::max);
+    // `  label  value` has to leave room for the value; below that, a record
+    // is as unreadable as the grid was.
+    if label_width + TABLE_SPACING + TABLE_MIN_COLUMN > ui.available_width() {
+        draw_source(ui, p, source);
+        return;
+    }
+    draw_records(
+        ui,
+        p,
+        &labels,
+        label_width.min(ui.available_width() * 0.5),
+        rows,
     );
 }
 
-fn draw_row(
+/// One grid row: cells of fixed width, each wrapped inside its column.
+fn draw_grid_row(
     ui: &mut egui::Ui,
     p: &Palette,
     cells: &[Vec<Span>],
     widths: &[f32],
     align: &[ColumnAlign],
-    heading: bool,
+    font: &FontId,
 ) {
+    let laid: Vec<Option<CellText>> = cells
+        .iter()
+        .zip(widths)
+        .map(|(cell, width)| layout_cell(ui, p, cell, *width, font, p.text))
+        .collect();
+    let height = laid
+        .iter()
+        .flatten()
+        .fold(0.0f32, |tallest, cell| tallest.max(cell.height));
+
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = TABLE_SPACING;
-
-        for (column, cell) in cells.iter().enumerate() {
-            let layout = Layout::top_down(match align[column] {
-                ColumnAlign::Left => Align::Min,
-                ColumnAlign::Center => Align::Center,
-                ColumnAlign::Right => Align::Max,
-            });
-            ui.allocate_ui_with_layout(Vec2::new(widths[column], 0.0), layout, |ui| {
-                if heading {
-                    draw_spans(ui, p, &bolded(cell), TABLE_SIZE, p.text);
-                } else {
-                    draw_spans(ui, p, cell, TABLE_SIZE, p.text);
-                }
-            });
+        // Every column is given a fixed box, whether or not it has a galley to
+        // put in it. A layout nested per column would size that box from the
+        // cell's own galley, and an empty cell — an empty header column, say —
+        // would report a zero width and pull every column after it out of line
+        // with the body rows.
+        for (column, cell) in laid.iter().enumerate() {
+            let width = widths[column];
+            let (rect, _) =
+                ui.allocate_exact_size(Vec2::new(width, height.max(1.0)), egui::Sense::hover());
+            let Some(cell) = cell else { continue };
+            // `allocate_exact_size` ignores the column's alignment, so a centre
+            // or right column is aligned by hand: the galley is drawn at the
+            // rect's left plus the alignment slack. A wrapped cell is also
+            // centred vertically, so a one-line cell beside a three-line one
+            // sits on the middle line rather than the first.
+            let left = match align[column] {
+                ColumnAlign::Left => 0.0,
+                ColumnAlign::Center => (width - cell.width) * 0.5,
+                ColumnAlign::Right => width - cell.width,
+            }
+            .max(0.0);
+            let top = ((height - cell.height) * 0.5).max(0.0);
+            ui.painter().galley(
+                rect.left_top() + Vec2::new(left, top),
+                cell.galley.clone(),
+                Color32::PLACEHOLDER,
+            );
         }
     });
 }
 
-/// Column widths, measured from the widest cell in each column.
+/// A hairline between two grid rows, the width of the table.
+fn draw_rule(ui: &mut egui::Ui, p: &Palette, width: f32) {
+    let y = ui.cursor().top() + 0.5;
+    let x = ui.cursor().left();
+    ui.painter()
+        .hline(x..=x + width, y, Stroke::new(1.0, p.border));
+    ui.add_space(1.0);
+}
+
+/// The last resort: the table's own source, monospace and wrapped.
 ///
-/// Measured rather than shared evenly, because a table of a short label beside
-/// a long sentence reads badly at 50/50. When the total will not fit, every
-/// width is scaled down together, so the table wraps instead of overflowing the
-/// bubble.
-fn column_widths(
+/// Monospace because that is the only form in which the `|` separators of a
+/// table line up, and muted because it is a fallback rather than the message.
+fn draw_source(ui: &mut egui::Ui, p: &Palette, source: &str) {
+    let mut job = LayoutJob::default();
+    job.wrap.break_anywhere = true;
+    job.append(
+        source,
+        0.0,
+        TextFormat {
+            font_id: FontId::monospace(TABLE_SIZE * 0.92),
+            color: p.text_muted,
+            ..Default::default()
+        },
+    );
+    ui.add(egui::Label::new(job).wrap().selectable(true));
+}
+
+/// Lays a cell out at `width`, wrapped and with its inline styles applied.
+///
+/// Returns `None` for an empty cell, which has no galley worth drawing.
+fn layout_cell(
+    ui: &egui::Ui,
+    p: &Palette,
+    spans: &[Span],
+    width: f32,
+    font: &FontId,
+    colour: Color32,
+) -> Option<CellText> {
+    if spans.iter().all(|span| span.text.is_empty()) {
+        return None;
+    }
+    let mut job = LayoutJob::default();
+    // A path or a URL has no spaces to wrap at, so a cell must be allowed to
+    // break mid-token; the column floor is what keeps that from happening to
+    // prose.
+    job.wrap.break_anywhere = true;
+    job.wrap.max_width = width;
+    for span in spans {
+        job.append(&span.text, 0.0, cell_format(p, span, font, colour));
+    }
+    let galley = ui.painter().layout_job(job);
+    Some(CellText {
+        width: galley.size().x,
+        height: galley.size().y,
+        galley,
+    })
+}
+
+/// The format a cell run is drawn with: [`span_format`], but with the table's
+/// own font as the base, so every run shares one baseline and one size.
+fn cell_format(p: &Palette, span: &Span, font: &FontId, colour: Color32) -> TextFormat {
+    let mut format = span_format(p, span, font.size, colour);
+    if span.style.code {
+        format.font_id = FontId::monospace(font.size * 0.92);
+    } else if span.style.bold {
+        format.font_id = fonts::bold(font.size);
+    } else {
+        format.font_id = font.clone();
+    }
+    format
+}
+
+/// The measured shape of every column.
+///
+/// The same pass records each column's [`ColumnKind`], from the mix of very
+/// long tokens and many-word cells in its body rows.
+fn measure_columns(
     ui: &egui::Ui,
     header: &[Vec<Span>],
     rows: &[Vec<Vec<Span>>],
+    regular: &FontId,
+    bold: &FontId,
     columns: usize,
-) -> Vec<f32> {
-    let mut widths = vec![0.0f32; columns];
-    // The header is drawn bold, so it is measured bold — otherwise a heading
-    // that is the widest thing in its column would wrap on its first frame.
-    measure_row(ui, header, &fonts::bold(TABLE_SIZE), &mut widths);
-    let regular = FontId::proportional(TABLE_SIZE);
+) -> Vec<ColumnMetrics> {
+    let mut metrics = (0..columns)
+        .map(|_| ColumnMetrics {
+            max: 0.0,
+            token: 0.0,
+            kind: ColumnKind::Compact,
+        })
+        .collect::<Vec<_>>();
+
+    for (column, cell) in header.iter().enumerate().take(columns) {
+        let width = measure_spans(ui, cell, bold);
+        metrics[column].max = metrics[column].max.max(width);
+        metrics[column].token = metrics[column].token.max(longest_token(ui, cell, bold));
+    }
+
     for row in rows {
-        measure_row(ui, row, &regular, &mut widths);
-    }
-
-    for width in &mut widths {
-        *width = width.max(TABLE_MIN_COLUMN);
-    }
-
-    let available =
-        (ui.available_width() - TABLE_SPACING * columns.saturating_sub(1) as f32).max(1.0);
-    let total: f32 = widths.iter().sum();
-    if total > available {
-        let scale = available / total;
-        for width in &mut widths {
-            *width *= scale;
+        for (column, cell) in row.iter().enumerate().take(columns) {
+            let width = measure_spans(ui, cell, regular);
+            metrics[column].max = metrics[column].max.max(width);
+            metrics[column].token = metrics[column].token.max(longest_token(ui, cell, regular));
         }
     }
 
-    widths
+    for (column, metric) in metrics.iter_mut().enumerate() {
+        metric.kind = classify_column(rows, column);
+    }
+    metrics
 }
 
-fn measure_row(ui: &egui::Ui, row: &[Vec<Span>], font: &FontId, widths: &mut [f32]) {
-    for (column, cell) in row.iter().enumerate() {
-        let text: String = cell.iter().map(|span| span.text.as_str()).collect();
-        let width = ui
-            .painter()
-            .layout_no_wrap(text, font.clone(), Color32::PLACEHOLDER)
-            .size()
-            .x;
-        widths[column] = widths[column].max(width);
+/// The width `spans` occupy when drawn in `font`, with no wrapping.
+fn measure_spans(ui: &egui::Ui, spans: &[Span], font: &FontId) -> f32 {
+    spans
+        .iter()
+        .map(|span| {
+            let font = if span.style.code {
+                FontId::monospace(font.size * 0.92)
+            } else if span.style.bold {
+                fonts::bold(font.size)
+            } else {
+                font.clone()
+            };
+            ui.painter()
+                .layout_no_wrap(span.text.clone(), font, Color32::PLACEHOLDER)
+                .size()
+                .x
+        })
+        .sum()
+}
+
+/// The widest single whitespace-delimited token in a cell.
+fn longest_token(ui: &egui::Ui, spans: &[Span], font: &FontId) -> f32 {
+    spans
+        .iter()
+        .flat_map(|span| span.text.split_whitespace())
+        .map(|token| {
+            ui.painter()
+                .layout_no_wrap(token.to_string(), font.clone(), Color32::PLACEHOLDER)
+                .size()
+                .x
+        })
+        .fold(0.0f32, f32::max)
+}
+
+/// How a column reads, from the shape of its body cells.
+///
+/// Follows `codex-rs`: a column of *unbreakable* tokens is `TokenHeavy` and
+/// gives width up first; a column of many-word cells is `Narrative` and wraps;
+/// everything else keeps its width.
+fn classify_column(rows: &[Vec<Vec<Span>>], column: usize) -> ColumnKind {
+    let mut long_tokens = 0usize;
+    let mut words = 0usize;
+    let mut cells_with_long_token = 0usize;
+    let mut filled_cells = 0usize;
+
+    for row in rows {
+        let Some(cell) = row.get(column) else {
+            continue;
+        };
+        let text = cell
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        if text.trim().is_empty() {
+            continue;
+        }
+        filled_cells += 1;
+        let mut has_long = false;
+        for word in text.split_whitespace() {
+            words += 1;
+            if word.chars().count() >= TABLE_LONG_TOKEN {
+                long_tokens += 1;
+                has_long = true;
+            }
+        }
+        cells_with_long_token += usize::from(has_long);
+    }
+
+    if filled_cells == 0 {
+        return ColumnKind::Compact;
+    }
+    if long_tokens * 2 >= words || cells_with_long_token * 2 >= filled_cells {
+        ColumnKind::TokenHeavy
+    } else if words as f32 / filled_cells as f32 >= TABLE_PROSE_WORDS {
+        ColumnKind::Narrative
+    } else {
+        ColumnKind::Compact
     }
 }
 
-/// A copy of `spans` with every run bolded, for a table's header row.
-fn bolded(spans: &[Span]) -> Vec<Span> {
-    spans
+impl ColumnMetrics {
+    /// The narrowest this column may be before it stops being worth showing.
+    ///
+    /// A `TokenHeavy` or `Narrative` column keeps a readable floor; a `Compact`
+    /// column keeps its longest token, so `200` never becomes `20`.
+    fn minimum(&self) -> f32 {
+        match self.kind {
+            ColumnKind::Compact => self.token.min(TABLE_MIN_COLUMN * 2.0),
+            _ => TABLE_MIN_COLUMN,
+        }
+        .max(TABLE_MIN_COLUMN)
+        .min(self.max.max(TABLE_MIN_COLUMN))
+    }
+}
+
+/// Column widths that fit `available`, or `None` if even the floors cannot.
+///
+/// Columns start at their widest cell and shrink by priority: `TokenHeavy`
+/// gives up width first, then `Narrative`, and `Compact` last — a path column
+/// collapsing to a few characters is a worse outcome than prose wrapping.
+fn fit_widths(metrics: &[ColumnMetrics], available: f32) -> Option<Vec<f32>> {
+    let mut widths: Vec<f32> = metrics
         .iter()
-        .map(|span| Span {
-            style: SpanStyle {
-                bold: true,
-                ..span.style
-            },
-            ..span.clone()
+        .map(|column| column.max.clamp(TABLE_MIN_COLUMN, TABLE_CELL_CAP))
+        .collect();
+    let floors: Vec<f32> = metrics.iter().map(ColumnMetrics::minimum).collect();
+
+    let total: f32 = widths.iter().sum();
+    if total <= available {
+        return Some(widths);
+    }
+    if floors.iter().sum::<f32>() > available {
+        return None;
+    }
+
+    // Repeatedly take one cell of width from the column with the most slack,
+    // cheapest first; a few hundred iterations is far below the cost of the
+    // layout that follows.
+    for _ in 0..TABLE_SHRINK_STEPS {
+        let total: f32 = widths.iter().sum();
+        if total <= available {
+            return Some(widths);
+        }
+        let mut pick: Option<usize> = None;
+        for (index, width) in widths.iter().enumerate() {
+            if *width - floors[index] < 1.0 {
+                continue;
+            }
+            let better = match pick {
+                None => true,
+                Some(chosen) => width - floors[index] > widths[chosen] - floors[chosen],
+            };
+            if better {
+                pick = Some(index);
+            }
+        }
+        let index = pick?;
+        widths[index] -= 1.0;
+    }
+    (widths.iter().sum::<f32>() <= available).then_some(widths)
+}
+
+/// Whether the grid should become label/value records instead.
+///
+/// True once enough rows hold a value the grid cannot show whole: a token wider
+/// than its column where the column is too narrow to keep it, or a `TokenHeavy`
+/// cell shredded into fragments. One bad row is noise; a third is a shape.
+fn should_render_records(
+    rows: &[Vec<Vec<Span>>],
+    widths: &[f32],
+    metrics: &[ColumnMetrics],
+) -> bool {
+    if rows.is_empty() {
+        return false;
+    }
+    let affected = rows
+        .iter()
+        .filter(|row| {
+            row.iter()
+                .zip(widths)
+                .zip(metrics)
+                .any(|((cell, width), metric)| {
+                    if metric.kind == ColumnKind::Narrative {
+                        return false;
+                    }
+                    let text = cell
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>();
+                    let fragment = text
+                        .split_whitespace()
+                        .any(|word| word.chars().count() as f32 * cell_char_width() > *width);
+                    match metric.kind {
+                        ColumnKind::Compact => fragment && *width < metric.token,
+                        ColumnKind::TokenHeavy => fragment,
+                        ColumnKind::Narrative => false,
+                    }
+                })
         })
-        .collect()
+        .count();
+    let threshold = if rows.len() == 1 {
+        1
+    } else {
+        2.max(rows.len().div_ceil(3))
+    };
+    affected >= threshold
+}
+
+/// A conservative width for one character of cell text.
+///
+/// The token measure in [`longest_token`] is exact but needs a `Painter`;
+/// [`should_render_records`] is pure so it can be tested without one. Chinese
+/// and other CJK glyphs are twice as wide as Latin ones, so the estimate is
+/// built on the widest case to keep a `TokenHeavy` column from looking safe
+/// when it is not.
+fn cell_char_width() -> f32 {
+    TABLE_SIZE * 0.6
+}
+
+/// The body as `label  value` records, one group per source row.
+///
+/// The grid is unusable at this width, but the data still is not: a label on
+/// its own line beats a cell three characters wide. Every label keeps the same
+/// width, so the values line up into a column.
+fn draw_records(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    labels: &[String],
+    label_width: f32,
+    rows: &[Vec<Vec<Span>>],
+) {
+    let label_font = fonts::bold(TABLE_SIZE);
+    let regular = FontId::proportional(TABLE_SIZE);
+    for (index, row) in rows.iter().enumerate() {
+        for (head, value) in labels.iter().zip(row) {
+            if value.is_empty() {
+                continue;
+            }
+            // The label is laid right-aligned into its own box, and the value
+            // is wrapped to whatever is left, so a long value breaks inside its
+            // own column instead of running under the label.
+            let value_width = (ui.available_width() - label_width - TABLE_SPACING).max(1.0);
+            let label = layout_cell(
+                ui,
+                p,
+                &[Span::plain(head.clone())],
+                label_width,
+                &label_font,
+                p.text_muted,
+            );
+            let value = layout_cell(ui, p, value, value_width, &regular, p.text);
+            let height = label
+                .iter()
+                .chain(value.iter())
+                .fold(0.0f32, |tallest, cell| tallest.max(cell.height));
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = TABLE_SPACING;
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::new(label_width, height), egui::Sense::hover());
+                if let Some(label) = &label {
+                    ui.painter().galley(
+                        egui::pos2(rect.right() - label.width, rect.top()),
+                        label.galley.clone(),
+                        Color32::PLACEHOLDER,
+                    );
+                }
+                if let Some(value) = &value {
+                    let (rect, _) = ui
+                        .allocate_exact_size(Vec2::new(value_width, height), egui::Sense::hover());
+                    ui.painter().galley(
+                        rect.left_top(),
+                        value.galley.clone(),
+                        Color32::PLACEHOLDER,
+                    );
+                }
+            });
+        }
+        if index < rows.len() - 1 {
+            ui.add_space(TABLE_V_PAD);
+            draw_rule(ui, p, ui.available_width());
+            ui.add_space(TABLE_V_PAD);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1315,7 +1776,12 @@ mod tests {
     #[test]
     fn a_table_reads_its_alignment_row() {
         match parse("| a | b | c |\n|:--|--:|:-:|\n| 1 | 2 | 3 |").as_slice() {
-            [Block::Table { align, header, rows }] => {
+            [Block::Table {
+                align,
+                header,
+                rows,
+                ..
+            }] => {
                 assert_eq!(
                     align,
                     &[ColumnAlign::Left, ColumnAlign::Right, ColumnAlign::Center]
@@ -1325,6 +1791,17 @@ mod tests {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0][2], vec![plain("3")]);
             }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    /// A bubble too narrow for the parsed cells has to fall back to the
+    /// source, so the parser has to keep it.
+    #[test]
+    fn a_table_keeps_its_source() {
+        const SOURCE: &str = "| a | b |\n|---|---|\n| 1 | 2 |";
+        match parse(SOURCE).as_slice() {
+            [Block::Table { text, .. }] => assert_eq!(text, SOURCE),
             other => panic!("parsed as {other:?}"),
         }
     }
@@ -1363,6 +1840,111 @@ mod tests {
             [Block::Table { rows, .. }] => assert_eq!(rows[0][0], vec![plain("x | y")]),
             other => panic!("parsed as {other:?}"),
         }
+    }
+
+    fn metric(max: f32, token: f32, kind: ColumnKind) -> ColumnMetrics {
+        ColumnMetrics { max, token, kind }
+    }
+
+    #[test]
+    fn a_table_that_fits_is_left_alone() {
+        let metrics = [
+            metric(42.0, 20.0, ColumnKind::Compact),
+            metric(100.0, 40.0, ColumnKind::Compact),
+        ];
+        assert_eq!(fit_widths(&metrics, 200.0), Some(vec![42.0, 100.0]));
+    }
+
+    /// The bug this guards: a short commit id beside a paragraph of text used
+    /// to be scaled down with everything else and wrapped into `cff` / `549` /
+    /// `5`. The paragraph is the column that can afford to wrap.
+    #[test]
+    fn a_compact_column_is_not_squeezed_to_fit_a_wide_one() {
+        let metrics = [
+            metric(42.0, 42.0, ColumnKind::Compact),
+            metric(600.0, 30.0, ColumnKind::Narrative),
+        ];
+        let widths = fit_widths(&metrics, 300.0).expect("the floors fit");
+
+        assert_eq!(widths[0], 42.0, "the compact column keeps its width");
+        assert!(
+            widths[1] <= 258.0 + 0.01,
+            "the prose column pays: {widths:?}"
+        );
+        assert!(widths.iter().sum::<f32>() <= 300.0 + 0.01);
+    }
+
+    /// The point of classifying columns at all: a path is what should give
+    /// width up, not the prose or the status beside it.
+    #[test]
+    fn a_token_heavy_column_gives_width_up_first() {
+        let metrics = [
+            metric(200.0, 200.0, ColumnKind::TokenHeavy),
+            metric(120.0, 60.0, ColumnKind::Narrative),
+            metric(40.0, 40.0, ColumnKind::Compact),
+        ];
+        let widths = fit_widths(&metrics, 240.0).expect("the floors fit");
+
+        assert_eq!(widths[2], 40.0, "the status column is untouched");
+        assert!(
+            widths[0] < 200.0 && widths[1] < 120.0,
+            "both wide columns shrink: {widths:?}"
+        );
+        assert!(
+            widths[1] >= widths[0],
+            "the path gives up more than the prose: {widths:?}"
+        );
+    }
+
+    /// Past the floor there is nothing left to give; the caller falls back to
+    /// records rather than drawing a grid of stubs.
+    #[test]
+    fn an_impossible_table_reports_no_fit() {
+        let metrics = [
+            metric(24.0, 24.0, ColumnKind::Compact),
+            metric(24.0, 24.0, ColumnKind::Compact),
+            metric(24.0, 24.0, ColumnKind::Compact),
+        ];
+        assert_eq!(fit_widths(&metrics, 30.0), None);
+    }
+
+    /// A path column and a prose column must not classify the same, or the
+    /// shrink has nothing to work with.
+    #[test]
+    fn columns_are_classified_by_their_body() {
+        let path = vec![vec![
+            vec![plain("/usr/local/lib/something/deep/inside/the/tree.rs")],
+            vec![plain("another/very/long/unbroken/path/to/a/file.rs")],
+        ]];
+        let prose = vec![vec![
+            vec![plain("This cell holds a sentence of several words")],
+            vec![plain("and so does this one, which is prose too")],
+        ]];
+        let count = vec![vec![vec![plain("42")], vec![plain("7")]]];
+
+        assert_eq!(classify_column(&path, 0), ColumnKind::TokenHeavy);
+        assert_eq!(classify_column(&prose, 0), ColumnKind::Narrative);
+        assert_eq!(classify_column(&count, 0), ColumnKind::Compact);
+    }
+
+    /// A single shredded value is noise; a table where most rows cannot be
+    /// shown whole is the wrong shape and transposes to records.
+    #[test]
+    fn records_replace_a_grid_that_cannot_show_its_values() {
+        let rows = vec![
+            vec![vec![plain("aaaa-bbbb-cccc-dddd")], vec![plain("x")]],
+            vec![vec![plain("eeee-ffff-gggg-hhhh")], vec![plain("y")]],
+            vec![vec![plain("iiii-jjjj-kkkk-llll")], vec![plain("z")]],
+        ];
+        let metrics = [
+            metric(200.0, 200.0, ColumnKind::Compact),
+            metric(12.0, 12.0, ColumnKind::Compact),
+        ];
+        let widths = [18.0, 30.0];
+        assert!(should_render_records(&rows, &widths, &metrics));
+
+        let roomy = [200.0, 30.0];
+        assert!(!should_render_records(&rows, &roomy, &metrics));
     }
 
     #[test]
@@ -1488,6 +2070,79 @@ mod tests {
         for source in ["**", "*", "`", "[", "\\", "***", "[](", "_"] {
             let _ = parse(source);
         }
+    }
+
+    /// The bug this guards: an empty first header cell used to size its column
+    /// from the cell's own (empty) galley, so every column after it shifted left
+    /// and the header no longer sat over the body.
+    #[test]
+    fn an_empty_header_cell_does_not_shift_the_columns() {
+        const MESSAGE: &str = "\
+|  | left | right |
+|---|---|---|
+| a | b | c |
+";
+        let columns = drawn_columns(MESSAGE, 520.0);
+        // Row 0 is the header, row 1 the body. The header's first cell is
+        // empty, so it draws no shape and cannot be compared by index.
+        let header = &columns[0];
+        let body = &columns[1];
+        assert_eq!(header.len(), 2, "the empty header cell draws nothing");
+        for cell in header {
+            assert!(
+                body.iter().any(|body| (body.0 - cell.0).abs() < 0.5),
+                "header cell at x={} has no body column: {header:?} vs {body:?}",
+                cell.0
+            );
+        }
+    }
+
+    /// Draws `message` at `width` and returns each text shape as
+    /// `(x, y, width)`, grouped by the row it lands on. Header and body cells
+    /// that share a column must share an `x`.
+    fn drawn_columns(message: &str, width: f32) -> Vec<Vec<(f32, f32, f32)>> {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.vertical(|ui| {
+                ui.set_max_width(width);
+                draw_text(ui, &Palette::dark(), message, (0usize, 0usize));
+            });
+        });
+        output.textures_delta.clear();
+
+        let mut shapes: Vec<(f32, f32, f32)> = Vec::new();
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(f32, f32, f32)>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => {
+                    out.push((text.pos.x, text.pos.y, text.galley.size().x));
+                }
+                egui::epaint::Shape::Vec(v) => {
+                    for shape in v {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut shapes);
+        }
+
+        // Rows are a few pixels apart; two shapes within 12 px of each other in
+        // `y` are on the same line.
+        shapes.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let mut rows: Vec<Vec<(f32, f32, f32)>> = Vec::new();
+        for shape in shapes {
+            match rows.last_mut() {
+                Some(row) if (row[0].1 - shape.1).abs() < 12.0 => row.push(shape),
+                _ => rows.push(vec![shape]),
+            }
+        }
+        for row in &mut rows {
+            row.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        }
+        rows
     }
 
     /// The only test here that draws, and it is here for the two failures that

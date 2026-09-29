@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::attachments::ImageRef;
 use crate::config::InputModality;
 use crate::context::ContextSettings;
-use crate::llm::{Message, ThinkingLevel, UserTurn, Usage};
+use crate::llm::{Message, ThinkingLevel, Usage, UserTurn};
 use crate::plugins::PluginCatalogue;
 use crate::tools::jobs::{JobSnapshot, JobStatus};
 use crate::tools::{HunkLines, ToolSettings};
@@ -413,11 +413,23 @@ mod tests {
     fn job_status_maps_onto_the_window_vocabulary() {
         // Every status has a state, and a running one is not settled — the
         // composer keeps polling while it is not.
-        assert_eq!(JobView::from(snapshot("bash", JobStatus::Running)).state, JobState::Running);
+        assert_eq!(
+            JobView::from(snapshot("bash", JobStatus::Running)).state,
+            JobState::Running
+        );
         assert!(!JobView::from(snapshot("bash", JobStatus::Running)).is_settled());
-        assert_eq!(JobView::from(snapshot("bash", JobStatus::Stopping)).state, JobState::Stopping);
-        assert_eq!(JobView::from(snapshot("bash", JobStatus::Killed)).state, JobState::Killed);
-        assert_eq!(JobView::from(snapshot("bash", JobStatus::Failed)).state, JobState::Failed);
+        assert_eq!(
+            JobView::from(snapshot("bash", JobStatus::Stopping)).state,
+            JobState::Stopping
+        );
+        assert_eq!(
+            JobView::from(snapshot("bash", JobStatus::Killed)).state,
+            JobState::Killed
+        );
+        assert_eq!(
+            JobView::from(snapshot("bash", JobStatus::Failed)).state,
+            JobState::Failed
+        );
         assert!(!JobView::from(snapshot("bash", JobStatus::Killed)).is_subagent());
     }
 }

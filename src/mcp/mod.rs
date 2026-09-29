@@ -404,7 +404,11 @@ mod tests {
 
         let error = client.list_tools().await.unwrap_err();
         assert!(error.message.contains("-32601"), "{}", error.message);
-        assert!(error.message.contains("Method not found"), "{}", error.message);
+        assert!(
+            error.message.contains("Method not found"),
+            "{}",
+            error.message
+        );
         assert!(error.message.contains("test"), "{}", error.message);
     }
 
@@ -416,7 +420,10 @@ mod tests {
         ]);
         client.handshake().await.unwrap();
 
-        let result = client.call_tool("search", &json!({"q": "x"})).await.unwrap();
+        let result = client
+            .call_tool("search", &json!({"q": "x"}))
+            .await
+            .unwrap();
         assert_eq!(result["content"][0]["text"], "hi");
     }
 

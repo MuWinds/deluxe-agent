@@ -445,9 +445,8 @@ mod tests {
     #[test]
     fn matches_a_hunk_when_only_the_terminators_differ() {
         // The patch says LF, the file is CRLF: the hunk must still land.
-        let (updated, _) =
-            apply_hunks("a\r\nold\r\nb\r\n", &[vec!["-old".into(), "+new".into()]])
-                .expect("hunk must match despite the terminator difference");
+        let (updated, _) = apply_hunks("a\r\nold\r\nb\r\n", &[vec!["-old".into(), "+new".into()]])
+            .expect("hunk must match despite the terminator difference");
         assert_eq!(updated, "a\r\nnew\r\nb\r\n");
     }
 

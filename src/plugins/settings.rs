@@ -80,8 +80,7 @@ impl PluginSettings {
         if id.is_empty() {
             return;
         }
-        self.plugins
-            .insert(id.to_string(), PluginEntry { enabled });
+        self.plugins.insert(id.to_string(), PluginEntry { enabled });
     }
 
     /// Repairs a hand-edited section.
@@ -218,7 +217,10 @@ mod tests {
         let mut settings = PluginSettings {
             plugins: BTreeMap::from([
                 off("figma@personal"),
-                ("repo-triage@my-team".to_string(), PluginEntry { enabled: true }),
+                (
+                    "repo-triage@my-team".to_string(),
+                    PluginEntry { enabled: true },
+                ),
             ]),
             projects: BTreeMap::from([(
                 "/work/repo".to_string(),
@@ -236,7 +238,10 @@ mod tests {
 
     #[test]
     fn a_project_key_is_the_same_whether_or_not_it_ends_in_a_separator() {
-        assert_eq!(project_key(Path::new("/work/repo/")), project_key(Path::new("/work/repo")));
+        assert_eq!(
+            project_key(Path::new("/work/repo/")),
+            project_key(Path::new("/work/repo"))
+        );
         assert_eq!(
             project_key(Path::new(r"C:\work\repo\")),
             project_key(Path::new(r"C:\work\repo"))
@@ -270,7 +275,11 @@ mod tests {
             !parsed.plugins["chrome@openai-bundled"].enabled,
             "a switch that is off is still a row, which is what makes it reversible"
         );
-        assert_eq!(parsed.projects.len(), 1, "`projects` is a field, not a plugin");
+        assert_eq!(
+            parsed.projects.len(),
+            1,
+            "`projects` is a field, not a plugin"
+        );
     }
 
     #[test]
@@ -285,7 +294,10 @@ mod tests {
     fn the_section_round_trips_through_toml() {
         let settings = PluginSettings {
             plugins: BTreeMap::from([
-                ("figma@openai-curated".to_string(), PluginEntry { enabled: true }),
+                (
+                    "figma@openai-curated".to_string(),
+                    PluginEntry { enabled: true },
+                ),
                 off("chrome@openai-bundled"),
             ]),
             projects: BTreeMap::from([(
