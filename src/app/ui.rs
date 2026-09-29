@@ -361,7 +361,7 @@ impl App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("Desktop Agent")
+                        RichText::new("Deluxe Agent")
                             .size(theme::font(14.0))
                             .strong(),
                     );
@@ -1340,7 +1340,7 @@ impl App {
                     draw_logo(ui, p);
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new("Desktop Agent")
+                            RichText::new("Deluxe Agent")
                                 .size(theme::font(16.0))
                                 .strong(),
                         );

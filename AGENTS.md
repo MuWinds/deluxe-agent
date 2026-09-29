@@ -1,6 +1,6 @@
 # AGENTS.md
 
-`desktop-agent` 的协作约定。本文件会被 agent 自己当作项目指令读取（`src/agent.rs`
+`deluxe-agent` 的协作约定。本文件会被 agent 自己当作项目指令读取（`src/agent.rs`
 的 `PROJECT_CONTEXT_FILES`：`AGENTS.md` → `CLAUDE.md` → `README.md`，每个文件上限
 16 KB），所以这里的规则对人和对模型同样生效。
 
@@ -74,7 +74,7 @@ cargo clippy --all-targets -- -D warnings
 ## Project Structure
 
 ```
-desktop-agent/
+deluxe-agent/
 ├── Cargo.toml             # 依赖、release profile、对 egui-winit 的 [patch.crates-io]
 ├── Cargo.lock             # 提交进仓库（二进制 crate）
 ├── AGENTS.md              # 本文件

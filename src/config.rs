@@ -16,15 +16,15 @@ use crate::theme::ThemeChoice;
 use crate::tools::ToolSettings;
 
 /// Read before the credential store, so a shell export always wins.
-pub const API_KEY_ENV: &str = "DESKTOP_AGENT_API_KEY";
+pub const API_KEY_ENV: &str = "DELUXE_AGENT_API_KEY";
 
 /// Overrides the config directory, so a shell export always wins — the same
 /// escape hatch [`API_KEY_ENV`] gives the key. A portable install, a second
 /// profile, or a test that must not touch the user's real state can point it
 /// somewhere else.
-pub const CONFIG_DIR_ENV: &str = "DESKTOP_AGENT_CONFIG_DIR";
+pub const CONFIG_DIR_ENV: &str = "DELUXE_AGENT_CONFIG_DIR";
 
-const KEYRING_SERVICE: &str = "desktop-agent";
+const KEYRING_SERVICE: &str = "deluxe-agent";
 const KEYRING_ACCOUNT: &str = "llm-api-key";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,7 +184,7 @@ pub fn config_dir() -> Option<PathBuf> {
             return Some(PathBuf::from(dir));
         }
     }
-    directories::ProjectDirs::from("", "", "desktop-agent")
+    directories::ProjectDirs::from("", "", "deluxe-agent")
         .map(|dirs| dirs.config_dir().to_path_buf())
 }
 

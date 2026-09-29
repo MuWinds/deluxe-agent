@@ -266,7 +266,7 @@ struct Marketplace {
 /// Finds and loads the enabled plugins.
 ///
 /// `home` is passed in rather than looked up so tests can point it at a temp
-/// directory. It cannot come from `DESKTOP_AGENT_CONFIG_DIR`, which redirects
+/// directory. It cannot come from `DELUXE_AGENT_CONFIG_DIR`, which redirects
 /// this agent's own config but not `~/.agents` or `~/.codex` — using it here
 /// would let a test read, and a stray write destroy, the real installation.
 ///

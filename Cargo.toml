@@ -1,5 +1,5 @@
 [package]
-name = "desktop-agent"
+name = "deluxe-agent"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
@@ -7,7 +7,7 @@ description = "A lightweight desktop GUI agent that drives local tools with an O
 license = "MIT"
 
 [[bin]]
-name = "desktop-agent"
+name = "deluxe-agent"
 path = "src/main.rs"
 
 [dependencies]

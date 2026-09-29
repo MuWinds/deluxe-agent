@@ -142,7 +142,7 @@ impl McpClient {
                     "protocolVersion": SERVER_PROTOCOL_VERSION,
                     "capabilities": {},
                     "clientInfo": {
-                        "name": "desktop-agent",
+                        "name": "deluxe-agent",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
                 }),

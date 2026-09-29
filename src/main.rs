@@ -1,4 +1,4 @@
-//! `desktop-agent` — a lightweight desktop GUI agent.
+//! `deluxe-agent` — a lightweight desktop GUI agent.
 //!
 //! Threading model, which the rest of the code assumes:
 //!
@@ -110,14 +110,14 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([900.0, 560.0])
-            .with_title("Desktop Agent"),
+            .with_title("Deluxe Agent"),
         ..Default::default()
     };
 
     let handle = runtime.handle().clone();
 
     eframe::run_native(
-        "Desktop Agent",
+        "Deluxe Agent",
         options,
         Box::new(move |cc| {
             // Must run before the first frame: the default font set has no CJK
