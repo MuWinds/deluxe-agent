@@ -485,6 +485,12 @@ impl App {
                 }
             }
 
+            Event::AssistantTurnReset { .. } => {
+                if let Some(session) = self.session_mut(session_id) {
+                    session::reset_turn(&mut session.steps);
+                }
+            }
+
             Event::ReasoningDelta { text, .. } => {
                 if let Some(session) = self.session_mut(session_id) {
                     session.push_reasoning(&text);
@@ -617,6 +623,7 @@ impl App {
         let run = self.subagent_run_mut(job_id);
         match event {
             Event::AssistantDelta { text, .. } => session::push_assistant(&mut run.steps, &text),
+            Event::AssistantTurnReset { .. } => session::reset_turn(&mut run.steps),
             Event::ReasoningDelta { text, .. } => session::push_reasoning(&mut run.steps, &text),
             Event::AssistantDone { content, .. } => session::push_answer(&mut run.steps, &content),
             Event::Notice { text, .. } => run.steps.push(Step::Notice { text }),
@@ -1074,6 +1081,8 @@ impl App {
                 model: self.config.llm.model.clone(),
                 context: self.config.context,
                 max_output_tokens: self.config.llm.max_output_tokens,
+                retry_count: self.config.llm.retry_count,
+                retry_forever: self.config.llm.retry_forever,
                 input: self.config.llm.input.clone(),
                 api_key: self.api_key.clone(),
             })))
@@ -1421,6 +1430,7 @@ impl App {
 fn event_run_id(event: &Event) -> RunId {
     match event {
         Event::AssistantDelta { run_id, .. }
+        | Event::AssistantTurnReset { run_id }
         | Event::ReasoningDelta { run_id, .. }
         | Event::AssistantDone { run_id, .. }
         | Event::Notice { run_id, .. }
@@ -1944,6 +1954,7 @@ mod tests {
                 run_id: 7,
                 text: String::new(),
             },
+            Event::AssistantTurnReset { run_id: 7 },
             Event::ReasoningDelta {
                 run_id: 7,
                 text: String::new(),
@@ -1984,6 +1995,99 @@ mod tests {
         for event in &events {
             assert_eq!(event_run_id(event), 7);
         }
+    }
+
+    #[test]
+    fn a_stream_retry_removes_partial_output_without_finishing_the_run() {
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            cmd_tx,
+            event_rx,
+            crate::config::Config::default(),
+            "key".into(),
+            Vec::new(),
+            no_plugins(),
+            test_paths(),
+        );
+
+        app.prompt = "new request".into();
+        app.start_run();
+        let session_id = app.selected.expect("the run opened a session");
+        let run_id = app.run_for(session_id).expect("the run is active");
+
+        app.apply(Event::ReasoningDelta {
+            run_id,
+            text: "partial thought".into(),
+        });
+        app.apply(Event::AssistantDelta {
+            run_id,
+            text: "partial answer".into(),
+        });
+        app.apply(Event::AssistantTurnReset { run_id });
+
+        let session = app.session(session_id).expect("the session remains");
+        assert_eq!(session.steps.len(), 1, "only the user's prompt remains");
+        assert!(matches!(
+            &session.steps[0],
+            Step::User { text, .. } if text == "new request"
+        ));
+        assert!(
+            app.run_for(session_id).is_some(),
+            "a retry reset is not a terminal event"
+        );
+    }
+
+    #[test]
+    fn saving_settings_sends_the_retry_count_to_the_worker() {
+        let config_dir = tempfile::tempdir().expect("a temp directory is available");
+        let config_path = config_dir.path().join("config.toml");
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.llm.retry_count = 6;
+        config.llm.retry_forever = true;
+        let mut app = App::new(
+            cmd_tx,
+            event_rx,
+            config,
+            "key".into(),
+            Vec::new(),
+            no_plugins(),
+            Paths {
+                home: test_home(),
+                config_path: Some(config_path.clone()),
+            },
+        );
+
+        app.save_settings();
+
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(Cmd::SetToolSettings(_))),
+            "tool settings are sent first"
+        );
+        match cmd_rx.try_recv() {
+            Ok(Cmd::SetLlmSettings(settings)) => {
+                assert_eq!(
+                    settings.retry_count, 6,
+                    "the worker receives the chosen value"
+                );
+                assert!(
+                    settings.retry_forever,
+                    "the worker receives the unlimited retry mode"
+                );
+            }
+            other => panic!("expected model settings, got {other:?}"),
+        }
+        assert_eq!(
+            saved_config(&config_path).llm.retry_count,
+            6,
+            "the same value survives a restart"
+        );
+        assert!(
+            saved_config(&config_path).llm.retry_forever,
+            "the unlimited retry mode survives a restart"
+        );
     }
 
     #[test]

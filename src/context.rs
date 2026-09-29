@@ -13,6 +13,7 @@
 //! settings make that trade-off the user's call.
 
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::llm::Message;
 
@@ -156,6 +157,7 @@ impl ContextWindow {
 pub async fn summarize(
     history: &[Message],
     llm: &crate::llm::LlmClient,
+    cancel: &CancellationToken,
 ) -> crate::error::Result<Option<String>> {
     let transcript = render(history);
     if transcript.is_empty() {
@@ -163,15 +165,18 @@ pub async fn summarize(
     }
 
     let turn = llm
-        .complete_turn(&[
-            Message::system(
-                "You compress a conversation between a user and a coding agent into a short \
+        .complete_turn(
+            &[
+                Message::system(
+                    "You compress a conversation between a user and a coding agent into a short \
                  continuation brief. Keep the user's goals, the decisions taken, the files \
                  touched, and anything still unfinished. Two hundred words at most. Answer in \
                  the language the conversation used.",
-            ),
-            Message::user(transcript),
-        ])
+                ),
+                Message::user(transcript),
+            ],
+            cancel,
+        )
         .await?;
 
     let summary = turn.content.trim().to_string();

@@ -141,6 +141,8 @@ fn main() -> eframe::Result<()> {
                 model: config.llm.model.clone(),
                 context: config.context,
                 max_output_tokens: config.llm.max_output_tokens,
+                retry_count: config.llm.retry_count,
+                retry_forever: config.llm.retry_forever,
                 input: config.llm.input.clone(),
                 api_key: api_key.clone(),
             })));
@@ -289,6 +291,11 @@ fn spawn_worker(
                                 &settings.model,
                                 &settings.api_key,
                                 settings.max_output_tokens,
+                                if settings.retry_forever {
+                                    None
+                                } else {
+                                    Some(settings.retry_count)
+                                },
                             ) {
                                 Ok(client) => client,
                                 Err(error) => {

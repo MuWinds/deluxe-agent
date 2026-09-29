@@ -1228,6 +1228,17 @@ impl App {
                         });
                         ui.end_row();
 
+                        ui.label("失败重试次数");
+                        ui.horizontal(|ui| {
+                            ui.add_enabled(
+                                !self.config.llm.retry_forever,
+                                egui::DragValue::new(&mut self.config.llm.retry_count)
+                                    .range(0..=crate::config::MAX_RETRY_COUNT),
+                            );
+                            ui.checkbox(&mut self.config.llm.retry_forever, "无限重试");
+                        });
+                        ui.end_row();
+
                         ui.label("压缩阈值");
                         ui.horizontal(|ui| {
                             let mut threshold = self.config.context.threshold_percent as f64;

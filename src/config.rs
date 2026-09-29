@@ -24,6 +24,9 @@ pub const API_KEY_ENV: &str = "DELUXE_AGENT_API_KEY";
 /// somewhere else.
 pub const CONFIG_DIR_ENV: &str = "DELUXE_AGENT_CONFIG_DIR";
 
+/// The most additional model-request attempts a config may enable.
+pub const MAX_RETRY_COUNT: u32 = 10;
+
 const KEYRING_SERVICE: &str = "deluxe-agent";
 const KEYRING_ACCOUNT: &str = "llm-api-key";
 
@@ -127,6 +130,11 @@ pub struct LlmConfig {
     /// all rather than a number a provider would read as a real one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// Additional attempts made after a failed model request. Defaults to
+    /// three and is bounded by [`MAX_RETRY_COUNT`].
+    pub retry_count: u32,
+    /// Whether failed model requests should keep retrying until cancelled.
+    pub retry_forever: bool,
 }
 
 /// One input modality a model can accept.
@@ -161,6 +169,7 @@ impl LlmConfig {
         if self.input.is_empty() {
             self.input = default_input_modalities();
         }
+        self.retry_count = self.retry_count.min(MAX_RETRY_COUNT);
     }
 }
 
@@ -171,6 +180,8 @@ impl Default for LlmConfig {
             model: "deepseek-chat".into(),
             input: default_input_modalities(),
             max_output_tokens: None,
+            retry_count: 3,
+            retry_forever: false,
         }
     }
 }
@@ -351,6 +362,8 @@ mod tests {
         config.tools.working_directory = PathBuf::from("/tmp/workspace");
         config.tools.block_destructive_commands = false;
         config.llm.model = "some-model".into();
+        config.llm.retry_count = 4;
+        config.llm.retry_forever = true;
         config.context.context_limit = 131_072;
         config.context.threshold_percent = 45;
 
@@ -363,6 +376,8 @@ mod tests {
         );
         assert!(!parsed.tools.block_destructive_commands);
         assert_eq!(parsed.llm.model, "some-model");
+        assert_eq!(parsed.llm.retry_count, 4);
+        assert!(parsed.llm.retry_forever);
         assert_eq!(parsed.context.context_limit, 131_072);
         assert_eq!(parsed.context.threshold_percent, 45);
     }
@@ -377,6 +392,8 @@ mod tests {
         );
         // No context section: compaction stays off until the user turns it on.
         assert_eq!(parsed.context.context_limit, 0);
+        assert_eq!(parsed.llm.retry_count, 3);
+        assert!(!parsed.llm.retry_forever);
     }
 
     #[test]
@@ -439,6 +456,15 @@ mod tests {
         assert!(config.llm.input.is_empty());
         config.llm.normalize();
         assert_eq!(config.llm.input, vec![InputModality::Text]);
+    }
+
+    #[test]
+    fn retry_count_is_bounded_when_loading_a_hand_edited_config() {
+        let mut config: Config = toml::from_str("[llm]\nmodel = \"m\"\nretryCount = 99\n").unwrap();
+
+        config.normalize();
+
+        assert_eq!(config.llm.retry_count, MAX_RETRY_COUNT);
     }
 
     #[test]

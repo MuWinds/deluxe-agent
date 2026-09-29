@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, EventSink, RunRequest};
@@ -191,6 +191,13 @@ impl FakeServer {
             .expect("the failure lock is not poisoned") = indices.to_vec();
     }
 
+    fn request_count(&self) -> usize {
+        self.requests
+            .lock()
+            .expect("the request lock is not poisoned")
+            .len()
+    }
+
     /// The body of the `index`-th request (0-based), or `""` if fewer requests
     /// arrived than the test expected — which is itself what the assertion is
     /// about.
@@ -302,7 +309,7 @@ fn agent_with_registry(
     directory: &std::path::Path,
     context: ContextSettings,
 ) -> Agent {
-    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None)
+    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, Some(0))
         .expect("the client builds");
     let settings = ToolSettings {
         working_directory: directory.to_path_buf(),
@@ -334,7 +341,7 @@ fn agent_with_plugins(
     directory: &std::path::Path,
     plugins: &[&LoadedPlugin],
 ) -> Agent {
-    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None)
+    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, Some(0))
         .expect("the client builds");
     let settings = ToolSettings {
         working_directory: directory.to_path_buf(),
@@ -782,6 +789,201 @@ fn answered(prompt_tokens: u64, answer: &str) -> String {
 }
 
 #[tokio::test]
+async fn a_completion_retries_provider_errors_and_returns_the_successful_answer() {
+    let provider_error = json!({ "error": { "message": "temporary failure" } }).to_string();
+    let answer = json!({
+        "choices": [{
+            "message": { "content": "recovered" },
+            "finish_reason": "stop",
+        }],
+    })
+    .to_string();
+    let server = FakeServer::start(vec![provider_error, answer]).await;
+    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, Some(1))
+        .expect("the client builds");
+
+    let turn = client
+        .complete_turn(&[Message::user("summarize")], &CancellationToken::new())
+        .await
+        .expect("the retry returns the successful answer");
+
+    assert_eq!(turn.content, "recovered");
+    assert_eq!(server.request_count(), 2, "one retry means two attempts");
+}
+
+#[tokio::test]
+async fn a_completion_stops_after_the_configured_number_of_retries() {
+    let server = FakeServer::start(vec![String::new(), String::new(), String::new()]).await;
+    server.fail(&[0, 1, 2]);
+    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, Some(2))
+        .expect("the client builds");
+
+    let result = client
+        .complete_turn(&[Message::user("summarize")], &CancellationToken::new())
+        .await;
+
+    assert!(result.is_err(), "every scripted HTTP response is an error");
+    assert_eq!(
+        server.request_count(),
+        3,
+        "two retries allow the initial attempt plus two retries"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_retry_discards_partial_output_before_emitting_the_answer() {
+    let partial = format!(
+        "data: {}\n\n",
+        json!({ "choices": [{ "delta": { "content": "partial" } }] })
+    );
+    let server = FakeServer::start(vec![partial, answered(3, "complete")]).await;
+    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, Some(1))
+        .expect("the client builds");
+    let mut fragments = Vec::new();
+
+    let turn = client
+        .stream_turn(
+            &[Message::user("answer")],
+            &json!([]),
+            None,
+            &CancellationToken::new(),
+            |fragment| match fragment {
+                crate::llm::StreamFragment::Reset => fragments.push("reset".to_string()),
+                crate::llm::StreamFragment::Reasoning(text) => {
+                    fragments.push(format!("reasoning:{text}"));
+                }
+                crate::llm::StreamFragment::Content(text) => {
+                    fragments.push(format!("content:{text}"));
+                }
+            },
+        )
+        .await
+        .expect("the second stream completes");
+
+    assert_eq!(turn.content, "complete");
+    assert_eq!(
+        fragments,
+        vec!["content:partial", "reset", "content:complete"],
+        "failed-attempt output is cleared before the retry's output"
+    );
+    assert_eq!(server.request_count(), 2);
+}
+
+#[tokio::test]
+async fn an_unlimited_completion_keeps_retrying_past_the_default_limit() {
+    let failures = (0..4).map(|_| json!({ "error": { "message": "maintenance" } }).to_string());
+    let answer = json!({
+        "choices": [{
+            "message": { "content": "service restored" },
+            "finish_reason": "stop",
+        }],
+    })
+    .to_string();
+    let server = FakeServer::start(failures.chain([answer]).collect()).await;
+    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, None)
+        .expect("the client builds");
+
+    let turn = client
+        .complete_turn(&[Message::user("summarize")], &CancellationToken::new())
+        .await
+        .expect("unlimited retries continue until the service recovers");
+
+    assert_eq!(turn.content, "service restored");
+    assert_eq!(
+        server.request_count(),
+        5,
+        "four failures do not exhaust retries"
+    );
+}
+
+#[tokio::test]
+async fn an_unlimited_completion_stops_retrying_when_cancelled() {
+    let server = FakeServer::start(vec![String::new()]).await;
+    server.fail(&[0]);
+    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, None)
+        .expect("the client builds");
+    let cancel = CancellationToken::new();
+    let request_cancel = cancel.clone();
+    let request = tokio::spawn(async move {
+        client
+            .complete_turn(&[Message::user("summarize")], &request_cancel)
+            .await
+    });
+
+    while server.request_count() == 0 {
+        tokio::task::yield_now().await;
+    }
+    cancel.cancel();
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+        .await
+        .expect("cancellation ends an unlimited retry loop")
+        .expect("the request task does not panic")
+        .expect_err("the cancelled request does not return a completion");
+    assert_eq!(error.code, crate::error::code::CANCELLED);
+    assert_eq!(
+        server.request_count(),
+        1,
+        "no retry starts after cancellation"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_waiting_for_response_headers_stops_when_cancelled() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port must be available");
+    let port = listener
+        .local_addr()
+        .expect("the listener has an address")
+        .port();
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("the client connects");
+        read_request(&mut socket).await;
+        let _ = accepted_tx.send(());
+        let _ = release_rx.await;
+    });
+    let client = LlmClient::new(
+        format!("http://127.0.0.1:{port}/v1"),
+        "test-model",
+        "test-key",
+        None,
+        None,
+    )
+    .expect("the client builds");
+    let cancel = CancellationToken::new();
+    let request_cancel = cancel.clone();
+    let request = tokio::spawn(async move {
+        client
+            .stream_turn(
+                &[Message::user("answer")],
+                &json!([]),
+                None,
+                &request_cancel,
+                |_| {},
+            )
+            .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), accepted_rx)
+        .await
+        .expect("the server receives the request")
+        .expect("the server signals the accepted request");
+    cancel.cancel();
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+        .await
+        .expect("cancellation ends the request before response headers arrive")
+        .expect("the request task does not panic")
+        .expect_err("the cancelled stream does not return a turn");
+    assert_eq!(error.code, crate::error::code::CANCELLED);
+    let _ = release_tx.send(());
+    server.await.expect("the local server task exits");
+}
+
+#[tokio::test]
 async fn crossing_the_threshold_compacts_the_history_before_the_next_turn() {
     let directory = tempfile::tempdir().expect("a temp directory is available");
 
@@ -1169,7 +1371,8 @@ async fn turning_the_guard_off_lets_a_destructive_command_through() {
     ))
     .await;
 
-    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None).expect("builds");
+    let client =
+        LlmClient::new(&server.base_url, "test-model", "test-key", None, Some(0)).expect("builds");
     let settings = ToolSettings {
         working_directory: directory.path().to_path_buf(),
         block_destructive_commands: false,

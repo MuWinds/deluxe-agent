@@ -405,7 +405,7 @@ mod tests {
 
     fn task_with(roles: Vec<AgentRole>) -> Task {
         Task::new(
-            LlmClient::new("http://localhost:1", "test-model", "key", None).unwrap(),
+            LlmClient::new("http://localhost:1", "test-model", "key", None, Some(0)).unwrap(),
             roles,
             Arc::new(ToolRegistry::with_builtins()),
             Arc::new(RwLock::new(ToolSettings::default())),

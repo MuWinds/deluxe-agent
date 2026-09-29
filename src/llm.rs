@@ -23,7 +23,11 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::attachments::ImageRef;
+use crate::config::MAX_RETRY_COUNT;
 use crate::error::{AgentError, Result};
+
+const RETRY_DELAY_BASE: Duration = Duration::from_millis(250);
+const RETRY_DELAY_MAX: Duration = Duration::from_secs(30);
 
 /// How much reasoning effort to ask a reasoning model for.
 ///
@@ -390,6 +394,8 @@ impl Usage {
 /// them here would put thinking into the answer where it cannot be folded.
 #[derive(Debug, Clone, Copy)]
 pub enum StreamFragment<'a> {
+    /// The previous attempt failed and its streamed output should be discarded.
+    Reset,
     /// The model's chain of thought, when it thinks out loud.
     Reasoning(&'a str),
     /// The part of the reply the user is meant to read.
@@ -425,6 +431,8 @@ pub struct LlmClient {
     /// `max_tokens` to send with every request, or `None` to leave the
     /// provider's own ceiling in force.
     max_output_tokens: Option<u32>,
+    /// Additional attempts after failure, or `None` to retry until cancelled.
+    retry_limit: Option<u32>,
 }
 
 impl LlmClient {
@@ -433,13 +441,15 @@ impl LlmClient {
     /// The URL is stored without a trailing slash so request paths join cleanly.
     /// No overall request timeout is set — a streamed turn runs for minutes and
     /// is bounded by cancellation instead — only a connect timeout, so a dead
-    /// host fails fast. Returns [`AgentError::internal`] if the HTTP client
+    /// host fails fast. `retry_limit` counts additional attempts; `None` retries
+    /// until cancellation. Returns [`AgentError::internal`] if the HTTP client
     /// itself cannot be built.
     pub fn new(
         base_url: impl Into<String>,
         model: impl Into<String>,
         api_key: impl Into<String>,
         max_output_tokens: Option<u32>,
+        retry_limit: Option<u32>,
     ) -> Result<Self> {
         // No overall timeout: a streamed turn legitimately runs for minutes.
         // Cancellation is what bounds it, plus a connect timeout so a dead host
@@ -457,6 +467,7 @@ impl LlmClient {
             model: model.into(),
             api_key: api_key.into(),
             max_output_tokens,
+            retry_limit: retry_limit.map(|count| count.min(MAX_RETRY_COUNT)),
         })
     }
 
@@ -466,6 +477,9 @@ impl LlmClient {
     ///
     /// `on_fragment` is called from the streaming task; the caller is responsible
     /// for coalescing fragments before touching the UI.
+    ///
+    /// Failed attempts emit [`StreamFragment::Reset`] before retrying, so the
+    /// caller can discard any fragments already shown from that attempt.
     ///
     /// `thinking` is the conversation's chosen reasoning effort, or `None` to
     /// leave the parameter out. It is passed per call rather than held on the
@@ -481,12 +495,60 @@ impl LlmClient {
     ) -> Result<AssistantTurn> {
         let url = format!("{}/chat/completions", self.base_url);
         let body = self.turn_body(messages, tools, thinking);
+        let mut retry = 0_u64;
 
+        loop {
+            if cancel.is_cancelled() {
+                return Err(AgentError::cancelled());
+            }
+
+            let outcome = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(AgentError::cancelled()),
+                outcome = self.stream_turn_once(&url, &body, cancel, &mut on_fragment) => outcome,
+            };
+            match outcome {
+                Ok(turn) => return Ok(turn),
+                Err(_) if cancel.is_cancelled() => return Err(AgentError::cancelled()),
+                Err(error) => {
+                    on_fragment(StreamFragment::Reset);
+                    if self
+                        .retry_limit
+                        .is_some_and(|limit| retry >= u64::from(limit))
+                    {
+                        return Err(error);
+                    }
+
+                    tracing::warn!(
+                        retry = retry.saturating_add(1),
+                        retry_forever = self.retry_limit.is_none(),
+                        %error,
+                        "retrying failed model stream"
+                    );
+                    let delay = retry_delay(retry);
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(AgentError::cancelled()),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    retry = retry.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    async fn stream_turn_once(
+        &self,
+        url: &str,
+        body: &Value,
+        cancel: &CancellationToken,
+        on_fragment: &mut impl FnMut(StreamFragment<'_>),
+    ) -> Result<AssistantTurn> {
         let response = self
             .http
-            .post(&url)
+            .post(url)
             .bearer_auth(&self.api_key)
-            .json(&body)
+            .json(body)
             .send()
             .await
             .map_err(|error| AgentError::llm(format!("Request to {url} failed: {error}")))?;
@@ -510,6 +572,7 @@ impl LlmClient {
         let mut usage = None;
         let mut finish_reason = None;
         let mut done = false;
+        let mut saw_choice = false;
 
         while !done {
             if cancel.is_cancelled() {
@@ -564,6 +627,7 @@ impl LlmClient {
                 let Some(choice) = event.get("choices").and_then(|c| c.get(0)) else {
                     continue;
                 };
+                saw_choice = true;
 
                 if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
                     finish_reason = Some(reason.to_string());
@@ -593,6 +657,17 @@ impl LlmClient {
 
                 absorb_tool_calls(delta, &mut accumulators);
             }
+        }
+
+        if !done {
+            return Err(AgentError::llm(format!(
+                "Stream from {url} ended before [DONE]"
+            )));
+        }
+        if !saw_choice {
+            return Err(AgentError::llm(format!(
+                "Stream from {url} completed without a choice"
+            )));
         }
 
         let tool_calls = accumulators
@@ -653,7 +728,11 @@ impl LlmClient {
     /// Used by the context-window compactor, which asks the model to summarise
     /// dropped history. No tools are offered, and the reply is not streamed —
     /// nothing here reaches the transcript until the summary text does.
-    pub async fn complete_turn(&self, messages: &[Message]) -> Result<Completion> {
+    pub async fn complete_turn(
+        &self,
+        messages: &[Message],
+        cancel: &CancellationToken,
+    ) -> Result<Completion> {
         let url = format!("{}/chat/completions", self.base_url);
         let mut body = json!({
             "model": &self.model,
@@ -663,11 +742,47 @@ impl LlmClient {
             body["max_tokens"] = json!(tokens);
         }
 
+        let mut retry = 0_u64;
+        loop {
+            let outcome = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(AgentError::cancelled()),
+                outcome = self.complete_turn_once(&url, &body) => outcome,
+            };
+            match outcome {
+                Ok(turn) => return Ok(turn),
+                Err(_) if cancel.is_cancelled() => return Err(AgentError::cancelled()),
+                Err(error) => {
+                    if self
+                        .retry_limit
+                        .is_some_and(|limit| retry >= u64::from(limit))
+                    {
+                        return Err(error);
+                    }
+
+                    tracing::warn!(
+                        retry = retry.saturating_add(1),
+                        retry_forever = self.retry_limit.is_none(),
+                        %error,
+                        "retrying failed model completion"
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(AgentError::cancelled()),
+                        _ = tokio::time::sleep(retry_delay(retry)) => {}
+                    }
+                    retry = retry.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    async fn complete_turn_once(&self, url: &str, body: &Value) -> Result<Completion> {
         let response = self
             .http
-            .post(&url)
+            .post(url)
             .bearer_auth(&self.api_key)
-            .json(&body)
+            .json(body)
             .send()
             .await
             .map_err(|error| AgentError::llm(format!("Request to {url} failed: {error}")))?;
@@ -767,6 +882,13 @@ fn truncate(text: &str, max: usize) -> String {
     format!("{}…", &text[..end])
 }
 
+fn retry_delay(retry: u64) -> Duration {
+    let multiplier = 1_u32 << retry.min(7) as u32;
+    RETRY_DELAY_BASE
+        .saturating_mul(multiplier)
+        .min(RETRY_DELAY_MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,6 +970,14 @@ mod tests {
     }
 
     #[test]
+    fn retry_delay_grows_exponentially_and_stops_at_thirty_seconds() {
+        assert_eq!(retry_delay(0), Duration::from_millis(250));
+        assert_eq!(retry_delay(4), Duration::from_secs(4));
+        assert_eq!(retry_delay(7), Duration::from_secs(30));
+        assert_eq!(retry_delay(100), Duration::from_secs(30));
+    }
+
+    #[test]
     fn an_assistant_message_with_tool_calls_serialises_content_as_null() {
         let message = Message::assistant(
             String::new(),
@@ -924,13 +1054,13 @@ mod tests {
     }
 
     fn client() -> LlmClient {
-        LlmClient::new("http://localhost/v1", "m", "k", None).expect("the client builds")
+        LlmClient::new("http://localhost/v1", "m", "k", None, Some(0)).expect("the client builds")
     }
 
     #[test]
     fn a_configured_output_budget_is_sent_as_max_tokens() {
-        let client =
-            LlmClient::new("http://localhost/v1", "m", "k", Some(8192)).expect("the client builds");
+        let client = LlmClient::new("http://localhost/v1", "m", "k", Some(8192), Some(0))
+            .expect("the client builds");
         let body = client.turn_body(&[], &json!([]), None);
         assert_eq!(body["max_tokens"], 8192);
     }

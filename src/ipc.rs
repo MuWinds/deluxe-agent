@@ -36,6 +36,10 @@ pub struct LlmSettings {
     /// The `max_tokens` sent with every request, or `None` to leave the
     /// provider's own ceiling in force.
     pub max_output_tokens: Option<u32>,
+    /// Additional attempts made after a failed model request.
+    pub retry_count: u32,
+    /// Keep retrying failed model requests until the run is cancelled.
+    pub retry_forever: bool,
     /// The model's input modalities. Part of the agent cache key because
     /// `image` decides whether `read_image` is registered and therefore what
     /// the system prompt advertises.
@@ -59,6 +63,8 @@ impl std::fmt::Debug for LlmSettings {
             .field("model", &self.model)
             .field("context", &self.context)
             .field("max_output_tokens", &self.max_output_tokens)
+            .field("retry_count", &self.retry_count)
+            .field("retry_forever", &self.retry_forever)
             .field("input", &self.input)
             .field("api_key", &"<redacted>")
             .finish()
@@ -134,6 +140,11 @@ pub enum Event {
     AssistantDelta {
         run_id: RunId,
         text: String,
+    },
+    /// Discards the incomplete assistant and reasoning output from a failed
+    /// streamed request before its retry begins.
+    AssistantTurnReset {
+        run_id: RunId,
     },
     /// A coalesced batch of streamed chain-of-thought text. It arrives before
     /// the answer it produced, and the UI folds it away by default.

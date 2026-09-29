@@ -202,6 +202,20 @@ pub fn push_assistant(steps: &mut Vec<Step>, text: &str) {
     }
 }
 
+/// Removes the trailing reasoning and answer fragments of an incomplete turn.
+///
+/// A failed streamed request can already have emitted live deltas; its retry
+/// must start with a clean transcript while leaving earlier turns and tool
+/// results untouched.
+pub fn reset_turn(steps: &mut Vec<Step>) {
+    while matches!(
+        steps.last(),
+        Some(Step::Assistant { .. } | Step::Reasoning { .. })
+    ) {
+        steps.pop();
+    }
+}
+
 /// Adds a completed turn's text, unless the streamed deltas already built it.
 ///
 /// A provider that answers in one piece, with no streaming chunks, emits no
@@ -808,6 +822,36 @@ mod tests {
         push_answer(&mut steps, "a second turn");
         assert_eq!(steps.len(), 2);
         assert!(matches!(&steps[1], Step::Assistant { text } if text == "a second turn"));
+    }
+
+    #[test]
+    fn resetting_a_turn_removes_only_its_trailing_streamed_output() {
+        let mut steps = vec![
+            Step::Assistant {
+                text: "earlier answer".into(),
+            },
+            Step::User {
+                text: "new request".into(),
+                images: Vec::new(),
+            },
+            Step::Reasoning {
+                id: Uuid::new_v4(),
+                text: "partial thought".into(),
+            },
+            Step::Assistant {
+                text: "partial answer".into(),
+            },
+        ];
+
+        reset_turn(&mut steps);
+
+        assert_eq!(
+            steps.len(),
+            2,
+            "earlier turns and the current prompt remain"
+        );
+        assert!(matches!(&steps[0], Step::Assistant { text } if text == "earlier answer"));
+        assert!(matches!(&steps[1], Step::User { text, .. } if text == "new request"));
     }
 
     #[test]

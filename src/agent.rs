@@ -407,6 +407,7 @@ impl Agent {
         context: &mut ContextWindow,
         sink: &dyn EventSink,
         run_id: RunId,
+        cancel: &CancellationToken,
     ) -> Result<Vec<Message>> {
         let count = messages.len();
 
@@ -421,7 +422,7 @@ impl Agent {
             "context threshold reached; compacting the history"
         );
 
-        match summarize(&messages, &self.llm).await {
+        match summarize(&messages, &self.llm, cancel).await {
             Ok(Some(summary)) => {
                 // The measurement belonged to the pre-compaction shape and no
                 // longer describes what will go out next; the turn that
@@ -451,6 +452,9 @@ impl Agent {
                 Ok(messages)
             }
             Err(error) => {
+                if cancel.is_cancelled() {
+                    return Err(AgentError::cancelled());
+                }
                 // Compaction is a mitigation, not the task. A failed summary
                 // request is logged and swallowed so the original prompt still
                 // goes out; the worst case is the provider refusing it, which
@@ -543,7 +547,7 @@ impl Agent {
             // the count now about to go out (the user prompt is already in).
             if context.should_compact(&messages) {
                 messages = self
-                    .compact_history(messages, &mut context, sink, run_id)
+                    .compact_history(messages, &mut context, sink, run_id, &cancel)
                     .await?;
             }
 
@@ -641,6 +645,12 @@ impl Agent {
             .llm
             .stream_turn(messages, &self.tools_schema, thinking, cancel, |fragment| {
                 match fragment {
+                    StreamFragment::Reset => {
+                        turn = TurnText::default();
+                        sink.emit(Event::AssistantTurnReset { run_id });
+                        last_flush = Instant::now();
+                        return;
+                    }
                     StreamFragment::Reasoning(text) => turn.reasoning.push_str(text),
                     StreamFragment::Content(text) => turn.content.push_str(text),
                 }
