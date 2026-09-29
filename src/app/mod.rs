@@ -1577,18 +1577,6 @@ fn project_name(project: &str) -> String {
         .unwrap_or_else(|| project.to_string())
 }
 
-/// Reveals `path` in the platform's file manager, best effort.
-fn open_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(target_os = "windows")]
-    let mut command = std::process::Command::new("explorer");
-    #[cfg(target_os = "macos")]
-    let mut command = std::process::Command::new("open");
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = std::process::Command::new("xdg-open");
-
-    command.arg(path).spawn().map(|_| ())
-}
-
 fn shorten(text: &str, max: usize) -> String {
     let flat = text.replace('\n', " ");
     if flat.chars().count() <= max {

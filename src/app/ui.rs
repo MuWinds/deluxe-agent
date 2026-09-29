@@ -257,8 +257,6 @@ impl App {
         let settings_open = self.show_settings;
         let about_open = self.show_about;
         let plugins_open = self.show_plugins;
-        let mut open_config_dir = false;
-        let mut copy_config_path = false;
 
         egui::Panel::left("rail")
             .exact_size(RAIL_WIDTH)
@@ -278,27 +276,8 @@ impl App {
                     if rail_button(ui, icons::HOUSE, !selected, "主界面").clicked() {
                         actions.new_session = true;
                     }
-                    ui.menu_button(
-                        RichText::new(icons::DOTS_THREE).size(theme::font(17.0)),
-                        |ui| {
-                            if ui.button("打开配置目录").clicked() {
-                                open_config_dir = true;
-                                ui.close();
-                            }
-                            if ui.button("复制配置路径").clicked() {
-                                copy_config_path = true;
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.button("退出").clicked() {
-                                actions.quit = true;
-                                ui.close();
-                            }
-                        },
-                    );
-                    // What is installed, next to the menu that holds the paths
-                    // and the quit: a plugin is only visible today through a
-                    // slash command in the picker, which is no way to answer
+                    // What is installed: a plugin is only visible today through
+                    // a slash command in the picker, which is no way to answer
                     // "did the one I just enabled load?".
                     if rail_button(ui, icons::PUZZLE_PIECE, plugins_open, "插件").clicked() {
                         actions.open_plugins = true;
@@ -316,18 +295,6 @@ impl App {
                     }
                 });
             });
-
-        if open_config_dir {
-            if let Some(dir) = config::config_dir() {
-                // `open` is best-effort: a failure here is not worth an error.
-                let _ = open_in_file_manager(&dir);
-            }
-        }
-        if copy_config_path {
-            if let Some(path) = config::config_path() {
-                ui.ctx().copy_text(path.display().to_string());
-            }
-        }
     }
 
     /// The session sidebar: search, projects, recent conversations.
