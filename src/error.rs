@@ -1,6 +1,5 @@
 //! The error type shared by the tool layer and the agent loop.
 
-/// Machine-readable error codes.
 pub mod code {
     pub const INVALID_PARAMS: &str = "invalid_params";
     pub const TOOL_NOT_FOUND: &str = "tool_not_found";

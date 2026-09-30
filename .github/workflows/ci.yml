@@ -1,0 +1,133 @@
+name: CI
+
+# Only Rust-affecting changes run this workflow, so a docs-only or AGENTS.md-only
+# commit leaves CI untouched. `paths` is an allowlist on purpose: everything the
+# build reads is listed below. A new build input (a `build.rs`, a `.cargo/config`,
+# a `rust-toolchain` file, a new asset directory) has to be added here or CI will
+# silently stop covering it.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'assets/**'
+      - 'vendor/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'assets/**'
+      - 'vendor/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # egui 0.36.2 — and the ecolor/epaint/egui_glow siblings it pulls in — declares
+  # `rust-version = 1.95`, so 1.95.0 is this crate's real floor even though
+  # Cargo.toml still says `rust-version = "1.88"`. There is no separate MSRV job
+  # (unlike local-tool-bridge, where only the library crates gate the floor):
+  # this crate is a single binary, so the pinned toolchain *is* the MSRV.
+  RUST_TOOLCHAIN: "1.95.0"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # eframe/winit, arboard, and rfd probe the X11 and Wayland stacks; the bare
+      # runner image ships none of the headers the build links against.
+      - name: Install Linux GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev libxkbcommon-dev libx11-dev libxcb1-dev libwayland-dev
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev libxkbcommon-dev libx11-dev libxcb1-dev libwayland-dev
+      - run: cargo test
+      # The release profile is not what `cargo test` exercises (LTO, opt-level
+      # "z", stripped); build it once so a profile-only breakage fails here.
+      - run: cargo build --release
+
+  package:
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: deluxe-agent-windows-x64.zip
+            binary: deluxe-agent.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: deluxe-agent-linux-x64.tar.gz
+            binary: deluxe-agent
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: deluxe-agent-macos-arm64.tar.gz
+            binary: deluxe-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev libxkbcommon-dev libx11-dev libxcb1-dev libwayland-dev
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\${{ matrix.target }}\release\${{ matrix.binary }} dist\
+          Compress-Archive -Path dist\${{ matrix.binary }} -DestinationPath ${{ matrix.archive }} -Force
+      - name: Package Unix
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/
+          tar -C dist -czf ${{ matrix.archive }} ${{ matrix.binary }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deluxe-agent-${{ matrix.target }}
+          path: ${{ matrix.archive }}
