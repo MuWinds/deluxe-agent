@@ -5,7 +5,7 @@
 //! with full permissions. What is left is schema validation (so a typo'd
 //! argument fails loudly instead of being dropped) and resource bounding.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ pub mod settings;
 pub mod shell;
 pub mod task;
 
+pub use crate::harness::HunkLines;
 pub use jobs::JobRegistry;
 pub use settings::ToolSettings;
 
@@ -96,19 +97,6 @@ impl ContentBlock {
             Self::Image { .. } => None,
         }
     }
-}
-
-/// The real line numbers one file section of a patch resolved to.
-///
-/// A patch can touch several files in one call, so the map is per section:
-/// `path` is the section's target as the patch named it, and `lines` carries
-/// one entry per hunk body line, in the order the patch lists them. `None`
-/// marks a line the patch did not number — a blank separator between hunks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HunkLines {
-    pub path: String,
-    pub lines: Vec<Option<usize>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,35 +322,6 @@ impl ToolRegistry {
     pub fn descriptors(&self) -> Vec<ToolDescriptor> {
         self.tools.values().map(|tool| tool.descriptor()).collect()
     }
-
-    /// The `<tools>` section of the system prompt: one bullet per tool.
-    ///
-    /// Named in prose because not every OpenAI-compatible backend surfaces the
-    /// native `tools` field to the model. Sourced from the registry, so a tool
-    /// shows up here the moment it is registered — no hand-copied list to drift.
-    pub fn tools_for_prompt(&self) -> String {
-        self.descriptors()
-            .iter()
-            .map(|descriptor| format!("- `{}`: {}", descriptor.name, descriptor.summary))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// Cross-tool rules, collected from every registered tool.
-    ///
-    /// Deduplicated so two tools agreeing on a rule state it once.
-    pub fn guidelines_for_prompt(&self) -> Vec<String> {
-        let mut seen = HashSet::new();
-        let mut rules = Vec::new();
-        for descriptor in self.descriptors() {
-            for rule in &descriptor.guidelines {
-                if seen.insert(rule.clone()) {
-                    rules.push(rule.clone());
-                }
-            }
-        }
-        rules
-    }
 }
 
 impl Default for ToolRegistry {
@@ -372,8 +331,9 @@ impl Default for ToolRegistry {
 }
 
 /// Renders the catalogue as the OpenAI `tools` request field.
-pub fn to_openai_tools(registry: &ToolRegistry) -> Value {
-    Value::Array(registry.descriptors().iter().map(to_openai_tool).collect())
+/// Renders a tool schema from a runtime-owned descriptor list.
+pub fn to_openai_tools_from_descriptors(descriptors: &[ToolDescriptor]) -> Value {
+    Value::Array(descriptors.iter().map(to_openai_tool).collect())
 }
 
 fn to_openai_tool(descriptor: &ToolDescriptor) -> Value {

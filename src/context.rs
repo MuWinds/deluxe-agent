@@ -15,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use crate::harness::LlmProvider;
 use crate::llm::Message;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,7 +157,7 @@ impl ContextWindow {
 /// the caller decides how it re-enters the wire — see [`summary_turn`].
 pub async fn summarize(
     history: &[Message],
-    llm: &crate::llm::LlmClient,
+    llm: &dyn LlmProvider,
     cancel: &CancellationToken,
 ) -> crate::error::Result<Option<String>> {
     let transcript = render(history);

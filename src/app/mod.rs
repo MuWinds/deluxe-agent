@@ -17,12 +17,12 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::agent::EventSink;
 use crate::attachments::{self, ImageRef};
 use crate::code_view;
-use crate::config::{self, Config, API_KEY_ENV};
+use crate::config::{Config, API_KEY_ENV};
+use crate::harness::{AgentEvent, AgentEventSink};
 use crate::image_ops;
-use crate::ipc::{Cmd, Event, JobState, JobView, LlmSettings, RunId, RunState};
+use crate::ipc::{Cmd, Event, JobState, JobView, LlmSettings, RunId, RunState, SecretValue};
 use crate::llm::{ThinkingLevel, UserTurn};
 use crate::plugins::{self, PluginCatalogue};
 use crate::session::{self, Session, Step, ToolResult};
@@ -115,13 +115,18 @@ impl ChannelSink {
     pub fn new(tx: mpsc::UnboundedSender<Event>, ctx: egui::Context) -> Self {
         Self { tx, ctx }
     }
-}
 
-impl EventSink for ChannelSink {
-    fn emit(&self, event: Event) {
+    /// Publishes a UI protocol event and wakes the window.
+    pub fn emit_ui(&self, event: Event) {
         if self.tx.send(event).is_ok() {
             self.ctx.request_repaint();
         }
+    }
+}
+
+impl AgentEventSink for ChannelSink {
+    fn emit(&self, event: AgentEvent) {
+        self.emit_ui(event.into());
     }
 }
 
@@ -199,16 +204,17 @@ struct Actions {
     paste_image: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ConfigSurface {
+    Sidebar,
+    Settings,
+}
+
 /// Where this app's state lives on the machine, resolved once at startup.
 ///
-/// Both are passed in rather than looked up on demand so a test can point them
-/// at a temp directory, and so a save targets the very file the app was started
-/// with rather than re-deriving one from the environment. They travel together
-/// because they answer a single question — where this machine keeps the things
-/// the window has to read and write.
+/// The config path is retained for the About window; persistence is owned by
+/// the worker.
 pub struct Paths {
-    /// The user's home directory: where `~/.agents` and `~/.codex` live.
-    pub home: PathBuf,
     /// The config file, or `None` when the system offers no config directory.
     pub config_path: Option<PathBuf>,
 }
@@ -234,7 +240,7 @@ pub struct App {
     /// and so a save writes the file the app was started with.
     paths: Paths,
 
-    /// Oldest first. [`session::save`] relies on that order.
+    /// Oldest first. The session store relies on that order.
     sessions: Vec<Session>,
     selected: Option<Uuid>,
     /// The project new chats are rooted at, and the one the sidebar keeps
@@ -250,6 +256,15 @@ pub struct App {
     /// text: a run emits hundreds of fragments, and serialising up to 5 MB on the
     /// GUI thread per fragment would be visible.
     dirty: bool,
+    /// Identifies each durable session snapshot.
+    session_revision: u64,
+    /// At most one normal save is queued at a time.
+    save_pending: Option<u64>,
+    next_config_request_id: u64,
+    pending_config_saves: HashMap<u64, ConfigSurface>,
+    config_save_requests: HashMap<ConfigSurface, u64>,
+    pending_api_key_save: Option<u64>,
+    pending_plugin_request: Option<u64>,
 
     prompt: String,
     /// Images queued for the next send, oldest first. Filled by pasting
@@ -364,6 +379,13 @@ impl App {
             active: HashMap::new(),
             next_run_id: 1,
             dirty: false,
+            session_revision: 0,
+            save_pending: None,
+            next_config_request_id: 1,
+            pending_config_saves: HashMap::new(),
+            config_save_requests: HashMap::new(),
+            pending_api_key_save: None,
+            pending_plugin_request: None,
             prompt: String::new(),
             pending_images: Vec::new(),
             thinking: None,
@@ -403,20 +425,46 @@ impl App {
         self.flush();
     }
 
-    /// Writes the session store if anything durable changed.
+    /// Queues the session store if anything durable changed.
     ///
-    /// A failed write leaves `dirty` set, so the next terminal event retries
-    /// rather than silently dropping the change.
+    /// File access stays on the worker. A failed write leaves `dirty` set for a
+    /// later poll to retry rather than silently dropping the change.
     pub fn flush(&mut self) {
-        if !self.dirty {
+        if !self.dirty || self.save_pending.is_some() {
             return;
         }
-        match session::save(&self.sessions) {
-            Ok(()) => self.dirty = false,
-            Err(error) => {
-                // `dirty` stays set, so the next terminal event tries again.
-                tracing::warn!(%error, "failed to save the session store");
+        let revision = self.session_revision;
+        if self
+            .cmd_tx
+            .send(Cmd::SaveSessions {
+                revision,
+                sessions: self.sessions.clone(),
+            })
+            .is_ok()
+        {
+            self.save_pending = Some(revision);
+        } else {
+            tracing::warn!("agent worker is gone; the session snapshot was not queued");
+        }
+    }
+
+    /// Queues the latest snapshot before asking the worker to stop.
+    pub fn shutdown(&mut self) {
+        if self.dirty {
+            let revision = self.session_revision;
+            if self
+                .cmd_tx
+                .send(Cmd::SaveSessions {
+                    revision,
+                    sessions: self.sessions.clone(),
+                })
+                .is_err()
+            {
+                tracing::warn!("agent worker is gone; the final session snapshot was not queued");
             }
+        }
+        if self.cmd_tx.send(Cmd::Shutdown).is_err() {
+            tracing::warn!("agent worker is gone; shutdown could not be requested");
         }
     }
 
@@ -435,6 +483,87 @@ impl App {
         // They belong to a job, not a session, so they fold into that job's
         // transcript instead.
         let event = match event {
+            Event::ApiKeySaved { request_id } => {
+                if self.pending_api_key_save == Some(request_id) {
+                    self.pending_api_key_save = None;
+                    self.settings_error = None;
+                    self.finish_save_settings();
+                }
+                return;
+            }
+            Event::ApiKeySaveFailed {
+                request_id,
+                message,
+            } => {
+                if self.pending_api_key_save == Some(request_id) {
+                    self.pending_api_key_save = None;
+                    self.settings_error = Some(format!("存储 API Key 失败：{message}"));
+                }
+                return;
+            }
+            Event::ConfigSaved { request_id } => {
+                if let Some(surface) = self.pending_config_saves.remove(&request_id) {
+                    if self.config_save_requests.get(&surface) == Some(&request_id) {
+                        match surface {
+                            ConfigSurface::Sidebar => self.sidebar_error = None,
+                            ConfigSurface::Settings => self.settings_error = None,
+                        }
+                    }
+                }
+                return;
+            }
+            Event::ConfigSaveFailed {
+                request_id,
+                message,
+            } => {
+                if let Some(surface) = self.pending_config_saves.remove(&request_id) {
+                    if self.config_save_requests.get(&surface) == Some(&request_id) {
+                        let error = format!("保存配置失败：{message}");
+                        match surface {
+                            ConfigSurface::Sidebar => self.sidebar_error = Some(error),
+                            ConfigSurface::Settings => self.settings_error = Some(error),
+                        }
+                    }
+                }
+                return;
+            }
+            Event::PluginsUpdated {
+                request_id,
+                catalogue,
+            } => {
+                if self.pending_plugin_request == Some(request_id) {
+                    self.catalogue = catalogue;
+                    self.pending_plugin_request = None;
+                    self.plugins_error = None;
+                }
+                return;
+            }
+            Event::PluginOperationFailed {
+                request_id,
+                message,
+            } => {
+                if self.pending_plugin_request == Some(request_id) {
+                    self.pending_plugin_request = None;
+                    self.plugins_error = Some(message);
+                }
+                return;
+            }
+            Event::SessionsSaved { revision } => {
+                if self.save_pending == Some(revision) {
+                    self.save_pending = None;
+                    if self.session_revision == revision {
+                        self.dirty = false;
+                    }
+                }
+                return;
+            }
+            Event::SessionSaveFailed { revision, message } => {
+                if self.save_pending == Some(revision) {
+                    self.save_pending = None;
+                }
+                tracing::warn!(%message, revision, "failed to save the session store");
+                return;
+            }
             Event::Jobs { project, jobs } => {
                 if self.jobs_project.as_ref() == Some(&project) {
                     self.jobs = jobs;
@@ -557,7 +686,7 @@ impl App {
                     // session's first request is already guarded.
                     session.context_measurement = measurement;
                 }
-                self.dirty = true;
+                self.mark_dirty();
             }
 
             // A compaction is announced before the summary request goes out and
@@ -571,7 +700,7 @@ impl App {
                         summary: summary.clone(),
                     });
                 }
-                self.dirty = true;
+                self.mark_dirty();
             }
 
             // A mid-run usage sample lands the moment its turn came back, so
@@ -591,13 +720,23 @@ impl App {
                         text: message.clone(),
                     });
                 }
-                self.dirty = true;
+                self.mark_dirty();
             }
 
             // Already folded in before the run guard above; unreachable here,
             // and listed only so this match stays exhaustive. A sub-agent's
             // events are the same story — they belong to a job, not a session.
-            Event::Jobs { .. } | Event::SubagentStarted { .. } | Event::Subagent { .. } => {}
+            Event::Jobs { .. }
+            | Event::SubagentStarted { .. }
+            | Event::Subagent { .. }
+            | Event::SessionsSaved { .. }
+            | Event::SessionSaveFailed { .. }
+            | Event::ApiKeySaved { .. }
+            | Event::ApiKeySaveFailed { .. }
+            | Event::ConfigSaved { .. }
+            | Event::ConfigSaveFailed { .. }
+            | Event::PluginsUpdated { .. }
+            | Event::PluginOperationFailed { .. } => {}
         }
 
         // A terminal event is also the last event its run can emit, so the run
@@ -610,6 +749,11 @@ impl App {
     /// The session with `id`, mutably.
     fn session_mut(&mut self, id: Uuid) -> Option<&mut Session> {
         self.sessions.iter_mut().find(|session| session.id == id)
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.session_revision = self.session_revision.wrapping_add(1);
     }
 
     /// Folds one event a sub-agent forwarded into that sub-agent's transcript.
@@ -705,7 +849,7 @@ impl App {
             return;
         };
         session.steps.push(Step::Notice { text });
-        self.dirty = true;
+        self.mark_dirty();
     }
 
     /// The run writing into `session`, if one is.
@@ -938,7 +1082,7 @@ impl App {
         self.prompt.clear();
         self.pending_images.clear();
         self.stick_to_bottom = true;
-        self.dirty = true;
+        self.mark_dirty();
 
         match self.cmd_tx.send(Cmd::Run {
             run_id,
@@ -975,7 +1119,7 @@ impl App {
         if self.selected == Some(id) {
             self.selected = None;
         }
-        self.dirty = true;
+        self.mark_dirty();
     }
 
     /// Makes `project` the active one and shows it.
@@ -1016,13 +1160,7 @@ impl App {
 
         self.config.projects.insert(0, project.clone());
         self.open_project(project);
-        self.sidebar_error = match self.save_config() {
-            Ok(()) => None,
-            Err(error) => {
-                tracing::warn!(%error, "failed to save the config after adding a project");
-                Some(format!("保存配置失败：{error}"))
-            }
-        };
+        self.queue_config_save(ConfigSurface::Sidebar);
     }
 
     /// Drops a project from the list, keeping its sessions.
@@ -1045,13 +1183,7 @@ impl App {
             self.selected = None;
             self.stick_to_bottom = true;
         }
-        self.sidebar_error = match self.save_config() {
-            Ok(()) => None,
-            Err(error) => {
-                tracing::warn!(%error, "failed to save the config after removing a project");
-                Some(format!("保存配置失败：{error}"))
-            }
-        };
+        self.queue_config_save(ConfigSurface::Sidebar);
     }
 
     /// Persists the settings and pushes them to the worker.
@@ -1059,6 +1191,28 @@ impl App {
     /// A failed push means the worker is gone, which is reported on the settings
     /// page rather than here.
     fn save_settings(&mut self) {
+        if !self.api_key.trim().is_empty() {
+            let request_id = self.next_config_request_id;
+            self.next_config_request_id = self.next_config_request_id.wrapping_add(1);
+            self.pending_api_key_save = Some(request_id);
+            if self
+                .cmd_tx
+                .send(Cmd::SaveApiKey {
+                    request_id,
+                    api_key: SecretValue::new(self.api_key.clone()),
+                })
+                .is_err()
+            {
+                self.pending_api_key_save = None;
+                self.settings_error = Some("agent 线程已退出，API Key 未保存".into());
+            }
+            return;
+        }
+
+        self.finish_save_settings();
+    }
+
+    fn finish_save_settings(&mut self) {
         // The tool settings are pushed to the worker too, so a new working
         // directory or a flipped guard takes effect on the next call rather than
         // needing a restart.
@@ -1092,26 +1246,30 @@ impl App {
             return;
         }
 
-        self.settings_error = match self.save_config() {
-            Ok(()) => None,
-            Err(error) => {
-                tracing::warn!(%error, "failed to save the settings");
-                Some(format!("保存设置失败：{error}"))
-            }
-        };
+        self.queue_config_save(ConfigSurface::Settings);
     }
 
-    /// Writes the config to the path the app was started with.
-    ///
-    /// [`config::save_to`] rather than [`config::save`] so the target is the
-    /// path already in hand, and so a test can aim a save at a temp file:
-    /// `save` re-derives its path from the environment, which a test cannot
-    /// change without mutating the process.
-    fn save_config(&self) -> crate::error::Result<()> {
-        let path = self.paths.config_path.as_deref().ok_or_else(|| {
-            crate::error::AgentError::internal("No config directory is available on this system")
-        })?;
-        config::save_to(path, &self.config)
+    fn queue_config_save(&mut self, surface: ConfigSurface) {
+        let request_id = self.next_config_request_id;
+        self.next_config_request_id = self.next_config_request_id.wrapping_add(1);
+        self.pending_config_saves.insert(request_id, surface);
+        self.config_save_requests.insert(surface, request_id);
+        if self
+            .cmd_tx
+            .send(Cmd::SaveConfig {
+                request_id,
+                config: Box::new(self.config.clone()),
+            })
+            .is_err()
+        {
+            self.pending_config_saves.remove(&request_id);
+            self.config_save_requests.remove(&surface);
+            let error = "agent 线程已退出，配置未保存".to_string();
+            match surface {
+                ConfigSurface::Sidebar => self.sidebar_error = Some(error),
+                ConfigSurface::Settings => self.settings_error = Some(error),
+            }
+        }
     }
 
     /// Re-runs discovery and hands the result to the worker.
@@ -1123,21 +1281,20 @@ impl App {
     /// every cached agent baked the old catalogue into its system prompt and
     /// tool registry.
     fn reload_plugins(&mut self) {
-        let projects: Vec<PathBuf> = self.config.projects.iter().map(PathBuf::from).collect();
-        let catalogue = Arc::new(plugins::discover(
-            &self.paths.home,
-            &projects,
-            &self.config.plugins,
-        ));
+        let request_id = self.next_config_request_id;
+        self.next_config_request_id = self.next_config_request_id.wrapping_add(1);
+        self.pending_plugin_request = Some(request_id);
         if self
             .cmd_tx
-            .send(Cmd::SetPlugins(catalogue.clone()))
+            .send(Cmd::ReloadPlugins {
+                request_id,
+                config: Box::new(self.config.clone()),
+            })
             .is_err()
         {
             self.plugins_error = Some("agent 线程已退出，插件改动未生效".into());
-            return;
+            self.pending_plugin_request = None;
         }
-        self.catalogue = catalogue;
     }
 
     /// Turns one plugin on or off, persists it, and reloads.
@@ -1148,16 +1305,6 @@ impl App {
     fn set_plugin_enabled(&mut self, id: &str, enabled: bool) {
         self.config.plugins.set_enabled(id, enabled);
         self.config.plugins.normalize();
-        self.plugins_error = match self.save_config() {
-            Ok(()) => None,
-            Err(error) => {
-                tracing::warn!(%error, plugin = id, "failed to save the plugin switch");
-                Some(format!("保存配置失败：{error}"))
-            }
-        };
-        if self.plugins_error.is_some() {
-            return;
-        }
         self.reload_plugins();
     }
 
@@ -1169,44 +1316,25 @@ impl App {
     /// touch; those are switched off and left in place, with the path reported
     /// so the user can remove it themselves.
     fn uninstall_plugin(&mut self, id: &str) {
-        let root = self
-            .catalogue
-            .global()
-            .iter()
-            .chain(self.catalogue.disabled())
-            .find(|plugin| plugin.id == id)
-            .map(|plugin| plugin.root.clone());
-
-        let Some(root) = root else {
-            self.plugins_error = Some(format!("找不到 {id} 的安装位置"));
-            return;
-        };
-
-        let cache = self.paths.home.join(".codex").join("plugins").join("cache");
-        let removed = root.starts_with(&cache);
-        if removed {
-            if let Err(error) = std::fs::remove_dir_all(&root) {
-                tracing::warn!(%error, plugin = id, "failed to delete the plugin's cached files");
-                self.plugins_error = Some(format!("删除 {id} 失败：{error}"));
-                return;
-            }
-        }
-
         // The switch goes off either way: a plugin whose files are still on
         // disk must not go on loading, and the row stays visible under 已停用.
         self.config.plugins.set_enabled(id, false);
         self.config.plugins.normalize();
-        self.plugins_error = match self.save_config() {
-            Ok(()) => None,
-            Err(error) => {
-                tracing::warn!(%error, plugin = id, "failed to save after uninstalling a plugin");
-                Some(format!("保存配置失败：{error}"))
-            }
-        };
-        if self.plugins_error.is_some() {
-            return;
+        let request_id = self.next_config_request_id;
+        self.next_config_request_id = self.next_config_request_id.wrapping_add(1);
+        self.pending_plugin_request = Some(request_id);
+        if self
+            .cmd_tx
+            .send(Cmd::UninstallPlugin {
+                request_id,
+                id: id.to_string(),
+                config: Box::new(self.config.clone()),
+            })
+            .is_err()
+        {
+            self.pending_plugin_request = None;
+            self.plugins_error = Some("agent 线程已退出，插件未卸载".into());
         }
-        self.reload_plugins();
     }
 
     /// Applies the deferred [`Actions`] a draw pass recorded, once its borrows
@@ -1444,7 +1572,17 @@ fn event_run_id(event: &Event) -> RunId {
         // Handled before this function is reached (see `App::apply`); listed so
         // the match stays exhaustive. Jobs and sub-agent messages are not
         // scoped to a run.
-        Event::Jobs { .. } | Event::SubagentStarted { .. } | Event::Subagent { .. } => 0,
+        Event::Jobs { .. }
+        | Event::SubagentStarted { .. }
+        | Event::Subagent { .. }
+        | Event::SessionsSaved { .. }
+        | Event::SessionSaveFailed { .. }
+        | Event::ApiKeySaved { .. }
+        | Event::ApiKeySaveFailed { .. }
+        | Event::ConfigSaved { .. }
+        | Event::ConfigSaveFailed { .. }
+        | Event::PluginsUpdated { .. }
+        | Event::PluginOperationFailed { .. } => 0,
     }
 }
 
@@ -1837,10 +1975,7 @@ mod tests {
 
     /// Paths pointing nowhere real, so a test never touches the user's state.
     fn test_paths() -> Paths {
-        Paths {
-            home: test_home(),
-            config_path: None,
-        }
+        Paths { config_path: None }
     }
 
     /// A catalogue with nothing in it.
@@ -2040,8 +2175,6 @@ mod tests {
 
     #[test]
     fn saving_settings_sends_the_retry_count_to_the_worker() {
-        let config_dir = tempfile::tempdir().expect("a temp directory is available");
-        let config_path = config_dir.path().join("config.toml");
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut config = crate::config::Config::default();
@@ -2054,17 +2187,31 @@ mod tests {
             "key".into(),
             Vec::new(),
             no_plugins(),
-            Paths {
-                home: test_home(),
-                config_path: Some(config_path.clone()),
-            },
+            test_paths(),
         );
 
         app.save_settings();
 
+        let key_request = match cmd_rx.try_recv() {
+            Ok(Cmd::SaveApiKey {
+                request_id,
+                api_key,
+            }) => {
+                assert_eq!(
+                    api_key.expose(),
+                    "key",
+                    "the credential is sent to the worker"
+                );
+                request_id
+            }
+            other => panic!("expected an API key save, got {other:?}"),
+        };
+        app.apply(Event::ApiKeySaved {
+            request_id: key_request,
+        });
         assert!(
             matches!(cmd_rx.try_recv(), Ok(Cmd::SetToolSettings(_))),
-            "tool settings are sent first"
+            "tool settings are sent after the credential is stored"
         );
         match cmd_rx.try_recv() {
             Ok(Cmd::SetLlmSettings(settings)) => {
@@ -2079,14 +2226,17 @@ mod tests {
             }
             other => panic!("expected model settings, got {other:?}"),
         }
-        assert_eq!(
-            saved_config(&config_path).llm.retry_count,
-            6,
-            "the same value survives a restart"
-        );
+        let (request_id, saved) = match cmd_rx.try_recv() {
+            Ok(Cmd::SaveConfig { request_id, config }) => (request_id, config),
+            other => panic!("expected a config save, got {other:?}"),
+        };
+        assert_eq!(saved.llm.retry_count, 6, "the chosen value is persisted");
+        assert!(saved.llm.retry_forever, "the retry mode is persisted");
+
+        app.apply(Event::ConfigSaved { request_id });
         assert!(
-            saved_config(&config_path).llm.retry_forever,
-            "the unlimited retry mode survives a restart"
+            app.settings_error.is_none(),
+            "the settings surface clears after the worker confirms the save"
         );
     }
 
@@ -2552,10 +2702,14 @@ mod tests {
         // whichever run happens to be newest.
         app.selected = Some(first_session);
         app.cancel_run();
-        assert!(
-            matches!(cmd_rx.try_recv(), Ok(Cmd::Cancel { run_id }) if run_id == first_run),
-            "Stop must name the open session's run"
-        );
+        let mut stopped_first = false;
+        while let Ok(command) = cmd_rx.try_recv() {
+            if matches!(command, Cmd::Cancel { run_id } if run_id == first_run) {
+                stopped_first = true;
+                break;
+            }
+        }
+        assert!(stopped_first, "Stop must name the open session's run");
     }
 
     #[test]
@@ -2703,6 +2857,46 @@ mod tests {
         (app, cmd_rx)
     }
 
+    #[test]
+    fn an_old_save_ack_does_not_clear_a_newer_session_change() {
+        let (mut app, mut cmd_rx) = app_at("/p", no_plugins());
+        app.sessions.push(Session::new("/p"));
+        app.mark_dirty();
+        app.flush();
+
+        let first_revision = match cmd_rx.try_recv().expect("a snapshot was queued") {
+            Cmd::SaveSessions { revision, .. } => revision,
+            other => panic!("expected a session snapshot, got {other:?}"),
+        };
+
+        app.mark_dirty();
+        app.apply(Event::SessionsSaved {
+            revision: first_revision,
+        });
+
+        assert!(app.dirty, "the newer change still needs persistence");
+        app.flush();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(Cmd::SaveSessions { revision, .. }) if revision > first_revision
+        ));
+    }
+
+    #[test]
+    fn shutdown_queues_the_latest_snapshot_before_stopping_the_worker() {
+        let (mut app, mut cmd_rx) = app_at("/p", no_plugins());
+        app.sessions.push(Session::new("/p"));
+        app.mark_dirty();
+
+        app.shutdown();
+
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(Cmd::SaveSessions { revision: 1, .. })
+        ));
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::Shutdown)));
+    }
+
     /// A home holding one global plugin, `thing@test`, plus a config that
     /// enables it.
     ///
@@ -2744,7 +2938,6 @@ mod tests {
     fn plugin_app(
         home: &Path,
         config: crate::config::Config,
-        config_path: PathBuf,
     ) -> (App, mpsc::UnboundedReceiver<Cmd>) {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2756,54 +2949,60 @@ mod tests {
             "key".into(),
             Vec::new(),
             catalogue,
-            Paths {
-                home: home.to_path_buf(),
-                config_path: Some(config_path),
-            },
+            test_paths(),
         );
         (app, cmd_rx)
     }
 
-    /// The config a plugin test just wrote, parsed back.
-    fn saved_config(path: &Path) -> crate::config::Config {
-        let text = std::fs::read_to_string(path).expect("the config was written");
-        toml::from_str(&text).expect("the config round-trips")
-    }
-
     #[test]
-    fn disabling_a_plugin_switches_it_off_everywhere_and_persists_it() {
+    fn disabling_a_plugin_queues_the_config_and_refreshes_from_worker_results() {
         let (home, config) = plugin_fixture();
-        let config_path = home.path().join("config.toml");
-        let (mut app, mut cmd_rx) = plugin_app(home.path(), config, config_path.clone());
+        let (mut app, mut cmd_rx) = plugin_app(home.path(), config);
         assert_eq!(app.catalogue.global().len(), 1, "it starts enabled");
 
         app.set_plugin_enabled("thing@test", false);
 
-        // Off for anything that would run it...
+        let (request_id, saved) = match cmd_rx.try_recv() {
+            Ok(Cmd::ReloadPlugins { request_id, config }) => (request_id, config),
+            other => panic!("expected a plugin refresh, got {other:?}"),
+        };
+        assert!(
+            !saved.plugins.plugins["thing@test"].enabled,
+            "the worker receives the disabled trust setting"
+        );
+        let projects: Vec<PathBuf> = saved.projects.iter().map(PathBuf::from).collect();
+        let catalogue = Arc::new(plugins::discover(home.path(), &projects, &saved.plugins));
+        app.apply(Event::PluginsUpdated {
+            request_id,
+            catalogue,
+        });
         assert!(app.catalogue.global().is_empty(), "off means off");
         assert_eq!(app.catalogue.disabled()[0].id, "thing@test");
-        // ...on disk as a row, so it can be turned back on rather than being
-        // indistinguishable from never having been installed...
-        assert!(!saved_config(&config_path).plugins.plugins["thing@test"].enabled);
-        // ...and the worker was told, so the next run stops loading it.
-        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::SetPlugins(_))));
     }
 
     #[test]
     fn enabling_a_plugin_turns_it_back_on() {
         let (home, mut config) = plugin_fixture();
         config.plugins.set_enabled("thing@test", false);
-        let config_path = home.path().join("config.toml");
-        let (mut app, mut cmd_rx) = plugin_app(home.path(), config, config_path.clone());
+        let (mut app, mut cmd_rx) = plugin_app(home.path(), config);
         assert!(app.catalogue.global().is_empty(), "it starts disabled");
         assert_eq!(app.catalogue.disabled().len(), 1);
 
         app.set_plugin_enabled("thing@test", true);
 
+        let (request_id, saved) = match cmd_rx.try_recv() {
+            Ok(Cmd::ReloadPlugins { request_id, config }) => (request_id, config),
+            other => panic!("expected a plugin refresh, got {other:?}"),
+        };
+        assert!(saved.plugins.plugins["thing@test"].enabled);
+        let projects: Vec<PathBuf> = saved.projects.iter().map(PathBuf::from).collect();
+        let catalogue = Arc::new(plugins::discover(home.path(), &projects, &saved.plugins));
+        app.apply(Event::PluginsUpdated {
+            request_id,
+            catalogue,
+        });
         assert_eq!(app.catalogue.global().len(), 1);
         assert!(app.catalogue.disabled().is_empty());
-        assert!(saved_config(&config_path).plugins.plugins["thing@test"].enabled);
-        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::SetPlugins(_))));
     }
 
     #[test]
@@ -2820,15 +3019,22 @@ mod tests {
 
         let mut config = crate::config::Config::default();
         config.plugins.set_enabled("thing@test", true);
-        let config_path = home.path().join("config.toml");
-        let (mut app, _cmd_rx) = plugin_app(home.path(), config, config_path.clone());
+        let (mut app, mut cmd_rx) = plugin_app(home.path(), config);
         assert_eq!(app.catalogue.global().len(), 1);
 
         app.uninstall_plugin("thing@test");
 
-        assert!(!cached.exists(), "the cached copy is gone");
-        assert!(!saved_config(&config_path).plugins.plugins["thing@test"].enabled);
-        assert!(app.catalogue.global().is_empty());
+        match cmd_rx.try_recv() {
+            Ok(Cmd::UninstallPlugin { id, config, .. }) => {
+                assert_eq!(id, "thing@test");
+                assert!(!config.plugins.plugins["thing@test"].enabled);
+            }
+            other => panic!("expected an uninstall request, got {other:?}"),
+        }
+        assert!(
+            cached.is_dir(),
+            "the GUI leaves filesystem mutation to the worker adapter"
+        );
     }
 
     #[test]
@@ -2836,35 +3042,41 @@ mod tests {
         // A marketplace's local source is somebody's working tree — the copy a
         // developer is editing. It is switched off, never deleted.
         let (home, config) = plugin_fixture();
-        let config_path = home.path().join("config.toml");
-        let (mut app, _cmd_rx) = plugin_app(home.path(), config, config_path.clone());
+        let (mut app, mut cmd_rx) = plugin_app(home.path(), config);
         let working_copy = home.path().join("plugins").join("thing");
         assert!(working_copy.is_dir());
 
         app.uninstall_plugin("thing@test");
 
         assert!(working_copy.is_dir(), "a working copy must not be deleted");
-        assert!(!saved_config(&config_path).plugins.plugins["thing@test"].enabled);
-        assert_eq!(app.catalogue.global().len(), 0, "but it stops loading");
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(Cmd::UninstallPlugin { id, .. }) if id == "thing@test"
+        ));
     }
 
     #[test]
-    fn a_save_that_fails_is_reported_and_leaves_the_plugin_alone() {
-        // The config path sits under a *file*, so creating its directory fails.
-        // The window must not claim a switch that will not survive a restart.
+    fn a_plugin_operation_failure_keeps_the_current_catalogue() {
         let (home, config) = plugin_fixture();
-        let blocked = home.path().join("blocked");
-        std::fs::write(&blocked, "not a directory").unwrap();
-        let (mut app, _cmd_rx) = plugin_app(home.path(), config, blocked.join("config.toml"));
+        let (mut app, mut cmd_rx) = plugin_app(home.path(), config);
+        let original = app.catalogue.clone();
 
         app.set_plugin_enabled("thing@test", false);
+        let request_id = match cmd_rx.try_recv() {
+            Ok(Cmd::ReloadPlugins { request_id, .. }) => request_id,
+            other => panic!("expected a plugin refresh, got {other:?}"),
+        };
+        app.apply(Event::PluginOperationFailed {
+            request_id,
+            message: "保存配置失败".into(),
+        });
 
-        assert_eq!(app.catalogue.global().len(), 1, "the plugin still loads");
-        assert!(app.catalogue.disabled().is_empty());
+        assert_eq!(app.catalogue.global().len(), 1, "the old catalogue remains");
+        assert!(Arc::ptr_eq(&app.catalogue, &original));
         assert!(
             app.plugins_error
                 .as_deref()
-                .is_some_and(|error| error.starts_with("保存配置失败")),
+                .is_some_and(|error| error.contains("保存配置失败")),
             "the failure is reported in the plugins window, got: {:?}",
             app.plugins_error
         );

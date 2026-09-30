@@ -8,18 +8,17 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::attachments::ImageRef;
-use crate::config::InputModality;
+use crate::config::{Config, InputModality};
 use crate::context::ContextSettings;
+pub use crate::harness::{AuditOutcome, HunkLines, RunId, RunState};
 use crate::llm::{Message, ThinkingLevel, Usage, UserTurn};
 use crate::plugins::PluginCatalogue;
+use crate::session::Session;
 use crate::tools::jobs::{JobSnapshot, JobStatus};
-use crate::tools::{HunkLines, ToolSettings};
-
-pub type RunId = u64;
+use crate::tools::ToolSettings;
 
 /// Which model to talk to, and with what credentials.
 ///
@@ -44,6 +43,27 @@ pub struct LlmSettings {
     /// `image` decides whether `read_image` is registered and therefore what
     /// the system prompt advertises.
     pub input: Vec<InputModality>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretValue(String);
+
+impl SecretValue {
+    /// Wraps a secret so protocol debug output cannot reveal its contents.
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    /// Borrows the secret for the worker-side adapter.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"<redacted>\"")
+    }
 }
 
 impl LlmSettings {
@@ -106,15 +126,34 @@ pub enum Cmd {
     /// Swaps the model settings in. Global on purpose: pushed once, and every
     /// session and every run uses whatever is current.
     SetLlmSettings(Box<LlmSettings>),
-    /// Swaps the plugin catalogue in, after the user enabled, disabled or
-    /// uninstalled a plugin in the plugins window.
-    ///
-    /// The GUI re-runs discovery — it owns the config that decides what loads —
-    /// and hands the result over, so the worker never reads the config itself.
-    /// Shared rather than cloned because a catalogue carries every plugin's
-    /// skills, commands and hooks, and the GUI keeps its own copy for the
-    /// window it just drew.
-    SetPlugins(Arc<PluginCatalogue>),
+    /// Persists a session snapshot on the worker thread.
+    SaveSessions {
+        revision: u64,
+        sessions: Vec<Session>,
+    },
+    /// Persists a config snapshot without blocking the GUI thread.
+    SaveConfig {
+        request_id: u64,
+        config: Box<Config>,
+    },
+    /// Persists a credential without blocking the GUI thread.
+    SaveApiKey {
+        request_id: u64,
+        api_key: SecretValue,
+    },
+    /// Persists config and refreshes the plugin catalogue in the worker.
+    ReloadPlugins {
+        request_id: u64,
+        config: Box<Config>,
+    },
+    /// Uninstalls a plugin's cached copy, persists config, then refreshes plugins.
+    UninstallPlugin {
+        request_id: u64,
+        id: String,
+        config: Box<Config>,
+    },
+    /// Stops the worker after commands already queued have been handled.
+    Shutdown,
     /// Asks for the background jobs of one project's agent, so the composer can
     /// show a live task list. Answered with [`Event::Jobs`], echoing the same
     /// `project` so a reply that arrives after the user switched projects can
@@ -239,6 +278,43 @@ pub enum Event {
         project: PathBuf,
         jobs: Vec<JobView>,
     },
+    /// Confirms that a session snapshot reached the store.
+    SessionsSaved {
+        revision: u64,
+    },
+    /// Reports a session-store failure while leaving the app's snapshot dirty.
+    SessionSaveFailed {
+        revision: u64,
+        message: String,
+    },
+    /// Confirms that a config snapshot reached disk.
+    ConfigSaved {
+        request_id: u64,
+    },
+    /// Reports a config persistence failure.
+    ConfigSaveFailed {
+        request_id: u64,
+        message: String,
+    },
+    /// Confirms that an API credential reached the operating-system store.
+    ApiKeySaved {
+        request_id: u64,
+    },
+    /// Reports an operating-system credential-store failure.
+    ApiKeySaveFailed {
+        request_id: u64,
+        message: String,
+    },
+    /// Replaces the GUI's plugin catalogue after a worker refresh.
+    PluginsUpdated {
+        request_id: u64,
+        catalogue: Arc<PluginCatalogue>,
+    },
+    /// Reports a plugin lifecycle operation failure.
+    PluginOperationFailed {
+        request_id: u64,
+        message: String,
+    },
     /// A delegated sub-agent has started: the role it runs and the brief it was
     /// handed.
     ///
@@ -264,46 +340,6 @@ pub enum Event {
         job_id: String,
         event: Box<Event>,
     },
-}
-
-/// How one tool call ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AuditOutcome {
-    /// The call ran. Whether it *succeeded* is in the tool's own output.
-    Executed,
-    /// The host refused to run it — currently only the destructive denylist.
-    Denied,
-    Failed,
-}
-
-impl AuditOutcome {
-    /// The Chinese word this outcome shows in the audit row.
-    /// The Chinese word this state shows in a task row.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Executed => "已执行",
-            Self::Denied => "已拒绝",
-            Self::Failed => "失败",
-        }
-    }
-
-    pub fn icon(self) -> &'static str {
-        match self {
-            Self::Executed => crate::icons::CHECK_CIRCLE,
-            Self::Denied => crate::icons::WARNING_CIRCLE,
-            Self::Failed => crate::icons::X_CIRCLE,
-        }
-    }
-}
-
-/// A coarse progress marker for a session, used by the sidebar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RunState {
-    Running,
-    Finished,
-    Failed,
 }
 
 /// Where a background job is, as the window's task list shows it.

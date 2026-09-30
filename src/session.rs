@@ -25,12 +25,12 @@ use uuid::Uuid;
 use crate::attachments::ImageRef;
 use crate::context::summary_turn;
 use crate::error::{AgentError, Result};
-use crate::ipc::{AuditOutcome, RunState};
+use crate::harness::SessionStore;
+use crate::harness::{AuditOutcome, HunkLines, RunState};
 use crate::llm::{FunctionCall, Message, ThinkingLevel, ToolCall, Usage, UserTurn};
-use crate::tools::HunkLines;
 
 /// Bumped when the shape changes in a way worth mentioning in a log line. A
-/// mismatch is tolerated rather than fatal — see [`load`].
+/// mismatch is tolerated rather than fatal — see [`JsonSessionStore::load`].
 const VERSION: u32 = 1;
 
 /// How many sessions are kept. Older ones are dropped from the front.
@@ -591,18 +591,51 @@ pub fn store_path() -> Option<PathBuf> {
     crate::config::config_dir().map(|dir| dir.join("sessions.json"))
 }
 
+pub struct JsonSessionStore {
+    path: Option<PathBuf>,
+}
+
+impl JsonSessionStore {
+    /// Creates a JSON store targeting `path`, or an unavailable store when it is `None`.
+    pub fn new(path: Option<PathBuf>) -> Self {
+        Self { path }
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionStore for JsonSessionStore {
+    async fn load(&self) -> Result<Vec<Session>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || load_at(path.as_deref()))
+            .await
+            .map_err(|error| AgentError::internal(format!("Session store worker failed: {error}")))
+    }
+
+    async fn save(&self, sessions: &[Session]) -> Result<()> {
+        let path = self.path.clone().ok_or_else(|| {
+            AgentError::internal("No config directory is available on this system")
+        })?;
+        let sessions = sessions.to_vec();
+        tokio::task::spawn_blocking(move || save_at(&path, &sessions))
+            .await
+            .map_err(|error| {
+                AgentError::internal(format!("Session store worker failed: {error}"))
+            })?
+    }
+}
+
 /// Reads the store, falling back to an empty list.
 ///
 /// A malformed or missing file is a warning, never a startup failure: refusing
 /// to open the window because the history is unreadable would be a trap, and the
 /// history is the part of this app that is safe to lose.
 ///
-/// The sessions come back oldest-first, which is the order `save` expects.
-pub fn load() -> Vec<Session> {
-    let Some(path) = store_path() else {
+/// The sessions come back oldest-first, which is the order the store writes.
+fn load_at(path: Option<&Path>) -> Vec<Session> {
+    let Some(path) = path else {
         return Vec::new();
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
 
@@ -648,10 +681,7 @@ fn settle_interrupted(mut sessions: Vec<Session>) -> Vec<Session> {
 }
 
 /// Writes the store, dropping the oldest sessions until it fits the budget.
-pub fn save(sessions: &[Session]) -> Result<()> {
-    let path = store_path()
-        .ok_or_else(|| AgentError::internal("No config directory is available on this system"))?;
-
+fn save_at(path: &Path, sessions: &[Session]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| AgentError::from_io("Failed to create the config directory", error))?;
@@ -665,7 +695,7 @@ pub fn save(sessions: &[Session]) -> Result<()> {
     std::fs::write(&temp, text)
         .map_err(|error| AgentError::from_io("Failed to write the session store", error))?;
 
-    std::fs::rename(&temp, &path).map_err(|error| {
+    std::fs::rename(&temp, path).map_err(|error| {
         let _ = std::fs::remove_file(&temp);
         AgentError::from_io("Failed to replace the session store", error)
     })
@@ -773,6 +803,56 @@ mod tests {
             thinking: None,
             steps,
         }
+    }
+
+    #[tokio::test]
+    async fn json_session_store_round_trips_in_a_temporary_directory() {
+        let dir = tempfile::tempdir().expect("a temp directory is available");
+        let path = dir.path().join("sessions.json");
+        let store = JsonSessionStore::new(Some(path.clone()));
+        let mut session = session_with(vec![Step::User {
+            text: "persist this".into(),
+            images: Vec::new(),
+        }]);
+        session.state = RunState::Running;
+
+        store
+            .save(&[session.clone()])
+            .await
+            .expect("the snapshot is written");
+        let loaded = store.load().await.expect("the snapshot is read");
+
+        assert_eq!(loaded.len(), 1, "one saved session is restored");
+        assert_eq!(loaded[0].id, session.id, "the durable id is preserved");
+        assert_eq!(loaded[0].title(), "persist this");
+        assert_eq!(
+            loaded[0].state,
+            RunState::Failed,
+            "a run cannot still be active after a restart"
+        );
+        assert!(
+            matches!(loaded[0].steps.last(), Some(Step::Notice { text }) if text.contains("中断")),
+            "the interrupted run is explained in the transcript"
+        );
+        assert!(path.is_file(), "the adapter writes to its injected path");
+    }
+
+    #[tokio::test]
+    async fn json_session_store_without_a_path_refuses_saves() {
+        let store = JsonSessionStore::new(None);
+
+        assert!(
+            store.save(&[]).await.is_err(),
+            "an unavailable store cannot claim that a snapshot was saved"
+        );
+        assert!(
+            store
+                .load()
+                .await
+                .expect("an unavailable store reads empty")
+                .is_empty(),
+            "loading without a configured path remains non-fatal"
+        );
     }
 
     #[test]

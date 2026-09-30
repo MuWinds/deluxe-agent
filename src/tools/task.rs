@@ -32,63 +32,45 @@
 //! their run id is the sub-agent's own and matches no run the window started,
 //! so [`crate::app`] folds them into the sub-agent's transcript instead.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    optional_bool, required_str, ObjectSchema, Tool, ToolDescriptor, ToolOutput, ToolRegistry,
-    ToolSettings,
+    optional_bool, required_str, ObjectSchema, Tool, ToolDescriptor, ToolOutput, ToolSettings,
 };
-use crate::agent::{Agent, EventSink, RunRequest};
-use crate::context::ContextSettings;
 use crate::error::{AgentError, Result};
-use crate::ipc::Event;
-use crate::llm::{LlmClient, UserTurn};
-use crate::plugins::AgentRole;
+use crate::harness::{
+    AgentEvent, AgentEventSink, AgentRole, JobRuntime, SubagentContext, SubagentRunner,
+};
 
 pub struct Task {
-    /// The model the sub-agent runs on. A clone of the parent's client, which
-    /// shares the underlying connection pool.
-    llm: LlmClient,
     /// The roles resolved for this project, sorted by name.
     roles: Vec<AgentRole>,
-    /// The tools a sub-agent may use: the parent's registry, minus `task`.
-    registry: Arc<ToolRegistry>,
-    /// Shared with the parent, so a settings change reaches a sub-agent too.
-    settings: Arc<RwLock<ToolSettings>>,
-    /// The project the sub-agent works in, the same as its parent's.
-    working_directory: PathBuf,
-    context_settings: ContextSettings,
+    runner: Arc<dyn SubagentRunner>,
+    jobs: Arc<dyn JobRuntime>,
+    context: SubagentContext,
     /// Where a sub-agent's events go so the window can show them. The same sink
     /// the parent's own run uses, so a delegated agent is observable live
     /// rather than only through its final answer.
-    forwarder: Arc<dyn EventSink>,
+    forwarder: Arc<dyn AgentEventSink>,
 }
 
 impl Task {
-    /// Wires a `task` tool to the model client, the roles it may delegate to,
-    /// the sub-agent registry it hands them, and the sink their events are
-    /// forwarded through.
+    /// Wires a `task` tool to a role runner and the shared job runtime.
     pub fn new(
-        llm: LlmClient,
         roles: Vec<AgentRole>,
-        registry: Arc<ToolRegistry>,
-        settings: Arc<RwLock<ToolSettings>>,
-        working_directory: PathBuf,
-        context_settings: ContextSettings,
-        forwarder: Arc<dyn EventSink>,
+        runner: Arc<dyn SubagentRunner>,
+        jobs: Arc<dyn JobRuntime>,
+        context: SubagentContext,
+        forwarder: Arc<dyn AgentEventSink>,
     ) -> Self {
         Self {
-            llm,
             roles,
-            registry,
-            settings,
-            working_directory,
-            context_settings,
+            runner,
+            jobs,
+            context,
             forwarder,
         }
     }
@@ -176,28 +158,25 @@ impl Tool for Task {
         // forwarded event with it — the window routes on that id.
         if optional_bool(&arguments, "runInBackground", false) {
             let label = format!("{name}: {}", first_line(&prompt));
-            let llm = self.llm.clone();
-            let registry = self.registry.clone();
-            let settings = self.settings.clone();
-            let working_directory = self.working_directory.clone();
-            let context_settings = self.context_settings;
+            let runner = self.runner.clone();
+            let context = self.context.clone();
             let forwarder = self.forwarder.clone();
+            let role_for_job = role.clone();
 
-            let job_id = self
-                .registry
-                .jobs()
-                .start_result("subagent", label, move |job_id| {
-                    run_delegation(
-                        llm,
-                        registry,
-                        settings,
-                        working_directory,
-                        context_settings,
-                        role,
+            let job_id = self.jobs.start_result(
+                "subagent",
+                label,
+                Box::new(move |job_id, cancel| {
+                    Box::pin(run_delegation(
+                        runner,
+                        context,
+                        role_for_job,
                         prompt,
-                        SubagentSink::live(job_id, forwarder),
-                    )
-                });
+                        Arc::new(SubagentSink::live(job_id, forwarder)),
+                        cancel,
+                    ))
+                }),
+            );
             return Ok(ToolOutput::text(format!(
                 "started background job {job_id}\nThe `{name}` agent is running in the \
                  background. Read its answer with job_output(jobId=\"{job_id}\")."
@@ -205,14 +184,12 @@ impl Tool for Task {
         }
 
         let answer = run_delegation(
-            self.llm.clone(),
-            self.registry.clone(),
-            self.settings.clone(),
-            self.working_directory.clone(),
-            self.context_settings,
+            self.runner.clone(),
+            self.context.clone(),
             role,
             prompt,
-            SubagentSink::silent(),
+            Arc::new(SubagentSink::silent()),
+            CancellationToken::new(),
         )
         .await;
 
@@ -230,56 +207,30 @@ impl Tool for Task {
 /// A shared helper so a foreground call and a background job run the sub-agent
 /// the same way: the background path just hands this future to the job
 /// registry instead of awaiting it inline.
-#[allow(clippy::too_many_arguments)]
 async fn run_delegation(
-    llm: LlmClient,
-    registry: Arc<ToolRegistry>,
-    settings: Arc<RwLock<ToolSettings>>,
-    working_directory: PathBuf,
-    context_settings: ContextSettings,
+    runner: Arc<dyn SubagentRunner>,
+    context: SubagentContext,
     role: AgentRole,
     prompt: String,
-    sink: SubagentSink,
+    sink: Arc<SubagentSink>,
+    cancel: CancellationToken,
 ) -> Result<String> {
     // Announced before the run starts so the window has the whole brief — the
     // job label carries only its first line — and so it arrives ahead of the
     // work it describes. Same task, so the order holds.
     sink.announce(&role.name, &prompt);
 
-    let agent = Agent::for_role(
-        llm,
-        registry,
-        settings,
-        working_directory,
-        context_settings,
-        &role,
-    );
-
-    // Run id `0` is never routed anywhere: the sub-agent's events go to the
-    // sink below, which forwards them tagged with the job rather than with a
-    // run, so nothing keys off this value.
-    let outcome = agent
-        .run(
-            0,
-            UserTurn::from(prompt),
-            RunRequest {
-                history: &[],
-                thinking: None,
-                carried: None,
-            },
-            CancellationToken::new(),
-            &sink,
-        )
-        .await;
-
-    match outcome {
+    match runner
+        .run_role(&role, prompt, context, sink.clone(), cancel)
+        .await
+    {
         // A sub-agent that ran but produced nothing is a failed delegation
         // rather than an empty success: an empty answer tells the model nothing
         // about what went wrong.
-        Ok(_) if sink.answer().trim().is_empty() => {
+        Ok(answer) if answer.trim().is_empty() => {
             Err(AgentError::internal("the agent finished without an answer"))
         }
-        Ok(_) => Ok(sink.answer()),
+        Ok(answer) => Ok(answer),
         Err(error) => Err(error),
     }
 }
@@ -306,16 +257,16 @@ fn first_line(prompt: &str) -> String {
 struct SubagentSink {
     /// The job this delegation belongs to and the sink its events go to, or
     /// `None` for a foreground call, which nothing can watch.
-    live: Option<(String, Arc<dyn EventSink>)>,
-    answer: Mutex<String>,
+    live: Option<(String, Arc<dyn AgentEventSink>)>,
+    answer: Arc<Mutex<String>>,
 }
 
 impl SubagentSink {
     /// A sink whose events reach the window, under the job that owns them.
-    fn live(job_id: String, forwarder: Arc<dyn EventSink>) -> Self {
+    fn live(job_id: String, forwarder: Arc<dyn AgentEventSink>) -> Self {
         Self {
             live: Some((job_id, forwarder)),
-            answer: Mutex::new(String::new()),
+            answer: Arc::new(Mutex::new(String::new())),
         }
     }
 
@@ -324,14 +275,14 @@ impl SubagentSink {
     fn silent() -> Self {
         Self {
             live: None,
-            answer: Mutex::new(String::new()),
+            answer: Arc::new(Mutex::new(String::new())),
         }
     }
 
     /// Tells the window which role is running and what it was asked to do.
     fn announce(&self, agent: &str, prompt: &str) {
         if let Some((job_id, forwarder)) = &self.live {
-            forwarder.emit(Event::SubagentStarted {
+            forwarder.emit(AgentEvent::SubagentStarted {
                 job_id: job_id.clone(),
                 agent: agent.to_string(),
                 prompt: prompt.to_string(),
@@ -345,6 +296,7 @@ impl SubagentSink {
     /// assistant turn per round and only the turn that came back without a tool
     /// call is its answer. Empty turns are ignored, so a stray empty one cannot
     /// erase a real answer.
+    #[cfg(test)]
     fn answer(&self) -> String {
         self.answer
             .lock()
@@ -353,10 +305,10 @@ impl SubagentSink {
     }
 }
 
-impl EventSink for SubagentSink {
-    fn emit(&self, event: Event) {
+impl AgentEventSink for SubagentSink {
+    fn emit(&self, event: AgentEvent) {
         // Read before forwarding, which consumes the event.
-        if let Event::AssistantDone { content, .. } = &event {
+        if let AgentEvent::AssistantDone { content, .. } = &event {
             if !content.trim().is_empty() {
                 if let Ok(mut answer) = self.answer.lock() {
                     *answer = content.clone();
@@ -365,7 +317,7 @@ impl EventSink for SubagentSink {
         }
 
         if let Some((job_id, forwarder)) = &self.live {
-            forwarder.emit(Event::Subagent {
+            forwarder.emit(AgentEvent::Subagent {
                 job_id: job_id.clone(),
                 event: Box::new(event),
             });
@@ -376,6 +328,11 @@ impl EventSink for SubagentSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ContextSettings;
+    use crate::harness::NativeJobRuntime;
+    use crate::ipc::Event;
+    use crate::tools::ToolRegistry;
+    use std::path::PathBuf;
 
     /// Records everything a sub-agent forwards, standing in for the window.
     #[derive(Default)]
@@ -387,9 +344,29 @@ mod tests {
         }
     }
 
-    impl EventSink for Forwarded {
-        fn emit(&self, event: Event) {
-            self.0.lock().unwrap().push(event);
+    impl AgentEventSink for Forwarded {
+        fn emit(&self, event: AgentEvent) {
+            self.0.lock().unwrap().push(event.into());
+        }
+    }
+
+    struct FakeRunner;
+
+    #[async_trait::async_trait]
+    impl SubagentRunner for FakeRunner {
+        async fn run_role(
+            &self,
+            _role: &AgentRole,
+            _prompt: String,
+            _context: SubagentContext,
+            sink: Arc<dyn AgentEventSink>,
+            _cancel: CancellationToken,
+        ) -> Result<String> {
+            sink.emit(AgentEvent::AssistantDone {
+                run_id: 1,
+                content: "the answer".into(),
+            });
+            Ok("the answer".into())
         }
     }
 
@@ -404,13 +381,16 @@ mod tests {
     }
 
     fn task_with(roles: Vec<AgentRole>) -> Task {
+        let registry = Arc::new(ToolRegistry::with_builtins());
+        let jobs: Arc<dyn JobRuntime> = Arc::new(NativeJobRuntime::new(registry.jobs().clone()));
         Task::new(
-            LlmClient::new("http://localhost:1", "test-model", "key", None, Some(0)).unwrap(),
             roles,
-            Arc::new(ToolRegistry::with_builtins()),
-            Arc::new(RwLock::new(ToolSettings::default())),
-            PathBuf::from("/work"),
-            ContextSettings::default(),
+            Arc::new(FakeRunner),
+            jobs,
+            SubagentContext {
+                project: PathBuf::from("/work"),
+                context_settings: ContextSettings::default(),
+            },
             Arc::new(Forwarded::default()),
         )
     }
@@ -480,20 +460,20 @@ mod tests {
     fn the_sink_keeps_the_last_non_empty_answer() {
         // A sub-agent emits a turn per tool round; only the final one is its
         // answer, and an empty turn must not overwrite a real one.
-        let sink = SubagentSink::silent();
-        sink.emit(Event::AssistantDone {
+        let sink = Arc::new(SubagentSink::silent());
+        sink.emit(AgentEvent::AssistantDone {
             run_id: 0,
             content: "thinking out loud".into(),
         });
-        sink.emit(Event::AssistantDone {
+        sink.emit(AgentEvent::AssistantDone {
             run_id: 0,
             content: "   ".into(),
         });
-        sink.emit(Event::AssistantDone {
+        sink.emit(AgentEvent::AssistantDone {
             run_id: 0,
             content: "the answer".into(),
         });
-        sink.emit(Event::AssistantDelta {
+        sink.emit(AgentEvent::AssistantDelta {
             run_id: 0,
             text: "streamed but unfinished".into(),
         });
@@ -506,10 +486,10 @@ mod tests {
         // What the window lives on: the brief first, then the sub-agent's own
         // events, every one of them tagged with the job the row names.
         let forwarder = Arc::new(Forwarded::default());
-        let sink = SubagentSink::live("subagent-1".into(), forwarder.clone());
+        let sink = Arc::new(SubagentSink::live("subagent-1".into(), forwarder.clone()));
 
         sink.announce("figma-implementation-agent", "do the thing");
-        sink.emit(Event::AssistantDone {
+        sink.emit(AgentEvent::AssistantDone {
             run_id: 0,
             content: "the answer".into(),
         });
@@ -548,9 +528,9 @@ mod tests {
     fn a_silent_sink_keeps_the_answer_without_forwarding() {
         // A foreground delegation has no job and no row, so nothing is watching
         // it — but its answer is still the tool result.
-        let sink = SubagentSink::silent();
+        let sink = Arc::new(SubagentSink::silent());
         sink.announce("figma-implementation-agent", "do the thing");
-        sink.emit(Event::AssistantDone {
+        sink.emit(AgentEvent::AssistantDone {
             run_id: 0,
             content: "the answer".into(),
         });

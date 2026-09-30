@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use crate::attachments::{self, ImageRef};
 use crate::code_view;
-use crate::config::{self, InputModality};
+use crate::config::InputModality;
 use crate::icons;
 use crate::image_ops;
 use crate::ipc::{AuditOutcome, JobState, JobView, RunState};
@@ -1283,15 +1283,6 @@ impl App {
             });
 
         if save {
-            // 点「保存」就顺带存凭据库，这样 key 不会只活在内存里：
-            // 重启后凭据库里的 key 会自动被读回来。失败不影响其余设置。
-            if !self.api_key.trim().is_empty() {
-                if let Err(error) = config::store_api_key(&self.api_key) {
-                    tracing::warn!(%error, "failed to store the API key");
-                    self.settings_error = Some(format!("存储 API Key 失败：{error}"));
-                    return;
-                }
-            }
             self.save_settings();
         }
 
@@ -1342,7 +1333,7 @@ impl App {
                         }
                     });
                 };
-                path_row("配置文件", config::config_path());
+                path_row("配置文件", self.paths.config_path.clone());
                 path_row("会话记录", session::store_path());
 
                 ui.add_space(6.0);
@@ -2311,7 +2302,7 @@ fn header_job(
 
     let glyph = match result {
         None => icons::SPINNER_GAP,
-        Some(result) => result.outcome.icon(),
+        Some(result) => outcome_icon(result.outcome),
     };
     append_run(&mut job, &format!("{glyph}  "), &font, accent);
     append_run(&mut job, code_view::tool_label(name), &font, p.text_muted);
@@ -2439,6 +2430,14 @@ fn outcome_colour(outcome: AuditOutcome) -> Color32 {
         AuditOutcome::Executed => OK_GREEN,
         AuditOutcome::Denied => WARN_AMBER,
         AuditOutcome::Failed => BAD_RED,
+    }
+}
+
+fn outcome_icon(outcome: AuditOutcome) -> &'static str {
+    match outcome {
+        AuditOutcome::Executed => crate::icons::CHECK_CIRCLE,
+        AuditOutcome::Denied => crate::icons::WARNING_CIRCLE,
+        AuditOutcome::Failed => crate::icons::X_CIRCLE,
     }
 }
 

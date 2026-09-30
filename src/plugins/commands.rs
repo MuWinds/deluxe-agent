@@ -7,15 +7,15 @@
 //!
 //! # Three things the real files forced
 //!
-//! * **Two shapes, both in use.** `figma`'s commands have no frontmatter and are
+//! * Two shapes, both in use. `figma`'s commands have no frontmatter and are
 //!   named by their filename; `boss-skill`'s carry `name:` (sometimes already
 //!   namespaced, as `boss:plan`) and `vercel`'s carry only a `description`.
 //!   `cloudflare`'s carry `argument-hint` and `allowed-tools` as well.
-//! * **Not every `.md` in the directory is a command.** `vercel/commands/` holds
+//! * Not every `.md` in the directory is a command. `vercel/commands/` holds
 //!   `_conventions.md` — authoring guidance the other commands follow — and each
 //!   command beside a `.md.tmpl` source. A plain `*.md` glob would invent a
 //!   `_conventions` command and count every command twice.
-//! * **`$ARGUMENTS` is real**, and a command that lacks it still has to receive
+//! * `$ARGUMENTS` is real, and a command that lacks it still has to receive
 //!   what the user typed, or `/figma:implement-from-figma <url>` would silently
 //!   lose the url.
 //!

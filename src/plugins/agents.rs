@@ -116,42 +116,6 @@ fn read_one(plugin: &str, path: &Path, stem: &str) -> Option<AgentRole> {
     })
 }
 
-/// Renders the `<agents>` section of the system prompt.
-///
-/// `None` when there are no roles, so an install with no plugin agents gets no
-/// empty section — the same rule the skill catalogue follows.
-///
-/// The section exists in prose even though the `task` tool already lists the
-/// roles in its own description, because not every OpenAI-compatible backend
-/// surfaces the native `tools` field to the model; the prompt is the one channel
-/// every backend reads. Both are built from the same plugin field, so the two
-/// cannot drift.
-pub fn render(roles: &[&AgentRole]) -> Option<String> {
-    if roles.is_empty() {
-        return None;
-    }
-
-    let mut section = String::from(
-        "<agents>\n\
-         Sub-agents contributed by installed plugins. Delegate to one with the `task` tool \
-         when its role fits a job better than doing it yourself.\n",
-    );
-    for role in roles {
-        section.push_str("- `");
-        section.push_str(&role.name);
-        section.push_str("` (");
-        section.push_str(&role.plugin);
-        section.push(')');
-        if let Some(description) = &role.description {
-            section.push_str(": ");
-            section.push_str(description);
-        }
-        section.push('\n');
-    }
-    section.push_str("</agents>");
-    Some(section)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,31 +223,5 @@ mod tests {
     fn a_plugin_with_no_agents_directory_yields_nothing() {
         let temp = tempfile::tempdir().unwrap();
         assert!(load("p@m", temp.path()).is_empty());
-    }
-
-    #[test]
-    fn the_section_names_each_role_and_its_plugin() {
-        let temp = tempfile::tempdir().unwrap();
-        write_agent(temp.path(), "impl.md", FIGMA);
-        let roles = load("figma@openai-curated", temp.path());
-
-        let section = render(&roles.iter().collect::<Vec<_>>()).unwrap();
-
-        assert!(section.starts_with("<agents>"));
-        assert!(section.ends_with("</agents>"));
-        assert!(section.contains("`impl`"), "{section}");
-        assert!(
-            section.contains("figma@openai-curated"),
-            "the plugin is named, so two marketplaces cannot be confused: {section}"
-        );
-        assert!(
-            section.contains("You are the Figma Implementation Agent"),
-            "{section}"
-        );
-    }
-
-    #[test]
-    fn no_roles_means_no_section() {
-        assert_eq!(render(&[]), None);
     }
 }

@@ -14,17 +14,19 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Agent, EventSink, RunRequest};
+use crate::agent::{Agent, RunRequest};
 use crate::attachments::ImageRef;
 use crate::context::ContextSettings;
 use crate::error::AgentError;
+use crate::harness::services::native_services;
+use crate::harness::{AgentEvent, AgentEventSink, PromptAgent, PromptContext, PromptSkill};
 use crate::ipc::{AuditOutcome, Event};
 use crate::llm::{LlmClient, Message};
 use crate::plugins::{hooks, LoadedPlugin, PluginManifest, Scope};
-use crate::tools::{to_openai_tools, ToolRegistry, ToolSettings};
+use crate::tools::{to_openai_tools_from_descriptors, ToolRegistry, ToolSettings};
 
 /// Collects everything the agent emits, so a test can assert on the sequence.
 #[derive(Default)]
@@ -97,12 +99,12 @@ impl CollectingSink {
     }
 }
 
-impl EventSink for CollectingSink {
-    fn emit(&self, event: Event) {
+impl AgentEventSink for CollectingSink {
+    fn emit(&self, event: AgentEvent) {
         self.events
             .lock()
             .expect("the sink lock is not poisoned")
-            .push(event);
+            .push(event.into());
     }
 }
 
@@ -309,22 +311,77 @@ fn agent_with_registry(
     directory: &std::path::Path,
     context: ContextSettings,
 ) -> Agent {
-    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, Some(0))
-        .expect("the client builds");
-    let settings = ToolSettings {
-        working_directory: directory.to_path_buf(),
-        ..ToolSettings::default()
-    };
-    Agent::new(
-        client,
-        Arc::new(registry),
-        Arc::new(RwLock::new(settings)),
-        directory.to_path_buf(),
+    agent_with_settings(
+        registry,
+        server,
+        directory,
         context,
-        // No plugins: these tests are about the tool loop, and an empty list is
-        // the shape an install with no plugins enabled sees.
+        ToolSettings {
+            working_directory: directory.to_path_buf(),
+            ..ToolSettings::default()
+        },
         &[],
     )
+}
+
+fn agent_with_settings(
+    registry: ToolRegistry,
+    server: &FakeServer,
+    directory: &std::path::Path,
+    context: ContextSettings,
+    settings: ToolSettings,
+    plugins: &[&LoadedPlugin],
+) -> Agent {
+    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, Some(0))
+        .expect("the client builds");
+    let services = Arc::new(native_services(
+        client,
+        Arc::new(registry),
+        Arc::new(tokio::sync::RwLock::new(settings)),
+        plugins
+            .iter()
+            .flat_map(|plugin| plugin.hooks.iter().cloned())
+            .collect(),
+        Arc::new(crate::runtime::prompt::NativePromptProvider::new()),
+    ));
+    let roles: Vec<PromptAgent> = plugins
+        .iter()
+        .flat_map(|plugin| plugin.agents.iter())
+        .map(|role| PromptAgent {
+            name: role.name.clone(),
+            description: role.description.clone(),
+            plugin: role.plugin.clone(),
+        })
+        .collect();
+    let prompt_context = PromptContext {
+        tools: services.tools.descriptors(),
+        skills: plugins
+            .iter()
+            .flat_map(|plugin| plugin.skills.iter())
+            .map(|skill| PromptSkill {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                path: skill.path.clone(),
+                plugin: skill.plugin.clone(),
+            })
+            .collect(),
+        agents: if services
+            .tools
+            .descriptors()
+            .iter()
+            .any(|tool| tool.name == "task")
+        {
+            roles
+        } else {
+            Vec::new()
+        },
+        project_instructions: crate::runtime::prompt::read_project_instructions(directory),
+    };
+    let system_prompt = services
+        .prompts
+        .build_system_prompt(&prompt_context)
+        .expect("the native prompt provider renders");
+    Agent::from_services(services, directory.to_path_buf(), context, system_prompt)
 }
 
 fn agent_for(server: &FakeServer, directory: &std::path::Path) -> Agent {
@@ -341,18 +398,16 @@ fn agent_with_plugins(
     directory: &std::path::Path,
     plugins: &[&LoadedPlugin],
 ) -> Agent {
-    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, Some(0))
-        .expect("the client builds");
     let settings = ToolSettings {
         working_directory: directory.to_path_buf(),
         ..ToolSettings::default()
     };
-    Agent::new(
-        client,
-        Arc::new(registry),
-        Arc::new(RwLock::new(settings)),
-        directory.to_path_buf(),
+    agent_with_settings(
+        registry,
+        server,
+        directory,
         ContextSettings::default(),
+        settings,
         plugins,
     )
 }
@@ -1371,19 +1426,17 @@ async fn turning_the_guard_off_lets_a_destructive_command_through() {
     ))
     .await;
 
-    let client =
-        LlmClient::new(&server.base_url, "test-model", "test-key", None, Some(0)).expect("builds");
     let settings = ToolSettings {
         working_directory: directory.path().to_path_buf(),
         block_destructive_commands: false,
         ..ToolSettings::default()
     };
-    let agent = Agent::new(
-        client,
-        Arc::new(ToolRegistry::with_builtins()),
-        Arc::new(RwLock::new(settings)),
-        directory.path().to_path_buf(),
+    let agent = agent_with_settings(
+        ToolRegistry::with_builtins(),
+        &server,
+        directory.path(),
         ContextSettings::default(),
+        settings,
         &[],
     );
     let sink = CollectingSink::default();
@@ -1602,13 +1655,16 @@ async fn a_follow_up_run_replays_the_conversation_it_continues() {
 fn read_image_is_offered_only_to_a_model_that_declares_image_input() {
     // The gate the worker applies: a text-only model must never see the tool,
     // because a picture it cannot read is a wasted call and a provider error.
-    let text_only = to_openai_tools(&ToolRegistry::with_builtins()).to_string();
+    let text_only =
+        to_openai_tools_from_descriptors(&ToolRegistry::with_builtins().descriptors()).to_string();
     assert!(
         !text_only.contains("read_image"),
         "a text-only model must not be offered read_image: {text_only}"
     );
 
-    let multimodal = to_openai_tools(&ToolRegistry::with_image_input()).to_string();
+    let multimodal =
+        to_openai_tools_from_descriptors(&ToolRegistry::with_image_input().descriptors())
+            .to_string();
     assert!(
         multimodal.contains("read_image"),
         "a model that declares image input must be offered read_image: {multimodal}"

@@ -138,38 +138,6 @@ fn read_one(plugin: &str, path: &Path, fallback_name: Option<&str>) -> Option<Sk
     })
 }
 
-/// Renders the `<skills>` section of the system prompt.
-///
-/// `None` when there are no skills, so a plugin-free install gets a prompt with
-/// no empty section in it.
-pub fn render(skills: &[&Skill]) -> Option<String> {
-    if skills.is_empty() {
-        return None;
-    }
-
-    let mut section = String::from(
-        "<skills>\n\
-         Reusable instructions contributed by installed plugins. The list carries only a \
-         summary: when one matches the task, read its SKILL.md in full before acting.\n",
-    );
-    for skill in skills {
-        section.push_str("- `");
-        section.push_str(&skill.name);
-        section.push_str("` (");
-        section.push_str(&skill.plugin);
-        section.push(')');
-        if let Some(description) = &skill.description {
-            section.push_str(": ");
-            section.push_str(description);
-        }
-        section.push_str("\n  SKILL.md: ");
-        section.push_str(&skill.path.display().to_string());
-        section.push('\n');
-    }
-    section.push_str("</skills>");
-    Some(section)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,61 +277,5 @@ mod tests {
             "capped plus the ellipsis"
         );
         assert!(description.ends_with('…'));
-    }
-
-    #[test]
-    fn the_section_names_each_skill_and_where_to_read_it() {
-        let temp = tempfile::tempdir().unwrap();
-        skill_file(temp.path(), "skills/computer-use", COMPUTER_USE);
-        let skills = load("computer-use@openai-bundled", temp.path(), None);
-
-        let section = render(&skills.iter().collect::<Vec<_>>()).unwrap();
-
-        assert!(section.starts_with("<skills>"));
-        assert!(section.ends_with("</skills>"));
-        assert!(section.contains("`computer-use`"), "{section}");
-        assert!(
-            section.contains("computer-use@openai-bundled"),
-            "the plugin is named, so two marketplaces cannot be confused: {section}"
-        );
-        assert!(
-            section.contains("Control Windows apps from Codex"),
-            "{section}"
-        );
-
-        // The path in the prompt has to be one the model can actually read, so
-        // it is checked against the filesystem rather than against a second
-        // hand-built string — building that string independently is how a
-        // separator mismatch would slip through unnoticed.
-        let path = &skills[0].path;
-        assert!(
-            path.is_file(),
-            "the advertised path must exist: {}",
-            path.display()
-        );
-        assert!(section.contains(&path.display().to_string()), "{section}");
-
-        // Progressive disclosure: the body is not inlined.
-        assert!(
-            !section.contains("Use this skill to automate"),
-            "only the summary goes in the prompt: {section}"
-        );
-    }
-
-    #[test]
-    fn a_skill_without_a_description_still_renders() {
-        let temp = tempfile::tempdir().unwrap();
-        skill_file(temp.path(), "skills/bare", "---\nname: bare\n---\n");
-        let skills = load("p@m", temp.path(), None);
-
-        let section = render(&skills.iter().collect::<Vec<_>>()).unwrap();
-
-        assert!(section.contains("`bare` (p@m)"), "{section}");
-        assert!(section.contains("SKILL.md:"), "{section}");
-    }
-
-    #[test]
-    fn no_skills_means_no_section() {
-        assert_eq!(render(&[]), None);
     }
 }

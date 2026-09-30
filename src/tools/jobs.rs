@@ -298,14 +298,14 @@ impl JobRegistry {
         make: F,
     ) -> JobId
     where
-        F: FnOnce(JobId) -> Fut,
+        F: FnOnce(JobId, CancellationToken) -> Fut,
         Fut: std::future::Future<Output = Result<String>> + Send + 'static,
     {
         let job = self.register(kind, label, JobPayload::Result(Mutex::new(None)));
         let registry = Arc::clone(self);
         let runner = Arc::clone(&job);
         let cancel = job.cancel.clone();
-        let work = make(job.id.clone());
+        let work = make(job.id.clone(), cancel.clone());
 
         tokio::spawn(async move {
             let outcome = tokio::select! {
@@ -911,7 +911,7 @@ mod tests {
     #[tokio::test]
     async fn a_result_job_returns_its_text_once_settled() {
         let jobs = registry();
-        let id = jobs.start_result("subagent", "do a thing", |_| async {
+        let id = jobs.start_result("subagent", "do a thing", |_, _| async {
             Ok("the answer".to_string())
         });
 
@@ -929,7 +929,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(None));
 
         let captured = Arc::clone(&seen);
-        let id = jobs.start_result("subagent", "self-naming", move |job_id| async move {
+        let id = jobs.start_result("subagent", "self-naming", move |job_id, _| async move {
             *captured.lock().unwrap() = Some(job_id);
             Ok("done".to_string())
         });
@@ -941,7 +941,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_result_job_keeps_its_error_as_output() {
         let jobs = registry();
-        let id = jobs.start_result("subagent", "fail", |_| async {
+        let id = jobs.start_result("subagent", "fail", |_, _| async {
             Err(AgentError::internal("boom"))
         });
 
@@ -966,7 +966,7 @@ mod tests {
     #[tokio::test]
     async fn completion_is_notified_once() {
         let jobs = registry();
-        let id = jobs.start_result("subagent", "quick", |_| async { Ok("done".to_string()) });
+        let id = jobs.start_result("subagent", "quick", |_, _| async { Ok("done".to_string()) });
 
         jobs.read(&id, true, Duration::from_secs(5)).await.unwrap();
 
@@ -989,7 +989,7 @@ mod tests {
     #[tokio::test]
     async fn removing_a_job_purges_its_queued_notice() {
         let jobs = registry();
-        let id = jobs.start_result("subagent", "quick", |_| async { Ok("done".to_string()) });
+        let id = jobs.start_result("subagent", "quick", |_, _| async { Ok("done".to_string()) });
 
         jobs.read(&id, true, Duration::from_secs(5)).await.unwrap();
         jobs.remove(&id);
@@ -1004,8 +1004,8 @@ mod tests {
     #[tokio::test]
     async fn listing_reports_each_job_in_registration_order() {
         let jobs = registry();
-        let first = jobs.start_result("subagent", "one", |_| async { Ok(String::new()) });
-        let second = jobs.start_result("subagent", "two", |_| async { Ok(String::new()) });
+        let first = jobs.start_result("subagent", "one", |_, _| async { Ok(String::new()) });
+        let second = jobs.start_result("subagent", "two", |_, _| async { Ok(String::new()) });
 
         let listed = jobs.list();
         assert_eq!(listed.len(), 2);
