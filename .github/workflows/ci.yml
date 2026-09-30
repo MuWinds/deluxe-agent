@@ -47,13 +47,14 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # eframe/winit, arboard, and rfd probe the X11 and Wayland stacks; the bare
-      # runner image ships none of the headers the build links against.
+      # X11/Wayland headers for eframe/winit and arboard, plus libdbus-1-dev:
+      # keyring's `sync-secret-service` backend builds `libdbus-sys` through
+      # pkg-config, and the bare runner image ships none of these.
       - name: Install Linux GUI dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libglib2.0-dev libxkbcommon-dev libx11-dev libxcb1-dev libwayland-dev
+            libdbus-1-dev libxkbcommon-dev libx11-dev libxcb1-dev libwayland-dev
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
 
@@ -75,7 +76,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libglib2.0-dev libxkbcommon-dev libx11-dev libxcb1-dev libwayland-dev
+            libdbus-1-dev libxkbcommon-dev libx11-dev libxcb1-dev libwayland-dev
       - run: cargo test
       # The release profile is not what `cargo test` exercises (LTO, opt-level
       # "z", stripped); build it once so a profile-only breakage fails here.
@@ -112,7 +113,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libglib2.0-dev libxkbcommon-dev libx11-dev libxcb1-dev libwayland-dev
+            libdbus-1-dev libxkbcommon-dev libx11-dev libxcb1-dev libwayland-dev
       - run: cargo build --release --target ${{ matrix.target }}
       - name: Package Windows
         if: runner.os == 'Windows'

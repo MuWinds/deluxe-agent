@@ -46,7 +46,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libglib2.0-dev libxkbcommon-dev libx11-dev libxcb1-dev libwayland-dev
+            libdbus-1-dev libxkbcommon-dev libx11-dev libxcb1-dev libwayland-dev
       - run: cargo build --release --target ${{ matrix.target }}
       - name: Package Windows
         if: runner.os == 'Windows'
