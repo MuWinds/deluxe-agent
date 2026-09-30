@@ -315,11 +315,16 @@ impl Session {
     }
 
     /// The last path component, which is what the project list shows.
+    ///
+    /// Splits on both separators instead of using `Path::file_name`, so a
+    /// session written on Windows still shows a bare name when it is opened on
+    /// a Unix host.
     pub fn project_name(&self) -> String {
-        Path::new(&self.project)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.project.clone())
+        self.project
+            .rsplit(['/', '\\'])
+            .find(|component| !component.is_empty())
+            .unwrap_or(self.project.as_str())
+            .to_string()
     }
 
     /// Appends to the trailing assistant step, or starts one.

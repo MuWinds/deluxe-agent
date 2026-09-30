@@ -1719,11 +1719,15 @@ fn pretty(value: &Value) -> String {
 }
 
 /// The last path component, for the project list.
+///
+/// Splits on both separators instead of using `Path::file_name`, so a session
+/// written on Windows still shows a bare name when it is opened on a Unix host.
 fn project_name(project: &str) -> String {
-    std::path::Path::new(project)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| project.to_string())
+    project
+        .rsplit(['/', '\\'])
+        .find(|component| !component.is_empty())
+        .unwrap_or(project)
+        .to_string()
 }
 
 fn shorten(text: &str, max: usize) -> String {
