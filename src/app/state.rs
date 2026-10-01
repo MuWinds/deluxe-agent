@@ -63,6 +63,7 @@ pub struct Paths {
 
 /// Application state that can be folded and tested without a GUI context.
 pub struct App {
+    pub(super) plugin_surface: Option<super::view_model::PluginSurfaceView>,
     pub(super) cmd_tx: mpsc::UnboundedSender<Cmd>,
     pub(super) events: mpsc::UnboundedReceiver<Event>,
 
@@ -104,7 +105,7 @@ pub struct App {
     pub(super) show_settings: bool,
     pub(super) show_about: bool,
     pub(super) show_plugins: bool,
-    pub(super) pending_uninstall: Option<String>,
+    pub(super) pending_uninstall: Option<(String, crate::plugins::Scope)>,
     pub(super) show_sidebar: bool,
     pub(super) settings_error: Option<String>,
     pub(super) plugins_error: Option<String>,

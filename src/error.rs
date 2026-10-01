@@ -9,6 +9,14 @@ pub mod code {
     pub const INTERNAL: &str = "internal";
     pub const LLM: &str = "llm";
     pub const CANCELLED: &str = "cancelled";
+    pub const PLUGIN_LOAD_FAILED: &str = "plugin_load_failed";
+    pub const PLUGIN_API_MISMATCH: &str = "plugin_api_mismatch";
+    pub const PLUGIN_TRAP: &str = "plugin_trap";
+    pub const PLUGIN_TIMEOUT: &str = "plugin_timeout";
+    pub const PLUGIN_CANCELLED: &str = "plugin_cancelled";
+    pub const PLUGIN_RESOURCE_LIMIT: &str = "plugin_resource_limit";
+    pub const PLUGIN_INVALID_OUTPUT: &str = "plugin_invalid_output";
+    pub const PLUGIN_PERMISSION_DENIED: &str = "plugin_permission_denied";
 }
 
 /// The one error type the tool layer and the loop pass around.
@@ -81,7 +89,7 @@ impl AgentError {
     /// Whether this error means "the host refused to run it", which the agent
     /// loop reports to the model as a refusal rather than a failure.
     pub fn is_denial(&self) -> bool {
-        matches!(self.code, code::DENIED)
+        matches!(self.code, code::DENIED | code::PLUGIN_PERMISSION_DENIED)
     }
 }
 

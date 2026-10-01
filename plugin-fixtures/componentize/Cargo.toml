@@ -1,0 +1,11 @@
+[package]
+name = "deluxe-componentize-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+wasm-encoder = "0.239"
+wit-component = "0.239"
+wit-parser = "0.239"

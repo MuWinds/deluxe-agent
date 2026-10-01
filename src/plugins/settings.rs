@@ -21,10 +21,10 @@
 //!
 //! This file is the *only* place the load decision is made. In particular the
 //! decision is never read from a repository: a cloned repo can ship plugin
-//! *definitions* in `<repo>/.agents/plugins/`, but a plugin's hooks are
-//! arbitrary shell commands, so a repo that could enable itself could run code
-//! on the machine of anyone who cloned it. Listing an id here is the act of
-//! trust, and it can only be performed by the person who owns this config.
+//! *definitions* in `<repo>/.agents/plugins/`. Executable behavior is still
+//! isolated behind the Wasm manifest and explicit capability permissions, so
+//! listing an id here is the act of trust and can only be performed by the
+//! person who owns this config.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -50,6 +50,9 @@ pub struct PluginSettings {
     /// everywhere else in this program. [`project_key`] is the normal form both
     /// sides are put through.
     pub projects: BTreeMap<String, Vec<String>>,
+    /// Project-scoped plugin ids that are installed but explicitly disabled.
+    #[serde(default)]
+    pub disabled_projects: BTreeMap<String, Vec<String>>,
 }
 
 /// One plugin's row in the `[plugins]` table.
@@ -81,6 +84,26 @@ impl PluginSettings {
             return;
         }
         self.plugins.insert(id.to_string(), PluginEntry { enabled });
+    }
+
+    /// Turns one plugin on or off only for `project`.
+    pub fn set_project_enabled(&mut self, project: &Path, id: &str, enabled: bool) {
+        let id = id.trim();
+        let project = project_key(project);
+        if id.is_empty() || project.is_empty() {
+            return;
+        }
+        remove_id(self.projects.entry(project.clone()).or_default(), id);
+        remove_id(
+            self.disabled_projects.entry(project.clone()).or_default(),
+            id,
+        );
+        let target = if enabled {
+            &mut self.projects
+        } else {
+            &mut self.disabled_projects
+        };
+        target.entry(project).or_default().push(id.to_string());
     }
 
     /// Repairs a hand-edited section.
@@ -124,6 +147,26 @@ impl PluginSettings {
                 Some((key, ids))
             })
             .collect();
+
+        let disabled_projects = std::mem::take(&mut self.disabled_projects);
+        self.disabled_projects = disabled_projects
+            .into_iter()
+            .filter_map(|(project, mut ids)| {
+                let key = project_key(Path::new(&project));
+                if key.is_empty() {
+                    return None;
+                }
+                dedup(&mut ids);
+                ids.retain(|id| {
+                    !off.contains(id.as_str())
+                        && !self
+                            .projects
+                            .get(&key)
+                            .is_some_and(|enabled| enabled.iter().any(|item| item == id))
+                });
+                Some((key, ids))
+            })
+            .collect();
     }
 }
 
@@ -164,6 +207,10 @@ fn dedup(ids: &mut Vec<String>) {
     }
 }
 
+fn remove_id(ids: &mut Vec<String>, id: &str) {
+    ids.retain(|item| item != id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +231,7 @@ mod tests {
                 "/work/repo/".to_string(),
                 vec!["c@m".into(), "c@m".into(), " ".into()],
             )]),
+            disabled_projects: BTreeMap::new(),
         };
 
         settings.normalize();
@@ -203,6 +251,7 @@ mod tests {
         let mut settings = PluginSettings {
             plugins: BTreeMap::new(),
             projects: BTreeMap::from([("/work/repo".to_string(), vec!["  ".into()])]),
+            disabled_projects: BTreeMap::new(),
         };
 
         settings.normalize();
@@ -226,6 +275,7 @@ mod tests {
                 "/work/repo".to_string(),
                 vec!["figma@personal".into(), "repo-triage@my-team".into()],
             )]),
+            disabled_projects: BTreeMap::new(),
         };
 
         settings.normalize();
@@ -250,10 +300,35 @@ mod tests {
     }
 
     #[test]
+    fn project_switch_moves_an_id_between_enabled_and_disabled_lists() {
+        let project = Path::new("/work/repo");
+        let key = project_key(project);
+        let mut settings = PluginSettings::default();
+
+        settings.set_project_enabled(project, "repo-triage@team", false);
+        assert_eq!(settings.disabled_projects[&key], vec!["repo-triage@team"]);
+        assert!(
+            settings.projects.get(&key).is_none_or(Vec::is_empty),
+            "disabling a project plugin must not create a global switch"
+        );
+
+        settings.set_project_enabled(project, "repo-triage@team", true);
+        assert_eq!(settings.projects[&key], vec!["repo-triage@team"]);
+        assert!(
+            settings
+                .disabled_projects
+                .get(&key)
+                .is_none_or(Vec::is_empty),
+            "enabling a project plugin removes its disabled marker"
+        );
+    }
+
+    #[test]
     fn an_absent_section_is_an_empty_one() {
         let parsed: PluginSettings = toml::from_str("").unwrap();
         assert!(parsed.plugins.is_empty());
         assert!(parsed.projects.is_empty());
+        assert!(parsed.disabled_projects.is_empty());
     }
 
     #[test]
@@ -304,6 +379,7 @@ mod tests {
                 "/work/repo".to_string(),
                 vec!["repo-triage@my-team".into()],
             )]),
+            disabled_projects: BTreeMap::new(),
         };
 
         let text = toml::to_string(&settings).unwrap();
@@ -311,5 +387,6 @@ mod tests {
 
         assert_eq!(parsed.plugins, settings.plugins);
         assert_eq!(parsed.projects, settings.projects);
+        assert_eq!(parsed.disabled_projects, settings.disabled_projects);
     }
 }

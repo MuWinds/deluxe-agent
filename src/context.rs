@@ -10,7 +10,7 @@
 //! provider's own token count for the prompt it received — never a local
 //! estimate, which would disagree with the provider by a wide margin on
 //! anything but plain English. The summary costs one extra request; the
-//! settings make that trade-off the user's call.
+//! settings make th    at trade-off the user's call.
 
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;

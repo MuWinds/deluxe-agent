@@ -1,0 +1,20 @@
+{
+  "name": "echo-tool",
+  "version": "0.1.0",
+  "interface": {
+    "displayName": "Echo Tool",
+    "shortDescription": "Offline Wasm tool and UI fixture"
+  },
+  "runtime": {
+    "type": "wasm",
+    "module": "plugin.wasm",
+    "apiVersion": "deluxe.harness/plugin@0.1",
+    "ui": {
+      "surfaces": ["main"],
+      "actions": ["echo"]
+    },
+    "permissions": {
+      "invokeTools": ["exec"]
+    }
+  }
+}

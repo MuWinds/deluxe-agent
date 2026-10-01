@@ -1,0 +1,17 @@
+{
+  "name": "mcp-http-fixture",
+  "version": "0.1.0",
+  "runtime": {
+    "type": "wasm",
+    "provider": "mcp",
+    "module": "plugin.wasm",
+    "apiVersion": "deluxe.harness/plugin@0.1",
+    "ui": {
+      "surfaces": ["mcp"]
+    },
+    "permissions": {
+      "mcpServers": ["fixture"],
+      "networkHosts": ["127.0.0.1"]
+    }
+  }
+}

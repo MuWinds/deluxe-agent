@@ -1,59 +1,33 @@
-//! Codex plugins, as this agent consumes them.
+//! Plugin discovery and project-scoped Wasmtime provider metadata.
 //!
-//! A *plugin* is a directory Codex installs: a manifest at
-//! `.codex-plugin/plugin.json` plus optional companions (`skills/`, `commands/`,
-//! `agents/`, `hooks.json`, `.mcp.json`). This module finds the ones the user
-//! enabled and reads their manifests and skills; the other companions are read
-//! by their own modules.
+//! Wasmtime plugin discovery, scope resolution, and lifecycle metadata.
 //!
-//! It also reads the ones the user *disabled*, and keeps them apart — see
-//! [`PluginCatalogue::disabled`]. A switch is only worth having if what it
-//! turned off stays visible and can be turned back on, and that needs the
-//! plugin resolved and read just like an enabled one. Nothing that runs a
-//! plugin ever sees them: the two lists are separate, so a consumer cannot
-//! reach a disabled plugin by forgetting a check.
-//!
-//! # Two scopes, and why they are not flattened
-//!
-//! Codex plugins come from marketplaces at two levels. The personal marketplace
-//! (`~/.agents/plugins/marketplace.json`) and the ones shipped with Codex
-//! (`~/.codex/bundled-marketplaces/`) are **global**: they apply everywhere. A
-//! repository's own marketplace (`<repo>/.agents/plugins/marketplace.json`) is
-//! **project-scoped**: it applies to that repository and nowhere else.
-//!
-//! Flattening the two into one list would be simpler and wrong. A plugin brings
-//! skills, MCP servers and hooks, and a project-scoped hook firing in an
-//! unrelated project is a real bug — so the split is preserved all the way to
-//! [`PluginCatalogue::for_project`], and every consumer goes through it.
-//!
-//! # What is deliberately not done here
-//!
-//! * **No remote fetching.** Only `local` sources and the already-installed
-//!   cache are resolved. `git-subdir` and `npm` sources are Codex's job to fetch;
-//!   by the time this agent looks, the result is in the cache.
-//! * **No enable decision from a repository.** See [`settings`].
-//! * **Discovery never fails.** A malformed manifest, a missing directory, an id
-//!   that names nothing — each is a warning and a skip, so one bad plugin cannot
-//!   stop the others from loading. This mirrors `config::load`, which treats a
-//!   malformed file as a warning rather than a startup failure.
-
+//! Every loaded plugin must declare a Wasmtime component. The hooks and MCP
+//! providers are ordinary entries in the same catalogue with a distinct
+//! provider role; no non-Wasm plugin path is retained.
 pub mod agents;
+pub mod capabilities;
 pub mod commands;
 pub mod frontmatter;
-pub mod hooks;
 pub mod manifest;
+pub mod providers;
+pub mod runtime;
 pub mod settings;
 pub mod skills;
+pub mod ui_protocol;
+pub mod wasm;
+pub mod wasm_manifest;
+pub mod wasm_runtime;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub use agents::AgentRole;
 pub use commands::Command;
-pub use hooks::Hook;
 pub use manifest::PluginManifest;
 pub use settings::PluginSettings;
 pub use skills::Skill;
+pub use wasm_manifest::ProviderKind;
 
 use settings::project_key;
 
@@ -89,7 +63,7 @@ pub(crate) fn first_prose_line(body: &str) -> Option<String> {
 }
 
 /// Where a plugin came from, which decides where it applies.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
     /// Applies in every project: the personal marketplace and the bundled ones.
     Global,
@@ -123,25 +97,22 @@ pub struct LoadedPlugin {
     /// Unlike a skill, a command is invoked by the user rather than chosen by
     /// the model, so this reaches the composer and never the system prompt.
     pub commands: Vec<Command>,
-    /// The `PostToolUse` hooks this plugin contributes.
+    /// The raw `hooks.json` contents for the hooks provider root.
     ///
-    /// Carried resolved rather than as a path, because a hook is a plain command
-    /// with no work left to do at run time — see [`hooks`]. They fire in the
-    /// agent loop, so like the skills they must belong to the project that
-    /// loaded them and no other.
-    pub hooks: Vec<Hook>,
+    /// The host preserves the file format but does not interpret hook
+    /// matchers or execute commands.
+    pub hooks_json: Option<String>,
+    /// The raw `.mcp.json` contents for the MCP provider root.
+    ///
+    /// The parsed server map below is only for host raw-transport
+    /// authorization; MCP protocol behavior remains in Wasm.
+    pub mcp_json: Option<String>,
+    /// The MCP declarations read from this plugin's `.mcp.json`.
+    pub mcp_servers: BTreeMap<String, manifest::McpServerConfig>,
     /// The sub-agent roles this plugin contributes, sorted by name.
     ///
     /// Offered to the model through the `task` tool; see [`agents`].
     pub agents: Vec<AgentRole>,
-    /// The MCP servers this plugin declares, keyed by the name they are exposed
-    /// under. Empty for most plugins.
-    ///
-    /// Carried here rather than resolved at discovery time because starting a
-    /// server is async work with a handshake and a timeout, and discovery is a
-    /// pure function that runs before the window exists. The worker connects
-    /// them for the project that needs them.
-    pub mcp_servers: BTreeMap<String, manifest::McpServerConfig>,
 }
 
 impl LoadedPlugin {
@@ -164,6 +135,8 @@ pub struct PluginCatalogue {
     /// so a project is one project whether it is spelled with a trailing
     /// separator or not.
     by_project: BTreeMap<String, Vec<LoadedPlugin>>,
+    /// Project-scoped plugins that are installed but disabled.
+    disabled_by_project: BTreeMap<String, Vec<LoadedPlugin>>,
     /// Global plugins the user turned off but that are still installed.
     ///
     /// Resolved and read like the others, because the plugins window must show
@@ -201,6 +174,38 @@ impl PluginCatalogue {
     /// Every loaded plugin, global first, for logging.
     pub fn all(&self) -> impl Iterator<Item = &LoadedPlugin> {
         self.global.iter().chain(self.by_project.values().flatten())
+    }
+
+    /// Enabled plugins explicitly assigned to `project`, excluding globals.
+    pub fn project(&self, project: &Path) -> &[LoadedPlugin] {
+        self.by_project
+            .get(&project_key(project))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// Disabled plugins explicitly assigned to `project`, excluding globals.
+    pub fn disabled_for_project(&self, project: &Path) -> &[LoadedPlugin] {
+        self.disabled_by_project
+            .get(&project_key(project))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// Finds an installed plugin by id and exact scope.
+    pub fn find_in_scope(&self, id: &str, scope: &Scope) -> Option<&LoadedPlugin> {
+        match scope {
+            Scope::Global => self
+                .global
+                .iter()
+                .chain(self.disabled.iter())
+                .find(|plugin| plugin.id == id),
+            Scope::Project(project) => self
+                .project(project)
+                .iter()
+                .chain(self.disabled_for_project(project))
+                .find(|plugin| plugin.id == id),
+        }
     }
 
     /// The global plugins alone: the personal marketplace's, and the ones
@@ -248,6 +253,17 @@ impl PluginCatalogue {
             "only global plugins are ever disabled"
         );
         self.disabled.push(plugin);
+    }
+
+    fn disable_project(&mut self, plugin: LoadedPlugin) {
+        let Scope::Project(project) = &plugin.scope else {
+            debug_assert!(false, "only project plugins are stored as project-disabled");
+            return;
+        };
+        self.disabled_by_project
+            .entry(project_key(project))
+            .or_default()
+            .push(plugin);
     }
 }
 
@@ -305,18 +321,40 @@ pub fn discover(home: &Path, projects: &[PathBuf], settings: &PluginSettings) ->
         .filter(|(_, entry)| !entry.enabled)
         .map(|(id, _)| id.as_str())
         .collect();
-    let mut projects: Vec<&String> = settings.projects.keys().collect();
+    let mut projects: Vec<&String> = settings
+        .projects
+        .keys()
+        .chain(settings.disabled_projects.keys())
+        .collect();
     projects.sort();
+    projects.dedup();
     for project in projects {
         let root = PathBuf::from(project);
-        let ids = &settings.projects[project];
-        for id in ids {
+        let enabled_ids = settings
+            .projects
+            .get(project)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for id in enabled_ids {
             if off.contains(id.as_str()) {
                 continue;
             }
             match resolve(id, &marketplaces, Some(&root), home) {
                 Some(plugin) => catalogue.insert(plugin),
                 None => warn_unresolved(id, &offered),
+            }
+        }
+        let disabled_ids = settings
+            .disabled_projects
+            .get(project)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for id in disabled_ids {
+            if off.contains(id.as_str()) || enabled_ids.contains(id) {
+                continue;
+            }
+            if let Some(plugin) = resolve(id, &marketplaces, Some(&root), home) {
+                catalogue.disable_project(plugin);
             }
         }
     }
@@ -331,7 +369,6 @@ pub fn discover(home: &Path, projects: &[PathBuf], settings: &PluginSettings) ->
             root = %plugin.root.display(),
             skills = plugin.skills.len(),
             commands = plugin.commands.len(),
-            hooks = plugin.hooks.len(),
             agents = plugin.agents.len(),
             "loaded plugin"
         );
@@ -466,6 +503,14 @@ fn load_from(root: &Path, id: &str, scope: Scope) -> Option<LoadedPlugin> {
             return None;
         }
     };
+    let Some(wasm_manifest) = manifest.wasm_runtime() else {
+        tracing::warn!(
+            id,
+            root = %root.display(),
+            "skipping a plugin without a Wasmtime runtime"
+        );
+        return None;
+    };
 
     let skills = skills::load(id, root, manifest.skills.as_deref());
 
@@ -474,21 +519,40 @@ fn load_from(root: &Path, id: &str, scope: Scope) -> Option<LoadedPlugin> {
     // skills above are attributed by. A user types the short one.
     let commands = commands::load(&manifest.name, root);
 
-    // Hooks and roles are attributed by the full `name@marketplace` id, like the
-    // skills: both are surfaced by the host rather than typed by the user, and
-    // with two marketplaces installed the short name alone is ambiguous.
-    let hooks = hooks::load(id, root);
+    // Roles are attributed by the full `name@marketplace` id, like the skills:
+    // both are surfaced by the host rather than typed by the user, and with two
+    // marketplaces installed the short name alone is ambiguous.
     let agents = agents::load(id, root);
 
-    // A `.mcp.json` that will not parse costs the plugin its servers and
-    // nothing else — the skills above are already loaded, and the manifest
-    // parsed. Same rule as everywhere else in discovery: warn, keep going.
-    let mcp_servers = match manifest::read_mcp_servers(root) {
-        Ok(servers) => servers,
-        Err(error) => {
-            tracing::warn!(id, %error, "skipping a plugin's unreadable .mcp.json");
-            BTreeMap::new()
+    let hooks_json = if wasm_manifest.provider == ProviderKind::Hooks {
+        match manifest::read_optional_file(root, manifest::HOOKS_FILE) {
+            Ok(contents) => contents,
+            Err(error) => {
+                tracing::warn!(id, %error, "skipping the hooks provider's unreadable hooks.json");
+                None
+            }
         }
+    } else {
+        None
+    };
+    let (mcp_json, mcp_servers) = if wasm_manifest.provider == ProviderKind::Mcp {
+        let mcp_json = match manifest::read_optional_file(root, manifest::MCP_FILE) {
+            Ok(contents) => contents,
+            Err(error) => {
+                tracing::warn!(id, %error, "skipping the MCP provider's unreadable .mcp.json");
+                None
+            }
+        };
+        let mcp_servers = match manifest::read_mcp_servers(root) {
+            Ok(servers) => servers,
+            Err(error) => {
+                tracing::warn!(id, %error, "skipping the MCP provider's unreadable declarations");
+                BTreeMap::new()
+            }
+        };
+        (mcp_json, mcp_servers)
+    } else {
+        (None, BTreeMap::new())
     };
 
     Some(LoadedPlugin {
@@ -498,9 +562,10 @@ fn load_from(root: &Path, id: &str, scope: Scope) -> Option<LoadedPlugin> {
         manifest,
         skills,
         commands,
-        hooks,
-        agents,
+        hooks_json,
+        mcp_json,
         mcp_servers,
+        agents,
     })
 }
 
@@ -669,6 +734,8 @@ mod tests {
             manifest_dir.join(manifest::MANIFEST_FILE),
             format!(
                 r#"{{"name":"{name}","version":"1.0.0","description":"The {name} plugin.",
+                     "runtime":{{"type":"wasm","module":"plugin.wasm",
+                     "apiVersion":"deluxe.harness/plugin@0.1","provider":"general"}},
                      "interface":{{"displayName":"{name}","shortDescription":"Does {name} things"}}}}"#
             ),
         )
@@ -683,11 +750,6 @@ mod tests {
             )
             .unwrap();
         }
-    }
-
-    /// Writes a plugin's `.mcp.json`.
-    fn write_mcp(root: &Path, body: &str) {
-        fs::write(root.join(manifest::MCP_FILE), body).unwrap();
     }
 
     /// Writes a marketplace file at the standard location under `root`.
@@ -778,6 +840,7 @@ mod tests {
         let settings = PluginSettings {
             plugins: settings::entries(&["figma@personal"]),
             projects: BTreeMap::new(),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(fixture.home.path(), &[], &settings);
 
@@ -802,6 +865,7 @@ mod tests {
                 project_key(fixture.project.path()),
                 vec!["repo-triage@my-team".into()],
             )]),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(
             fixture.home.path(),
@@ -823,6 +887,295 @@ mod tests {
     }
 
     #[test]
+    fn a_project_plugin_can_be_disabled_without_disabling_global_plugins() {
+        let fixture = fixture();
+        let settings = PluginSettings {
+            plugins: settings::entries(&["figma@personal"]),
+            projects: BTreeMap::new(),
+            disabled_projects: BTreeMap::from([(
+                project_key(fixture.project.path()),
+                vec!["repo-triage@my-team".into()],
+            )]),
+        };
+        let catalogue = discover(
+            fixture.home.path(),
+            &[fixture.project.path().to_path_buf()],
+            &settings,
+        );
+
+        assert_eq!(
+            ids(&catalogue.for_project(fixture.project.path())),
+            vec!["figma@personal"],
+            "a disabled project plugin must not enter the project runtime"
+        );
+        assert_eq!(
+            catalogue
+                .disabled_for_project(fixture.project.path())
+                .iter()
+                .map(|plugin| plugin.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["repo-triage@my-team"],
+            "the disabled project plugin remains visible in its project scope"
+        );
+        assert!(
+            catalogue
+                .disabled_for_project(fixture.other.path())
+                .is_empty(),
+            "a project-disabled plugin must not leak into another project"
+        );
+    }
+
+    #[test]
+    fn provider_companion_configuration_follows_global_and_project_scope() {
+        let fixture = fixture();
+        let global_hooks_root = fixture.home.path().join("plugins/figma");
+        let global_hooks = r#"{"hooks":{"PostToolUse":[]}}"#;
+        let global_mcp = r#"{"mcpServers":{"global":{"command":"global-server"}}}"#;
+        fs::write(
+            global_hooks_root
+                .join(manifest::MANIFEST_DIR)
+                .join(manifest::MANIFEST_FILE),
+            r#"{"name":"figma","version":"1.0.0","runtime":{
+                "type":"wasm","module":"plugin.wasm",
+                "apiVersion":"deluxe.harness/plugin@0.1","provider":"hooks"}}"#,
+        )
+        .unwrap();
+        fs::write(global_hooks_root.join(manifest::HOOKS_FILE), global_hooks).unwrap();
+
+        let global_mcp_root = fixture.home.path().join("plugins/global-mcp");
+        write_plugin(&global_mcp_root, "global-mcp", None);
+        fs::write(
+            global_mcp_root
+                .join(manifest::MANIFEST_DIR)
+                .join(manifest::MANIFEST_FILE),
+            r#"{"name":"global-mcp","version":"1.0.0","runtime":{
+                "type":"wasm","module":"plugin.wasm",
+                "apiVersion":"deluxe.harness/plugin@0.1","provider":"mcp"}}"#,
+        )
+        .unwrap();
+        fs::write(global_mcp_root.join(manifest::MCP_FILE), global_mcp).unwrap();
+
+        let general_root = fixture
+            .home
+            .path()
+            .join(".codex/bundled-marketplaces/openai-bundled/plugins/computer-use");
+        fs::write(general_root.join(manifest::HOOKS_FILE), global_hooks).unwrap();
+        fs::write(general_root.join(manifest::MCP_FILE), global_mcp).unwrap();
+
+        write_marketplace(
+            fixture.home.path(),
+            "personal",
+            &[
+                ("figma", "./plugins/figma"),
+                ("global-mcp", "./plugins/global-mcp"),
+            ],
+        );
+
+        let project_mcp_root = fixture.project.path().join("plugins/repo-triage");
+        let project_hooks = r#"{"hooks":{"PostToolUse":[{"hooks":[]}]}}"#;
+        let project_mcp = r#"{"mcpServers":{"project":{"command":"project-server"}}}"#;
+        fs::write(
+            project_mcp_root
+                .join(manifest::MANIFEST_DIR)
+                .join(manifest::MANIFEST_FILE),
+            r#"{"name":"repo-triage","version":"1.0.0","runtime":{
+                "type":"wasm","module":"plugin.wasm",
+                "apiVersion":"deluxe.harness/plugin@0.1","provider":"mcp"}}"#,
+        )
+        .unwrap();
+        fs::write(project_mcp_root.join(manifest::MCP_FILE), project_mcp).unwrap();
+
+        let project_hooks_root = fixture.project.path().join("plugins/project-hooks");
+        write_plugin(&project_hooks_root, "project-hooks", None);
+        fs::write(
+            project_hooks_root
+                .join(manifest::MANIFEST_DIR)
+                .join(manifest::MANIFEST_FILE),
+            r#"{"name":"project-hooks","version":"1.0.0","runtime":{
+                "type":"wasm","module":"plugin.wasm",
+                "apiVersion":"deluxe.harness/plugin@0.1","provider":"hooks"}}"#,
+        )
+        .unwrap();
+        fs::write(project_hooks_root.join(manifest::HOOKS_FILE), project_hooks).unwrap();
+        write_marketplace(
+            fixture.project.path(),
+            "my-team",
+            &[
+                ("repo-triage", "./plugins/repo-triage"),
+                ("project-hooks", "./plugins/project-hooks"),
+            ],
+        );
+
+        let settings = PluginSettings {
+            plugins: settings::entries(&[
+                "figma@personal",
+                "global-mcp@personal",
+                "computer-use@openai-bundled",
+            ]),
+            projects: BTreeMap::from([(
+                project_key(fixture.project.path()),
+                vec!["repo-triage@my-team".into(), "project-hooks@my-team".into()],
+            )]),
+            disabled_projects: BTreeMap::new(),
+        };
+        let catalogue = discover(
+            fixture.home.path(),
+            &[
+                fixture.project.path().to_path_buf(),
+                fixture.other.path().to_path_buf(),
+            ],
+            &settings,
+        );
+
+        let project_plugins = catalogue.for_project(fixture.project.path());
+        let global = project_plugins
+            .iter()
+            .find(|plugin| plugin.id == "figma@personal")
+            .expect("the global plugin applies to the project");
+        assert_eq!(
+            global.hooks_json.as_deref(),
+            Some(global_hooks),
+            "only the global Hooks provider receives its hooks.json"
+        );
+        assert_eq!(
+            global.mcp_json.as_deref(),
+            None,
+            "the Hooks provider must not receive MCP input"
+        );
+
+        let global_mcp_plugin = project_plugins
+            .iter()
+            .find(|plugin| plugin.id == "global-mcp@personal")
+            .expect("the global MCP provider applies to the project");
+        assert_eq!(
+            global_mcp_plugin.hooks_json.as_deref(),
+            None,
+            "the MCP provider must not receive Hooks input"
+        );
+        assert_eq!(
+            global_mcp_plugin.mcp_json.as_deref(),
+            Some(global_mcp),
+            "the global MCP provider receives its raw .mcp.json"
+        );
+        assert_eq!(
+            global_mcp_plugin.mcp_servers["global"].command.as_deref(),
+            Some("global-server"),
+            "the MCP provider receives the parsed transport declarations"
+        );
+
+        let general = project_plugins
+            .iter()
+            .find(|plugin| plugin.id == "computer-use@openai-bundled")
+            .expect("the General Wasmtime provider applies to the project");
+        assert_eq!(
+            general.hooks_json.as_deref(),
+            None,
+            "a General Wasmtime plugin must not read hooks.json"
+        );
+        assert_eq!(
+            general.mcp_json.as_deref(),
+            None,
+            "a General Wasmtime plugin must not read .mcp.json"
+        );
+
+        let project_mcp_plugin = project_plugins
+            .iter()
+            .find(|plugin| plugin.id == "repo-triage@my-team")
+            .expect("the project MCP provider applies to its own project");
+        assert_eq!(project_mcp_plugin.hooks_json.as_deref(), None);
+        assert_eq!(
+            project_mcp_plugin.mcp_json.as_deref(),
+            Some(project_mcp),
+            "the project MCP provider receives the project-scoped .mcp.json"
+        );
+
+        let project_hooks_plugin = project_plugins
+            .iter()
+            .find(|plugin| plugin.id == "project-hooks@my-team")
+            .expect("the project Hooks provider applies to its own project");
+        assert_eq!(
+            project_hooks_plugin.hooks_json.as_deref(),
+            Some(project_hooks),
+            "the project Hooks provider receives the project-scoped hooks.json"
+        );
+        assert_eq!(project_hooks_plugin.mcp_json.as_deref(), None);
+
+        let other_plugins = catalogue.for_project(fixture.other.path());
+        let global_elsewhere = other_plugins
+            .iter()
+            .find(|plugin| plugin.id == "figma@personal")
+            .expect("the global Hooks provider applies to another project");
+        assert_eq!(global_elsewhere.hooks_json.as_deref(), Some(global_hooks));
+        assert_eq!(global_elsewhere.mcp_json.as_deref(), None);
+        assert!(
+            other_plugins.iter().all(|plugin| {
+                plugin.id != "repo-triage@my-team" && plugin.id != "project-hooks@my-team"
+            }),
+            "project provider inputs must not leak into another project"
+        );
+    }
+
+    #[test]
+    fn a_project_scoped_wasm_manifest_is_visible_only_to_its_project() {
+        let fixture = fixture();
+        let root = fixture.project.path().join("plugins/wasm-echo");
+        let manifest_dir = root.join(manifest::MANIFEST_DIR);
+        fs::create_dir_all(&manifest_dir).expect("the Wasm plugin manifest directory is writable");
+        fs::write(
+            manifest_dir.join(manifest::MANIFEST_FILE),
+            r#"{
+              "name": "wasm-echo",
+              "runtime": {
+                "type": "wasm",
+                "module": "plugin.wasm",
+                "apiVersion": "deluxe.harness/plugin@0.1"
+              }
+            }"#,
+        )
+        .expect("the project Wasm manifest is writable");
+        fs::write(root.join("plugin.wasm"), b"fixture").expect("the component entry is present");
+        write_marketplace(
+            fixture.project.path(),
+            "my-team",
+            &[
+                ("repo-triage", "./plugins/repo-triage"),
+                ("wasm-echo", "./plugins/wasm-echo"),
+            ],
+        );
+
+        let settings = PluginSettings {
+            plugins: BTreeMap::new(),
+            projects: BTreeMap::from([(
+                project_key(fixture.project.path()),
+                vec!["wasm-echo@my-team".into()],
+            )]),
+            disabled_projects: BTreeMap::new(),
+        };
+        let catalogue = discover(
+            fixture.home.path(),
+            &[
+                fixture.project.path().to_path_buf(),
+                fixture.other.path().to_path_buf(),
+            ],
+            &settings,
+        );
+
+        let project_plugins = catalogue.for_project(fixture.project.path());
+        let wasm = project_plugins
+            .iter()
+            .find(|plugin| plugin.id == "wasm-echo@my-team")
+            .expect("the project-scoped Wasm plugin is discovered");
+        assert!(
+            wasm.manifest.wasm_runtime().is_some(),
+            "the runtime declaration is preserved for the worker"
+        );
+        assert!(
+            catalogue.for_project(fixture.other.path()).is_empty(),
+            "a project Wasm plugin must not leak into another project"
+        );
+    }
+
+    #[test]
     fn a_project_sees_its_own_plugins_alongside_the_global_ones() {
         let fixture = fixture();
         let settings = PluginSettings {
@@ -831,6 +1184,7 @@ mod tests {
                 project_key(fixture.project.path()),
                 vec!["repo-triage@my-team".into()],
             )]),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(
             fixture.home.path(),
@@ -866,6 +1220,7 @@ mod tests {
                 project_key(fixture.project.path()),
                 vec!["repo-triage@my-team".into()],
             )]),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(
             fixture.home.path(),
@@ -897,6 +1252,7 @@ mod tests {
                 project_key(fixture.project.path()),
                 vec!["figma@personal".into()],
             )]),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(
             fixture.home.path(),
@@ -920,6 +1276,7 @@ mod tests {
         let settings = PluginSettings {
             plugins: settings::entries(&["repo-triage@my-team"]),
             projects: BTreeMap::new(),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(
             fixture.home.path(),
@@ -949,6 +1306,7 @@ mod tests {
                 project_key(fixture.project.path()),
                 vec!["pinned@personal".into()],
             )]),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(
             fixture.home.path(),
@@ -984,6 +1342,7 @@ mod tests {
         let settings = PluginSettings {
             plugins: settings::entries(&["figma@openai-curated"]),
             projects: BTreeMap::new(),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(home.path(), &[], &settings);
 
@@ -1005,6 +1364,7 @@ mod tests {
         let settings = PluginSettings {
             plugins: settings::entries(&["computer-use@openai-bundled"]),
             projects: BTreeMap::new(),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(home.path(), &[], &settings);
 
@@ -1030,6 +1390,7 @@ mod tests {
         let settings = PluginSettings {
             plugins: settings::entries(&["figma@personal"]),
             projects: BTreeMap::new(),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(fixture.home.path(), &[], &settings);
 
@@ -1063,6 +1424,7 @@ mod tests {
         let settings = PluginSettings {
             plugins: settings::entries(&["withdrawn@personal"]),
             projects: BTreeMap::new(),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(home.path(), &[], &settings);
 
@@ -1075,6 +1437,7 @@ mod tests {
         let settings = PluginSettings {
             plugins: settings::entries(&["computer-use@openai-bundled"]),
             projects: BTreeMap::new(),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(fixture.home.path(), &[], &settings);
 
@@ -1097,6 +1460,7 @@ mod tests {
                 "malformed-id",
             ]),
             projects: BTreeMap::new(),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(fixture.home.path(), &[], &settings);
 
@@ -1128,6 +1492,7 @@ mod tests {
         let settings = PluginSettings {
             plugins: settings::entries(&["broken@personal", "figma@personal"]),
             projects: BTreeMap::new(),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(fixture.home.path(), &[], &settings);
 
@@ -1151,62 +1516,11 @@ mod tests {
         let settings = PluginSettings {
             plugins: settings::entries(&["x@stray"]),
             projects: BTreeMap::new(),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(home.path(), &[], &settings);
 
         assert!(catalogue.for_project(Path::new("/any")).is_empty());
-    }
-
-    #[test]
-    fn a_plugins_mcp_servers_load_alongside_its_skills() {
-        let fixture = fixture();
-        write_mcp(
-            &fixture.project.path().join("plugins/repo-triage"),
-            r#"{"mcpServers":{"triage":{"command":"python","args":["./s.py"],"cwd":"."}}}"#,
-        );
-
-        let settings = PluginSettings {
-            plugins: BTreeMap::new(),
-            projects: BTreeMap::from([(
-                project_key(fixture.project.path()),
-                vec!["repo-triage@my-team".into()],
-            )]),
-        };
-        let catalogue = discover(
-            fixture.home.path(),
-            &[fixture.project.path().to_path_buf()],
-            &settings,
-        );
-
-        let plugins = catalogue.for_project(fixture.project.path());
-        let triage = plugins
-            .iter()
-            .find(|plugin| plugin.id == "repo-triage@my-team")
-            .expect("the project's own plugin loads");
-
-        assert_eq!(triage.mcp_servers.len(), 1);
-        assert_eq!(
-            triage.mcp_servers["triage"].command.as_deref(),
-            Some("python"),
-            "the server is carried on the plugin, not resolved at discovery time"
-        );
-    }
-
-    #[test]
-    fn a_plugin_with_no_mcp_file_has_no_servers() {
-        // The common case, and it must not be an error: most plugins bring no
-        // server, and one that does not must still load its skills.
-        let fixture = fixture();
-        let settings = PluginSettings {
-            plugins: settings::entries(&["figma@personal"]),
-            projects: BTreeMap::new(),
-        };
-        let catalogue = discover(fixture.home.path(), &[], &settings);
-
-        let plugins = catalogue.for_project(Path::new("/any"));
-        assert_eq!(ids(&plugins), vec!["figma@personal"]);
-        assert!(plugins[0].mcp_servers.is_empty());
-        assert_eq!(plugins[0].skills.len(), 1, "the skills still load");
     }
 
     #[test]
@@ -1282,6 +1596,7 @@ mod tests {
                 project_key(fixture.project.path()),
                 vec!["figma@personal".into()],
             )]),
+            disabled_projects: BTreeMap::new(),
         };
         config.plugins.insert(
             "figma@personal".into(),
@@ -1306,6 +1621,7 @@ mod tests {
                 project_key(fixture.project.path()),
                 vec!["repo-triage@my-team".into()],
             )]),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(
             fixture.home.path(),
@@ -1330,6 +1646,7 @@ mod tests {
         let settings = PluginSettings {
             plugins: BTreeMap::new(),
             projects: BTreeMap::from([(with_separator, vec!["repo-triage@my-team".into()])]),
+            disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(
             fixture.home.path(),
@@ -1344,62 +1661,37 @@ mod tests {
     }
 
     #[test]
-    fn the_real_figma_plugin_loads_its_hooks_and_agents_from_this_machines_install() {
+    fn a_plugin_without_a_wasmtime_runtime_is_not_loaded() {
         // Not a fixture: the plugin Codex actually cached, so the shapes the
         // unit tests encode are the shapes that ship, and the wiring from a
         // plugin root to `LoadedPlugin` is exercised end to end. Skipped where
         // figma is absent, so the suite still passes on a machine that has
         // never run Codex.
-        let Some(home) = directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
-        else {
-            return;
-        };
-        if !home
-            .join(".codex/plugins/cache/openai-curated/figma")
-            .is_dir()
-        {
-            return;
-        }
-
+        let fixture = fixture();
+        let root = fixture.home.path().join("plugins/no-runtime");
+        let manifest_dir = root.join(manifest::MANIFEST_DIR);
+        fs::create_dir_all(&manifest_dir).unwrap();
+        fs::write(
+            manifest_dir.join(manifest::MANIFEST_FILE),
+            r#"{"name":"no-runtime","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        write_marketplace(
+            fixture.home.path(),
+            "no-runtime-marketplace",
+            &[("no-runtime", "./plugins/no-runtime")],
+        );
         let settings = PluginSettings {
-            plugins: settings::entries(&["figma@openai-curated"]),
+            plugins: settings::entries(&["no-runtime@no-runtime-marketplace"]),
             projects: BTreeMap::new(),
-        };
-        let catalogue = discover(&home, &[], &settings);
-        let plugins = catalogue.for_project(Path::new("/any"));
-        let Some(figma) = plugins
-            .iter()
-            .find(|plugin| plugin.id == "figma@openai-curated")
-        else {
-            return;
+            disabled_projects: BTreeMap::new(),
         };
 
-        // The four roles figma ships, named by their files and sorted.
-        assert_eq!(
-            figma
-                .agents
-                .iter()
-                .map(|role| role.name.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "design-parity-review-agent",
-                "design-system-rules-agent",
-                "figma-code-connect-agent",
-                "figma-implementation-agent",
-            ]
-        );
         assert!(
-            figma
-                .agents
-                .iter()
-                .all(|role| !role.instructions.is_empty()),
-            "each role's body becomes a sub-agent's system prompt"
+            discover(fixture.home.path(), &[], &settings)
+                .for_project(Path::new("/any"))
+                .is_empty(),
+            "only Wasmtime component plugins belong in the catalogue"
         );
-
-        // One hook, matching the Codex names for an edit — which this agent
-        // spells `apply_patch`.
-        assert_eq!(figma.hooks.len(), 1);
-        assert_eq!(figma.hooks[0].pattern, "Write|Edit");
-        assert!(figma.hooks[0].matches("apply_patch"));
     }
 }

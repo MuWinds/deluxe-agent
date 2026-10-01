@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Read|Write|Edit|Bash|Shell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo hooks-provider-ran"
+          }
+        ]
+      }
+    ]
+  }
+}

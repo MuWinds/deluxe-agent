@@ -158,6 +158,7 @@ impl App {
         self.draw_settings(&ctx, &p, &mut intents);
         self.draw_about(&ctx, &p);
         self.draw_plugins(&ctx, &mut intents);
+        super::plugin_ui::draw(&ctx, self, &mut intents);
         self.draw_subagent_window(&ctx, &p, resources, &mut intents);
 
         let effects = self.apply_intents(intents);
@@ -1371,12 +1372,9 @@ impl App {
     /// typed a `/` for was invisible, and the log was the only place to find out
     /// whether an id had resolved at all.
     ///
-    /// Global scope only. A project's own plugins are a property of that
-    /// repository, and listing them here would answer a question about a project
-    /// the user may not be looking at.
-    ///
-    /// Each row expands to what the plugin brings and carries the two acts on
-    /// it: a switch, which is reversible, and an uninstall, which asks first.
+    /// Lists the global plugins and the plugins assigned to the displayed
+    /// project. Each row carries its exact scope so equal ids cannot operate on
+    /// the wrong installation.
     fn draw_plugins(&mut self, ctx: &egui::Context, intents: &mut Vec<UiIntent>) {
         if !self.show_plugins {
             return;
@@ -1387,6 +1385,7 @@ impl App {
         // land in `actions` and are applied once every borrow has been released,
         // the same shape the rest of the app uses.
         let mut pending = self.pending_uninstall.clone();
+        let project = self.displayed_project();
 
         let mut open = true;
         egui::Window::new("插件")
@@ -1394,9 +1393,55 @@ impl App {
             .default_width(620.0)
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.weak(
-                    "全局生效的插件，来自个人 marketplace 与 Codex 自带的 bundled marketplace。",
-                );
+                ui.horizontal(|ui| {
+                    ui.weak("所有插件都通过 Wasmtime Component 加载。");
+                    let refreshing = self.pending_plugin_request.is_some();
+                    let icon = if refreshing {
+                        icons::SPINNER_GAP
+                    } else {
+                        icons::ARROW_CLOCKWISE
+                    };
+                    if ui
+                        .add_enabled(
+                            !refreshing,
+                            egui::Button::new(RichText::new(icon).size(theme::font(15.0))),
+                        )
+                        .on_hover_text("重新扫描并加载 Wasmtime 插件")
+                        .clicked()
+                    {
+                        intents.push(UiIntent::RefreshPlugins);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let refreshing = self.pending_plugin_request.is_some();
+                    if ui
+                        .add_enabled(
+                            !refreshing,
+                            egui::Button::new(format!("{} 添加到全局", icons::PLUS)),
+                        )
+                        .on_hover_text("选择插件包中的 .wasm Component 并安装到全局")
+                        .clicked()
+                    {
+                        intents.push(UiIntent::AddPlugin {
+                            scope: plugins::Scope::Global,
+                        });
+                    }
+                    if ui
+                        .add_enabled(
+                            !refreshing,
+                            egui::Button::new(format!("{} 添加到当前项目", icons::PLUS)),
+                        )
+                        .on_hover_text("选择插件包中的 .wasm Component 并安装到当前项目")
+                        .clicked()
+                    {
+                        intents.push(UiIntent::AddPlugin {
+                            scope: plugins::Scope::Project(PathBuf::from(&project)),
+                        });
+                    }
+                });
+                if self.pending_plugin_request.is_some() {
+                    ui.weak("正在导入 Wasmtime Component…");
+                }
 
                 // Where a plugin action's failure is shown: on the page that
                 // performed it.
@@ -1406,28 +1451,76 @@ impl App {
                 }
                 ui.add_space(6.0);
 
-                let enabled = self.catalogue.global();
-                let disabled = self.catalogue.disabled();
+                let surfaces =
+                    super::view_model::plugin_surfaces(&self.catalogue, Path::new(&project));
+                if !surfaces.is_empty() {
+                    ui.label(
+                        RichText::new(format!("项目界面 · {}", project_name(&project))).strong(),
+                    );
+                    for surface in surfaces {
+                        if ui
+                            .button(format!("{} · {}", surface.display_name, surface.surface_id))
+                            .clicked()
+                        {
+                            intents.push(UiIntent::OpenPluginSurface {
+                                plugin_id: surface.plugin_id,
+                                surface_id: surface.surface_id,
+                            });
+                        }
+                    }
+                    ui.separator();
+                }
+                let global_enabled = self.catalogue.global();
+                let global_disabled = self.catalogue.disabled();
+                let project_enabled = self.catalogue.project(Path::new(&project));
+                let project_disabled = self.catalogue.disabled_for_project(Path::new(&project));
 
-                if enabled.is_empty() && disabled.is_empty() {
+                if global_enabled.is_empty()
+                    && global_disabled.is_empty()
+                    && project_enabled.is_empty()
+                    && project_disabled.is_empty()
+                {
                     ui.weak("没有已安装的插件。");
                     ui.add_space(4.0);
-                    ui.weak("用 Codex 安装一个插件后，它就会出现在这里。");
                     return;
                 }
 
-                if !enabled.is_empty() {
-                    ui.label(RichText::new(format!("已启用（{}）", enabled.len())).strong());
-                    for plugin in enabled {
+                if !global_enabled.is_empty() {
+                    ui.label(
+                        RichText::new(format!("全局已启用（{}）", global_enabled.len())).strong(),
+                    );
+                    for plugin in global_enabled {
                         draw_plugin_row(ui, plugin, true, &mut pending, intents);
                     }
                 }
 
-                if !disabled.is_empty() {
+                if !global_disabled.is_empty() {
                     ui.add_space(10.0);
-                    ui.label(RichText::new(format!("已停用（{}）", disabled.len())).strong());
-                    for plugin in disabled {
+                    ui.label(
+                        RichText::new(format!("全局已停用（{}）", global_disabled.len())).strong(),
+                    );
+                    for plugin in global_disabled {
                         draw_plugin_row(ui, plugin, false, &mut pending, intents);
+                    }
+                }
+
+                if !project_enabled.is_empty() || !project_disabled.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(format!("项目已启用 · {}", project_name(&project))).strong(),
+                    );
+                    for plugin in project_enabled {
+                        draw_plugin_row(ui, plugin, true, &mut pending, intents);
+                    }
+                    if !project_disabled.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(format!("项目已停用 · {}", project_name(&project)))
+                                .strong(),
+                        );
+                        for plugin in project_disabled {
+                            draw_plugin_row(ui, plugin, false, &mut pending, intents);
+                        }
                     }
                 }
             });
@@ -1451,7 +1544,7 @@ fn draw_plugin_row(
     ui: &mut egui::Ui,
     plugin: &plugins::LoadedPlugin,
     enabled: bool,
-    pending: &mut Option<String>,
+    pending: &mut Option<(String, plugins::Scope)>,
     intents: &mut Vec<UiIntent>,
 ) {
     let version = plugin.manifest.version.as_deref().unwrap_or("版本未知");
@@ -1463,7 +1556,7 @@ fn draw_plugin_row(
     };
 
     egui::CollapsingHeader::new(header)
-        .id_salt(&plugin.id)
+        .id_salt((&plugin.id, &plugin.scope))
         .default_open(false)
         .show(ui, |ui| {
             if let Some(summary) = plugin.summary() {
@@ -1477,6 +1570,15 @@ fn draw_plugin_row(
                 ui.weak("目录");
                 ui.monospace(plugin.root.display().to_string());
             });
+            ui.horizontal(|ui| {
+                ui.weak("作用域");
+                match &plugin.scope {
+                    plugins::Scope::Global => ui.label("全局"),
+                    plugins::Scope::Project(project) => {
+                        ui.monospace(format!("项目 {}", project.display()))
+                    }
+                };
+            });
 
             draw_plugin_contents(ui, plugin);
 
@@ -1485,19 +1587,26 @@ fn draw_plugin_row(
                 if ui.button(if enabled { "停用" } else { "启用" }).clicked() {
                     intents.push(UiIntent::SetPluginEnabled {
                         id: plugin.id.clone(),
+                        scope: plugin.scope.clone(),
                         enabled: !enabled,
                     });
                 }
                 if ui.button("卸载").clicked() {
-                    *pending = Some(plugin.id.clone());
+                    *pending = Some((plugin.id.clone(), plugin.scope.clone()));
                 }
             });
 
-            if pending.as_deref() == Some(plugin.id.as_str()) {
+            let is_pending = pending
+                .as_ref()
+                .is_some_and(|(id, scope)| id == &plugin.id && scope == &plugin.scope);
+            if is_pending {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("确认卸载？").color(BAD_RED));
                     if ui.button("确认").clicked() {
-                        intents.push(UiIntent::UninstallPlugin(plugin.id.clone()));
+                        intents.push(UiIntent::UninstallPlugin {
+                            id: plugin.id.clone(),
+                            scope: plugin.scope.clone(),
+                        });
                         *pending = None;
                     }
                     if ui.button("取消").clicked() {
@@ -1516,7 +1625,11 @@ fn draw_plugin_row(
 /// skills might be the wrong two. A plugin that brings nothing still says so,
 /// so an empty body is never mistaken for a failed load.
 fn draw_plugin_contents(ui: &mut egui::Ui, plugin: &plugins::LoadedPlugin) {
-    let sections: [(&str, Vec<&str>); 5] = [
+    let Some(runtime) = plugin.manifest.wasm_runtime() else {
+        ui.weak("插件没有有效的 Wasmtime runtime");
+        return;
+    };
+    let mut sections: Vec<(&str, Vec<&str>)> = vec![
         (
             "技能",
             plugin.skills.iter().map(|s| s.name.as_str()).collect(),
@@ -1526,20 +1639,32 @@ fn draw_plugin_contents(ui: &mut egui::Ui, plugin: &plugins::LoadedPlugin) {
             plugin.commands.iter().map(|c| c.name.as_str()).collect(),
         ),
         (
-            "钩子",
-            plugin.hooks.iter().map(|h| h.pattern.as_str()).collect(),
-        ),
-        (
             "子代理",
             plugin.agents.iter().map(|a| a.name.as_str()).collect(),
         ),
-        (
-            "MCP",
-            plugin.mcp_servers.keys().map(String::as_str).collect(),
-        ),
     ];
+    let mut any = true;
+    ui.horizontal_wrapped(|ui| {
+        ui.weak("运行时：");
+        ui.label(RichText::new("Wasmtime").strong());
+    });
 
-    let mut any = false;
+    let mut capabilities = Vec::new();
+    match runtime.provider {
+        plugins::ProviderKind::Hooks => capabilities.push("Hooks provider"),
+        plugins::ProviderKind::Mcp => capabilities.push("MCP provider"),
+        plugins::ProviderKind::General => {}
+    }
+    if !runtime.permissions.invoke_tools.is_empty() {
+        capabilities.push("工具");
+    }
+    if !runtime.ui.surfaces.is_empty() {
+        capabilities.push("插件界面");
+    }
+    if !capabilities.is_empty() {
+        sections.push(("能力", capabilities));
+    }
+
     for (label, items) in sections {
         if items.is_empty() {
             continue;
@@ -1551,7 +1676,7 @@ fn draw_plugin_contents(ui: &mut egui::Ui, plugin: &plugins::LoadedPlugin) {
         });
     }
     if !any {
-        ui.weak("不含技能、命令、钩子、子代理或 MCP server");
+        ui.weak("Wasmtime 插件没有声明式内容或 runtime capability");
     }
 }
 

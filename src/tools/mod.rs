@@ -265,6 +265,17 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    /// Creates an empty registry that shares an existing background job runtime.
+    ///
+    /// Provider-loaded tools use this when native capability dispatch and the
+    /// final agent registry must observe the same `exec` and `task` jobs.
+    pub fn empty_with_jobs(jobs: Arc<JobRegistry>) -> Self {
+        Self {
+            tools: BTreeMap::new(),
+            jobs,
+        }
+    }
+
     /// The registry every agent starts from: `read_file`, `list_dir`, `exec`,
     /// `apply_patch` and the three `job_*` tools, sharing one job runtime.
     pub fn with_builtins() -> Self {

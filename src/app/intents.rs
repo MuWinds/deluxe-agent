@@ -11,8 +11,18 @@ use uuid::Uuid;
 use crate::theme::ThemeChoice;
 
 /// A user action collected during one render pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) enum UiIntent {
+    OpenPluginSurface {
+        plugin_id: String,
+        surface_id: String,
+    },
+    PluginUiAction(crate::plugins::ui_protocol::PluginUiAction),
+    ClosePluginSurface,
+    RefreshPlugins,
+    AddPlugin {
+        scope: crate::plugins::Scope,
+    },
     Quit,
     NewSession,
     SelectSession(Uuid),
@@ -30,8 +40,15 @@ pub(super) enum UiIntent {
     SetTheme(ThemeChoice),
     SetSidebarVisible(bool),
     CopyTranscript,
-    SetPluginEnabled { id: String, enabled: bool },
-    UninstallPlugin(String),
+    SetPluginEnabled {
+        id: String,
+        scope: crate::plugins::Scope,
+        enabled: bool,
+    },
+    UninstallPlugin {
+        id: String,
+        scope: crate::plugins::Scope,
+    },
     AddProject,
     RemoveProject(String),
     PasteImage,

@@ -48,7 +48,6 @@ impl SubagentRunner for NativeSubagentRunner {
             self.llm.clone(),
             self.registry.clone(),
             self.settings.clone(),
-            Vec::new(),
             Arc::new(crate::runtime::prompt::NativePromptProvider::new()),
         ));
         let tools = services.tools.descriptors();

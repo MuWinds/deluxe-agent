@@ -1,5 +1,6 @@
 # Rust build artifacts — `target/` is several GB, never commit it.
 /target
+plugin-fixtures/**/target
 
 # Stray build logs left at the repo root.
 /build.log

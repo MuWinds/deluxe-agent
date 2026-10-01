@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::error::Result;
 use crate::llm::{AssistantTurn, Message, ThinkingLevel, ToolCall};
-use crate::plugins::{PluginCatalogue, PluginSettings};
+use crate::plugins::{PluginCatalogue, PluginSettings, Scope};
 use crate::session::Session;
 use crate::tools::jobs::JobSnapshot;
 use crate::tools::{ToolDescriptor, ToolOutput};
@@ -59,7 +59,6 @@ pub struct ToolContext {
     pub working_directory: PathBuf,
     pub timeout: Duration,
     pub max_output_chars: usize,
-    pub block_destructive_commands: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -191,8 +190,26 @@ pub trait PluginManager: Send + Sync {
         settings: PluginSettings,
     ) -> Result<Arc<PluginCatalogue>>;
 
+    /// Imports a Wasmtime component or its plugin root into the managed cache.
+    async fn install_local(&self, component_path: PathBuf) -> Result<InstalledPlugin>;
+
+    /// Removes a cache directory created by an import that failed afterward.
+    async fn discard_install(&self, root: PathBuf) -> Result<()>;
+
     /// Removes a cached plugin copy, leaving local and bundled sources intact.
-    async fn uninstall(&self, id: &str, catalogue: Arc<PluginCatalogue>) -> Result<()>;
+    async fn uninstall(
+        &self,
+        id: &str,
+        scope: &Scope,
+        catalogue: Arc<PluginCatalogue>,
+    ) -> Result<()>;
+}
+
+#[derive(Debug, Clone)]
+pub struct InstalledPlugin {
+    pub id: String,
+    pub root: PathBuf,
+    pub copied: bool,
 }
 
 pub trait AgentEventSink: Send + Sync {

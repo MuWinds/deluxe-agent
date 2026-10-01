@@ -22,10 +22,12 @@ use crate::attachments::ImageRef;
 use crate::context::ContextSettings;
 use crate::error::AgentError;
 use crate::harness::services::native_services;
-use crate::harness::{AgentEvent, AgentEventSink, PromptAgent, PromptContext, PromptSkill};
+use crate::harness::{AgentEvent, AgentEventSink, HookRuntime, PromptContext};
 use crate::ipc::{AuditOutcome, Event};
 use crate::llm::{LlmClient, Message};
-use crate::plugins::{hooks, LoadedPlugin, PluginManifest, Scope};
+use crate::plugins::capabilities::CapabilityHub;
+use crate::plugins::providers::WasmHookRuntime;
+use crate::plugins::wasm_runtime::{ComponentActor, ProviderInputs};
 use crate::tools::{to_openai_tools_from_descriptors, ToolRegistry, ToolSettings};
 
 /// Collects everything the agent emits, so a test can assert on the sequence.
@@ -320,7 +322,6 @@ fn agent_with_registry(
             working_directory: directory.to_path_buf(),
             ..ToolSettings::default()
         },
-        &[],
     )
 }
 
@@ -330,51 +331,39 @@ fn agent_with_settings(
     directory: &std::path::Path,
     context: ContextSettings,
     settings: ToolSettings,
-    plugins: &[&LoadedPlugin],
+) -> Agent {
+    agent_with_settings_and_hooks(
+        registry,
+        server,
+        directory,
+        context,
+        settings,
+        Arc::new(WasmHookRuntime::empty()),
+    )
+}
+
+fn agent_with_settings_and_hooks(
+    registry: ToolRegistry,
+    server: &FakeServer,
+    directory: &std::path::Path,
+    context: ContextSettings,
+    settings: ToolSettings,
+    hooks: Arc<dyn HookRuntime>,
 ) -> Agent {
     let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, Some(0))
         .expect("the client builds");
-    let services = Arc::new(native_services(
+    let mut native = native_services(
         client,
         Arc::new(registry),
         Arc::new(tokio::sync::RwLock::new(settings)),
-        plugins
-            .iter()
-            .flat_map(|plugin| plugin.hooks.iter().cloned())
-            .collect(),
         Arc::new(crate::runtime::prompt::NativePromptProvider::new()),
-    ));
-    let roles: Vec<PromptAgent> = plugins
-        .iter()
-        .flat_map(|plugin| plugin.agents.iter())
-        .map(|role| PromptAgent {
-            name: role.name.clone(),
-            description: role.description.clone(),
-            plugin: role.plugin.clone(),
-        })
-        .collect();
+    );
+    native.hooks = hooks;
+    let services = Arc::new(native);
     let prompt_context = PromptContext {
         tools: services.tools.descriptors(),
-        skills: plugins
-            .iter()
-            .flat_map(|plugin| plugin.skills.iter())
-            .map(|skill| PromptSkill {
-                name: skill.name.clone(),
-                description: skill.description.clone(),
-                path: skill.path.clone(),
-                plugin: skill.plugin.clone(),
-            })
-            .collect(),
-        agents: if services
-            .tools
-            .descriptors()
-            .iter()
-            .any(|tool| tool.name == "task")
-        {
-            roles
-        } else {
-            Vec::new()
-        },
+        skills: Vec::new(),
+        agents: Vec::new(),
         project_instructions: crate::runtime::prompt::read_project_instructions(directory),
     };
     let system_prompt = services
@@ -388,72 +377,62 @@ fn agent_for(server: &FakeServer, directory: &std::path::Path) -> Agent {
     agent_for_with_context(server, directory, ContextSettings::default())
 }
 
-/// Builds an agent over an explicit registry and set of plugins.
-///
-/// The plugin-carrying twin of [`agent_with_registry`], for the parts of the
-/// loop a plugin drives — currently the `PostToolUse` hooks.
-fn agent_with_plugins(
+async fn fixture_hook_runtime(
+    project: &std::path::Path,
+    settings: &ToolSettings,
+) -> Arc<dyn HookRuntime> {
+    let manifest = serde_json::from_str::<crate::plugins::PluginManifest>(include_str!(
+        "../plugin-fixtures/echo-tool/.codex-plugin/plugin.json"
+    ))
+    .expect("the checked-in fixture manifest is valid")
+    .wasm_runtime()
+    .expect("the fixture declares a Wasm runtime");
+    let host_tools = Arc::new(crate::harness::services::RegistryToolRuntime::new(
+        Arc::new(ToolRegistry::with_builtins()),
+        Arc::new(tokio::sync::RwLock::new(settings.clone())),
+    ));
+    let hub = CapabilityHub::new(
+        project.to_path_buf(),
+        project.to_path_buf(),
+        manifest.permissions.clone(),
+        Default::default(),
+        host_tools,
+    )
+    .expect("the fixture host capabilities are valid");
+    let actor = ComponentActor::load_bytes(
+        include_bytes!("../plugin-fixtures/echo-tool/plugin.wasm"),
+        project.to_path_buf(),
+        manifest,
+        ProviderInputs {
+            hooks_json: Some(include_str!("../plugin-fixtures/echo-tool/hooks.json").into()),
+            ..Default::default()
+        },
+        hub,
+    )
+    .await
+    .expect("the checked-in hook component loads");
+    Arc::new(
+        WasmHookRuntime::load([("hooky@test".to_string(), actor)])
+            .await
+            .expect("the fixture hook declaration is valid"),
+    )
+}
+
+async fn agent_with_fixture_hooks(
     registry: ToolRegistry,
     server: &FakeServer,
     directory: &std::path::Path,
-    plugins: &[&LoadedPlugin],
+    settings: ToolSettings,
 ) -> Agent {
-    let settings = ToolSettings {
-        working_directory: directory.to_path_buf(),
-        ..ToolSettings::default()
-    };
-    agent_with_settings(
+    let hooks = fixture_hook_runtime(directory, &settings).await;
+    agent_with_settings_and_hooks(
         registry,
         server,
         directory,
         ContextSettings::default(),
         settings,
-        plugins,
+        hooks,
     )
-}
-
-/// A plugin with one `PostToolUse` hook, built the way discovery builds one.
-///
-/// The hook is read from a real `hooks.json` rather than assembled by hand,
-/// because `Hook` keeps its compiled matcher private — and because loading it is
-/// what the running agent does.
-fn plugin_with_hook(root: &std::path::Path, matcher: &str, command: &str) -> LoadedPlugin {
-    std::fs::write(
-        root.join("hooks.json"),
-        format!(
-            r#"{{"hooks":{{"PostToolUse":[{{"matcher":"{matcher}","hooks":[
-                 {{"type":"command","command":"{command}"}}]}}]}}}}"#
-        ),
-    )
-    .expect("the hooks file is written");
-
-    LoadedPlugin {
-        id: "hooky@test".into(),
-        scope: Scope::Global,
-        root: root.to_path_buf(),
-        manifest: PluginManifest {
-            name: "hooky".into(),
-            version: None,
-            description: None,
-            skills: None,
-            interface: None,
-        },
-        skills: Vec::new(),
-        commands: Vec::new(),
-        hooks: hooks::load("hooky@test", root),
-        agents: Vec::new(),
-        mcp_servers: Default::default(),
-    }
-}
-
-/// A command that prints `hook-ran` in whichever shell this platform defaults
-/// to, so the hook test runs the way a real hook would.
-fn echo_hook_command() -> &'static str {
-    if cfg!(windows) {
-        "Write-Output 'hook-ran'"
-    } else {
-        "echo hook-ran"
-    }
 }
 
 #[tokio::test]
@@ -552,11 +531,6 @@ async fn a_post_tool_use_hook_runs_and_its_output_joins_the_tool_result() {
     let directory = tempfile::tempdir().expect("a temp directory is available");
     std::fs::write(directory.path().join("note.txt"), "hello\n").expect("the file is written");
 
-    // `Read` is the Codex spelling of this agent's `read_file`, so this proves
-    // the alias table on the wire, not only in the unit test beside it.
-    let plugin_root = tempfile::tempdir().expect("a temp directory is available");
-    let plugin = plugin_with_hook(plugin_root.path(), "Read", echo_hook_command());
-
     let server = FakeServer::start(two_turns(
         json!({
             "index": 0,
@@ -568,12 +542,16 @@ async fn a_post_tool_use_hook_runs_and_its_output_joins_the_tool_result() {
     ))
     .await;
 
-    let agent = agent_with_plugins(
+    let agent = agent_with_fixture_hooks(
         ToolRegistry::with_builtins(),
         &server,
         directory.path(),
-        &[&plugin],
-    );
+        ToolSettings {
+            working_directory: directory.path().to_path_buf(),
+            ..ToolSettings::default()
+        },
+    )
+    .await;
     let sink = CollectingSink::default();
 
     let _ = agent
@@ -602,8 +580,8 @@ async fn a_post_tool_use_hook_runs_and_its_output_joins_the_tool_result() {
         "the hook is named in the result the model reads: {output}"
     );
     assert!(
-        output.contains("hook-ran"),
-        "the hook's own output joins the result: {output}"
+        output.contains("wasm-hook-ran"),
+        "the Wasm provider's output joins the result: {output}"
     );
 }
 
@@ -612,27 +590,27 @@ async fn a_hook_whose_matcher_does_not_match_the_tool_stays_out() {
     let directory = tempfile::tempdir().expect("a temp directory is available");
     std::fs::write(directory.path().join("note.txt"), "hello\n").expect("the file is written");
 
-    // `Bash` is `exec`'s Codex name, so this hook must not fire for a read.
-    let plugin_root = tempfile::tempdir().expect("a temp directory is available");
-    let plugin = plugin_with_hook(plugin_root.path(), "Bash", echo_hook_command());
-
     let server = FakeServer::start(two_turns(
         json!({
             "index": 0,
             "id": "call_1",
             "type": "function",
-            "function": { "name": "read_file", "arguments": "{\"path\":\"note.txt\"}" },
+            "function": { "name": "list_dir", "arguments": "{\"path\":\".\"}" },
         }),
         "done",
     ))
     .await;
 
-    let agent = agent_with_plugins(
+    let agent = agent_with_fixture_hooks(
         ToolRegistry::with_builtins(),
         &server,
         directory.path(),
-        &[&plugin],
-    );
+        ToolSettings {
+            working_directory: directory.path().to_path_buf(),
+            ..ToolSettings::default()
+        },
+    )
+    .await;
     let sink = CollectingSink::default();
 
     let _ = agent
@@ -650,21 +628,16 @@ async fn a_hook_whose_matcher_does_not_match_the_tool_stays_out() {
         .await
         .expect("the run completes");
 
-    let (_, output) = sink.tool_output("read_file").expect("the call finished");
+    let (_, output) = sink.tool_output("list_dir").expect("the call finished");
     assert!(
-        !output.contains("hook-ran"),
-        "a hook must not run for a tool it does not match: {output}"
+        !output.contains("wasm-hook-ran"),
+        "a Wasm hook must not run for a tool it does not match: {output}"
     );
 }
 
 #[tokio::test]
 async fn a_refused_call_does_not_fire_its_hook() {
     let directory = tempfile::tempdir().expect("a temp directory is available");
-
-    // `Bash` is `exec`'s Codex name, so this hook *would* fire for the command
-    // below — if the guard ever let the command run.
-    let plugin_root = tempfile::tempdir().expect("a temp directory is available");
-    let plugin = plugin_with_hook(plugin_root.path(), "Bash", echo_hook_command());
 
     let server = FakeServer::start(two_turns(
         json!({
@@ -677,12 +650,16 @@ async fn a_refused_call_does_not_fire_its_hook() {
     ))
     .await;
 
-    let agent = agent_with_plugins(
+    let agent = agent_with_fixture_hooks(
         ToolRegistry::with_builtins(),
         &server,
         directory.path(),
-        &[&plugin],
-    );
+        ToolSettings {
+            working_directory: directory.path().to_path_buf(),
+            ..ToolSettings::default()
+        },
+    )
+    .await;
     let sink = CollectingSink::default();
 
     let _ = agent
@@ -707,8 +684,8 @@ async fn a_refused_call_does_not_fire_its_hook() {
         "the guard must have refused it"
     );
     assert!(
-        !output.contains("hook-ran"),
-        "a refused call is not a tool use, so its hook must not describe one: {output}"
+        !output.contains("wasm-hook-ran"),
+        "a refused call is not a tool use, so its Wasm hook must not describe one: {output}"
     );
 }
 
@@ -1437,7 +1414,6 @@ async fn turning_the_guard_off_lets_a_destructive_command_through() {
         directory.path(),
         ContextSettings::default(),
         settings,
-        &[],
     );
     let sink = CollectingSink::default();
 

@@ -1,0 +1,20 @@
+{
+  "name": "hooks-provider",
+  "version": "0.1.0",
+  "interface": {
+    "displayName": "Hooks",
+    "shortDescription": "Wasmtime hook provider"
+  },
+  "runtime": {
+    "type": "wasm",
+    "provider": "hooks",
+    "module": "plugin.wasm",
+    "apiVersion": "deluxe.harness/plugin@0.1",
+    "ui": {
+      "surfaces": ["hooks"]
+    },
+    "permissions": {
+      "invokeTools": ["exec"]
+    }
+  }
+}

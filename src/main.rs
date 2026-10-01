@@ -27,6 +27,8 @@ use harness::{
     NativeSecretStore, PluginManager, SecretStore, SessionStore,
 };
 use ipc::{Cmd, Event, JobView, LlmSettings, RunId};
+use plugins::runtime::{PluginUiEvent, PluginUiExecutor, SurfaceHandle};
+use plugins::ui_protocol::SurfaceRequest;
 use plugins::PluginCatalogue;
 use runtime::project::{ProjectRuntime, ProjectRuntimeFactory, RuntimeModelSettings};
 use tools::ToolSettings;
@@ -45,7 +47,6 @@ mod image_ops;
 mod ipc;
 mod llm;
 mod markdown;
-mod mcp;
 mod plugins;
 mod process;
 mod runtime;
@@ -95,11 +96,9 @@ fn main() -> eframe::Result<()> {
         }
     };
 
-    // Plugins are discovered once, here, for the same reason the config and the
-    // sessions are: the first frame's agent already needs its skill catalogue,
-    // and a marketplace file does not change while the window is open. The home
-    // directory is passed in rather than looked up inside, so a test can point
-    // discovery at a temp directory instead of the real `~/.agents`.
+    // Plugins are discovered before the first frame so the first agent and the
+    // first page have a catalogue immediately. The page can request another
+    // discovery later when Codex installs or updates a component.
     let home = directories::UserDirs::new()
         .map(|dirs| dirs.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
@@ -225,6 +224,7 @@ fn spawn_worker(
         // context files are read from there) and every tool's working
         // directory.
         let mut runtimes: HashMap<PathBuf, Arc<ProjectRuntime>> = HashMap::new();
+        let mut surfaces: HashMap<SurfaceRequest, SurfaceHandle> = HashMap::new();
         let factory = ProjectRuntimeFactory::new(worker.settings.clone(), Arc::new(sink.clone()));
         // The model settings the GUI wants. Pushed before the first run and on
         // every settings save; `None` only until then.
@@ -232,6 +232,207 @@ fn spawn_worker(
 
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
+                Cmd::OpenPluginSurface(request) => {
+                    let declaration = worker
+                        .plugins
+                        .for_project(&request.project)
+                        .into_iter()
+                        .find(|plugin| plugin.id == request.plugin_id)
+                        .and_then(|plugin| {
+                            plugin.manifest.wasm_runtime().map(|manifest| {
+                                (
+                                    plugin.root.clone(),
+                                    manifest,
+                                    plugins::wasm_runtime::ProviderInputs {
+                                        hooks_json: plugin.hooks_json.clone(),
+                                        mcp_json: plugin.mcp_json.clone(),
+                                    },
+                                    plugin.mcp_servers.clone(),
+                                )
+                            })
+                        });
+                    let Some((root, manifest, inputs, mcp_servers)) =
+                        declaration.filter(|(_, manifest, _, _)| {
+                            manifest.ui.surfaces.contains(&request.surface_id)
+                        })
+                    else {
+                        sink.emit_ui(Event::PluginUiFailed {
+                            request,
+                            message: "Plugin surface is disabled, out of scope, or undeclared"
+                                .into(),
+                        });
+                        continue;
+                    };
+                    if surfaces.len() >= 16 {
+                        sink.emit_ui(Event::PluginUiFailed {
+                            request,
+                            message: "Too many open plugin surfaces".into(),
+                        });
+                        continue;
+                    }
+                    let cached = runtimes
+                        .get(&request.project)
+                        .and_then(|runtime| runtime.component(&request.plugin_id));
+                    let host_tools: Arc<dyn harness::ports::ToolRuntime> = runtimes
+                        .get(&request.project)
+                        .map(|runtime| runtime.host_tools.clone())
+                        .unwrap_or_else(|| {
+                            factory
+                                .host_capabilities(
+                                    &request.project,
+                                    llm_settings
+                                        .as_ref()
+                                        .is_some_and(LlmSettings::supports_images),
+                                )
+                                .runtime
+                        });
+                    let hub = match plugins::capabilities::CapabilityHub::new(
+                        request.project.clone(),
+                        root.clone(),
+                        manifest.permissions.clone(),
+                        mcp_servers,
+                        host_tools,
+                    ) {
+                        Ok(hub) => hub,
+                        Err(error) => {
+                            sink.emit_ui(Event::PluginUiFailed {
+                                request,
+                                message: error.to_string(),
+                            });
+                            continue;
+                        }
+                    };
+                    let actions = manifest.ui.actions.clone();
+                    let load = async move {
+                        let actor = match cached {
+                            Some(actor) => actor,
+                            None => {
+                                plugins::wasm_runtime::ComponentActor::load(
+                                    root, manifest, inputs, hub,
+                                )
+                                .await?
+                            }
+                        };
+                        Ok(Box::new(plugins::wasm::WasmUiExecutor::new(actor))
+                            as Box<dyn PluginUiExecutor>)
+                    };
+                    let event_sink = sink.clone();
+                    let emit = Arc::new(move |event| {
+                        event_sink.emit_ui(match event {
+                            PluginUiEvent::Updated { request, document } => {
+                                Event::PluginUiUpdated { request, document }
+                            }
+                            PluginUiEvent::Failed { request, message } => {
+                                Event::PluginUiFailed { request, message }
+                            }
+                            PluginUiEvent::Closed { request } => Event::PluginUiClosed { request },
+                        })
+                    });
+                    let handle =
+                        plugins::runtime::spawn_surface(request.clone(), actions, load, emit);
+                    surfaces.insert(request, handle);
+                }
+                Cmd::PluginUiAction(action) => {
+                    if let Some(surface) = surfaces.get(&action.surface) {
+                        let request = action.surface.clone();
+                        if let Err(error) = surface.action(action) {
+                            sink.emit_ui(Event::PluginUiFailed {
+                                request,
+                                message: error.to_string(),
+                            });
+                        }
+                    }
+                }
+                Cmd::ClosePluginSurface(request) => {
+                    surfaces.remove(&request);
+                }
+                Cmd::InstallPlugin {
+                    request_id,
+                    component_path,
+                    scope,
+                    config,
+                } => {
+                    let result = async {
+                        let installed = worker.plugin_manager.install_local(component_path).await?;
+                        let mut config = *config;
+                        match &scope {
+                            plugins::Scope::Global => {
+                                config.plugins.set_enabled(&installed.id, true);
+                            }
+                            plugins::Scope::Project(project) => {
+                                config
+                                    .plugins
+                                    .set_project_enabled(project, &installed.id, true);
+                            }
+                        }
+                        config.plugins.normalize();
+                        let projects: Vec<PathBuf> =
+                            config.projects.iter().map(PathBuf::from).collect();
+                        let plugins = match worker
+                            .plugin_manager
+                            .discover(projects, config.plugins.clone())
+                            .await
+                        {
+                            Ok(plugins) => plugins,
+                            Err(error) => {
+                                if installed.copied {
+                                    let _ = worker
+                                        .plugin_manager
+                                        .discard_install(installed.root.clone())
+                                        .await;
+                                }
+                                return Err(error);
+                            }
+                        };
+                        if let Err(error) = worker.config_store.save(&config).await {
+                            if installed.copied {
+                                let _ = worker.plugin_manager.discard_install(installed.root).await;
+                            }
+                            return Err(error);
+                        }
+                        Ok::<_, crate::error::AgentError>((config, plugins))
+                    }
+                    .await;
+
+                    match result {
+                        Ok((config, plugins)) => {
+                            surfaces.clear();
+                            invalidate_runtimes(&mut runtimes, &active).await;
+                            worker.plugins = plugins.clone();
+                            sink.emit_ui(Event::PluginInstalled {
+                                request_id,
+                                config: Box::new(config),
+                                catalogue: plugins,
+                            });
+                        }
+                        Err(error) => sink.emit_ui(Event::PluginOperationFailed {
+                            request_id,
+                            message: error.to_string(),
+                        }),
+                    }
+                }
+                Cmd::RefreshPlugins {
+                    request_id,
+                    projects,
+                    settings,
+                } => {
+                    let result = worker.plugin_manager.discover(projects, settings).await;
+                    match result {
+                        Ok(plugins) => {
+                            surfaces.clear();
+                            invalidate_runtimes(&mut runtimes, &active).await;
+                            worker.plugins = plugins.clone();
+                            sink.emit_ui(Event::PluginsUpdated {
+                                request_id,
+                                catalogue: plugins,
+                            });
+                        }
+                        Err(error) => sink.emit_ui(Event::PluginOperationFailed {
+                            request_id,
+                            message: error.to_string(),
+                        }),
+                    }
+                }
                 Cmd::SetToolSettings(settings) => {
                     *worker.settings.write().await = *settings;
                 }
@@ -245,7 +446,7 @@ fn spawn_worker(
                     // stale. A settings push that changes nothing — the theme
                     // toggle saves too — keeps the cache instead.
                     if llm_settings.as_ref() != Some(&settings) {
-                        runtimes.clear();
+                        invalidate_runtimes(&mut runtimes, &active).await;
                     }
                     llm_settings = Some(settings);
                 }
@@ -299,8 +500,9 @@ fn spawn_worker(
                     .await;
                     match result {
                         Ok(plugins) => {
+                            surfaces.clear();
+                            invalidate_runtimes(&mut runtimes, &active).await;
                             worker.plugins = plugins.clone();
-                            runtimes.clear();
                             sink.emit_ui(Event::PluginsUpdated {
                                 request_id,
                                 catalogue: plugins,
@@ -316,12 +518,15 @@ fn spawn_worker(
                 Cmd::UninstallPlugin {
                     request_id,
                     id,
+                    scope,
                     config,
                 } => {
+                    surfaces.clear();
+                    invalidate_runtimes(&mut runtimes, &active).await;
                     let result = async {
                         worker
                             .plugin_manager
-                            .uninstall(&id, worker.plugins.clone())
+                            .uninstall(&id, &scope, worker.plugins.clone())
                             .await?;
                         worker.config_store.save(&config).await?;
                         let projects: Vec<PathBuf> =
@@ -336,7 +541,6 @@ fn spawn_worker(
                     match result {
                         Ok(plugins) => {
                             worker.plugins = plugins.clone();
-                            runtimes.clear();
                             sink.emit_ui(Event::PluginsUpdated {
                                 request_id,
                                 catalogue: plugins,
@@ -349,7 +553,11 @@ fn spawn_worker(
                     }
                 }
 
-                Cmd::Shutdown => break,
+                Cmd::Shutdown => {
+                    surfaces.clear();
+                    invalidate_runtimes(&mut runtimes, &active).await;
+                    break;
+                }
 
                 // The window's task list asking what is running in one project.
                 // A project with no agent yet has no jobs — its agent is built
@@ -485,7 +693,27 @@ fn spawn_worker(
                 }
             }
         }
+        surfaces.clear();
+        invalidate_runtimes(&mut runtimes, &active).await;
     });
+}
+
+async fn invalidate_runtimes(
+    runtimes: &mut HashMap<PathBuf, Arc<ProjectRuntime>>,
+    active: &Arc<Mutex<HashMap<RunId, CancellationToken>>>,
+) {
+    {
+        let runs = active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for cancel in runs.values() {
+            cancel.cancel();
+        }
+    }
+    for runtime in runtimes.values() {
+        runtime.shutdown().await;
+    }
+    runtimes.clear();
 }
 
 /// Wraps the app so `eframe` can drive it, and so the runtime outlives the

@@ -12,7 +12,7 @@ pub mod types;
 
 pub use events::AgentEvent;
 pub use ports::{
-    AgentEventSink, AgentServices, ConfigStore, HookContext, JobRuntime, LlmProvider,
+    AgentEventSink, AgentServices, ConfigStore, HookContext, HookRuntime, JobRuntime, LlmProvider,
     LlmStreamEvent, LlmStreamSink, PluginManager, SecretStore, SessionStore, SubagentContext,
     SubagentRunner,
 };

@@ -1,0 +1,46 @@
+package deluxe:harness@0.1.0;
+
+interface host {
+    list-tools: async func() -> string;
+    invoke-tool: async func(name: string, arguments-json: string) -> result<string, string>;
+    spawn-process: async func(
+        command: string,
+        arguments-json: string,
+        cwd: string,
+        environment-json: string
+    ) -> result<u64, string>;
+    process-write: async func(handle: u64, data: list<u8>) -> result<_, string>;
+    process-read: async func(handle: u64, max-bytes: u32) -> result<list<u8>, string>;
+    process-close: async func(handle: u64);
+    http-request: async func(
+        method: string,
+        url: string,
+        headers-json: string,
+        body: string
+    ) -> result<string, string>;
+    http-read: async func(handle: u64, max-bytes: u32) -> result<list<u8>, string>;
+    http-close: async func(handle: u64);
+}
+
+interface plugin {
+    configure: async func(config-json: string) -> result<_, string>;
+    list-tools: async func() -> string;
+    execute-tool: async func(name: string, arguments-json: string) -> result<string, string>;
+    list-hooks: async func() -> string;
+    invoke-hook: async func(hook-id: string, event-json: string) -> result<string, string>;
+    list-mcp-servers: async func() -> string;
+    list-mcp-tools: async func(server: string) -> string;
+    invoke-mcp-tool: async func(
+        server: string,
+        name: string,
+        arguments-json: string
+    ) -> result<string, string>;
+    open-surface: async func(request-json: string) -> result<string, string>;
+    handle-action: async func(action-json: string) -> result<string, string>;
+    close-surface: async func(surface-id: string);
+}
+
+world harness-plugin {
+    import host;
+    export plugin;
+}

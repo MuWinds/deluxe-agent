@@ -25,11 +25,14 @@ use crate::llm::UserTurn;
 use crate::plugins::{self, PluginCatalogue};
 use crate::session::{self, Session, Step, ToolResult};
 
+mod controller;
 mod events;
 mod intents;
+mod plugin_ui;
 mod resources;
 mod state;
 mod ui;
+mod view_model;
 
 use intents::{UiEffects, UiIntent};
 
@@ -130,6 +133,7 @@ impl App {
         let selected = sessions.first().map(|s| s.id);
 
         Self {
+            plugin_surface: None,
             cmd_tx,
             events,
             config,
@@ -235,6 +239,9 @@ impl App {
     /// `Jobs` and sub-agent events are handled before the run guard, since they
     /// are not scoped to a run this window started.
     fn apply(&mut self, event: Event) {
+        if self.fold_plugin_ui(&event) {
+            return;
+        }
         // Jobs are not tied to a run, so they are folded before the run guard
         // below — there is no `active` entry for them to match, and dropping
         // them there would leave the task list permanently empty. A reply for a
@@ -294,6 +301,21 @@ impl App {
                 catalogue,
             } => {
                 if self.pending_plugin_request == Some(request_id) {
+                    self.close_plugin_surface();
+                    self.catalogue = catalogue;
+                    self.pending_plugin_request = None;
+                    self.plugins_error = None;
+                }
+                return;
+            }
+            Event::PluginInstalled {
+                request_id,
+                config,
+                catalogue,
+            } => {
+                if self.pending_plugin_request == Some(request_id) {
+                    self.close_plugin_surface();
+                    self.config = *config;
                     self.catalogue = catalogue;
                     self.pending_plugin_request = None;
                     self.plugins_error = None;
@@ -498,6 +520,10 @@ impl App {
             | Event::ConfigSaved { .. }
             | Event::ConfigSaveFailed { .. }
             | Event::PluginsUpdated { .. }
+            | Event::PluginInstalled { .. }
+            | Event::PluginUiUpdated { .. }
+            | Event::PluginUiClosed { .. }
+            | Event::PluginUiFailed { .. }
             | Event::PluginOperationFailed { .. } => {}
         }
 
@@ -1053,13 +1079,84 @@ impl App {
         }
     }
 
+    /// Re-discovers installed Wasmtime plugins without changing configuration.
+    ///
+    /// The worker owns filesystem access and replaces its catalogue only after
+    /// discovery succeeds. Existing project runtimes are invalidated then, so
+    /// the next surface or agent build reads the current component bytes.
+    fn refresh_plugins(&mut self) {
+        if self.pending_plugin_request.is_some() {
+            return;
+        }
+        let request_id = self.next_config_request_id;
+        self.next_config_request_id = self.next_config_request_id.wrapping_add(1);
+        self.pending_plugin_request = Some(request_id);
+        let projects = self.config.projects.iter().map(PathBuf::from).collect();
+        if self
+            .cmd_tx
+            .send(Cmd::RefreshPlugins {
+                request_id,
+                projects,
+                settings: self.config.plugins.clone(),
+            })
+            .is_err()
+        {
+            self.plugins_error = Some("agent 线程已退出，插件未刷新".into());
+            self.pending_plugin_request = None;
+        }
+    }
+
+    /// Opens a Wasmtime component picker and asks the worker to import it.
+    ///
+    /// The selected component is matched to its plugin manifest in the worker;
+    /// the worker owns validation, the cache copy, and the config update.
+    fn add_plugin(&mut self, scope: plugins::Scope) {
+        if self.pending_plugin_request.is_some() {
+            return;
+        }
+        let Some(component_path) = rfd::FileDialog::new()
+            .set_title("选择 Wasmtime 插件组件")
+            .add_filter("Wasmtime Component", &["wasm"])
+            .pick_file()
+        else {
+            return;
+        };
+        let request_id = self.next_config_request_id;
+        self.next_config_request_id = self.next_config_request_id.wrapping_add(1);
+        self.pending_plugin_request = Some(request_id);
+        self.plugins_error = None;
+        if self
+            .cmd_tx
+            .send(Cmd::InstallPlugin {
+                request_id,
+                component_path,
+                scope,
+                config: Box::new(self.config.clone()),
+            })
+            .is_err()
+        {
+            self.plugins_error = Some("agent 线程已退出，插件未添加".into());
+            self.pending_plugin_request = None;
+        }
+    }
+
     /// Turns one plugin on or off, persists it, and reloads.
     ///
     /// Normalised before the save, because switching a plugin off also strikes
     /// it from every project list — so the file written here is the repaired
     /// one, not the one the user typed.
-    fn set_plugin_enabled(&mut self, id: &str, enabled: bool) {
-        self.config.plugins.set_enabled(id, enabled);
+    fn set_plugin_enabled(&mut self, id: &str, scope: &plugins::Scope, enabled: bool) {
+        if !enabled {
+            self.close_plugin_surface();
+        }
+        match scope {
+            plugins::Scope::Global => self.config.plugins.set_enabled(id, enabled),
+            plugins::Scope::Project(project) => {
+                self.config
+                    .plugins
+                    .set_project_enabled(project, id, enabled);
+            }
+        }
         self.config.plugins.normalize();
         self.reload_plugins();
     }
@@ -1071,10 +1168,14 @@ impl App {
     /// removing either would destroy something the user never asked us to
     /// touch; those are switched off and left in place, with the path reported
     /// so the user can remove it themselves.
-    fn uninstall_plugin(&mut self, id: &str) {
-        // The switch goes off either way: a plugin whose files are still on
-        // disk must not go on loading, and the row stays visible under 已停用.
-        self.config.plugins.set_enabled(id, false);
+    fn uninstall_plugin(&mut self, id: &str, scope: &plugins::Scope) {
+        self.close_plugin_surface();
+        match scope {
+            plugins::Scope::Global => self.config.plugins.set_enabled(id, false),
+            plugins::Scope::Project(project) => {
+                self.config.plugins.set_project_enabled(project, id, false);
+            }
+        }
         self.config.plugins.normalize();
         let request_id = self.next_config_request_id;
         self.next_config_request_id = self.next_config_request_id.wrapping_add(1);
@@ -1084,6 +1185,7 @@ impl App {
             .send(Cmd::UninstallPlugin {
                 request_id,
                 id: id.to_string(),
+                scope: scope.clone(),
                 config: Box::new(self.config.clone()),
             })
             .is_err()
@@ -1102,6 +1204,13 @@ impl App {
         let mut effects = UiEffects::default();
         for intent in intents {
             match intent {
+                UiIntent::OpenPluginSurface {
+                    plugin_id,
+                    surface_id,
+                } => self.open_plugin_surface(plugin_id, surface_id),
+                UiIntent::PluginUiAction(action) => self.plugin_ui_action(action),
+                UiIntent::ClosePluginSurface => self.close_plugin_surface(),
+                UiIntent::AddPlugin { scope } => self.add_plugin(scope),
                 UiIntent::Quit => effects.close = true,
                 UiIntent::NewSession => self.new_session(),
                 UiIntent::SelectSession(id) => {
@@ -1126,7 +1235,13 @@ impl App {
                         .unwrap_or_default();
                 }
                 UiIntent::OpenAbout => self.show_about = true,
-                UiIntent::OpenPlugins => self.show_plugins = true,
+                UiIntent::OpenPlugins => {
+                    if !self.show_plugins {
+                        self.show_plugins = true;
+                        self.refresh_plugins();
+                    }
+                }
+                UiIntent::RefreshPlugins => self.refresh_plugins(),
                 UiIntent::SetTheme(theme) => {
                     if self.config.theme != theme {
                         self.config.theme = theme;
@@ -1138,10 +1253,10 @@ impl App {
                 UiIntent::CopyTranscript => {
                     effects.clipboard_text = self.selected_session().map(Session::as_text);
                 }
-                UiIntent::SetPluginEnabled { id, enabled } => {
-                    self.set_plugin_enabled(&id, enabled);
+                UiIntent::SetPluginEnabled { id, scope, enabled } => {
+                    self.set_plugin_enabled(&id, &scope, enabled);
                 }
-                UiIntent::UninstallPlugin(id) => self.uninstall_plugin(&id),
+                UiIntent::UninstallPlugin { id, scope } => self.uninstall_plugin(&id, &scope),
                 UiIntent::AddProject => self.add_project(),
                 UiIntent::PasteImage => self.paste_image(),
                 UiIntent::PickImage => self.pick_image(),
@@ -1162,6 +1277,7 @@ impl App {
                 UiIntent::SendPrompt => self.start_run(),
             }
         }
+        self.reconcile_plugin_surface();
         effects.repaint_after =
             self.jobs.iter().any(|job| !job.is_settled()) || !self.active.is_empty();
         effects
@@ -1340,6 +1456,10 @@ fn event_run_id(event: &Event) -> RunId {
         | Event::ConfigSaved { .. }
         | Event::ConfigSaveFailed { .. }
         | Event::PluginsUpdated { .. }
+        | Event::PluginInstalled { .. }
+        | Event::PluginUiUpdated { .. }
+        | Event::PluginUiClosed { .. }
+        | Event::PluginUiFailed { .. }
         | Event::PluginOperationFailed { .. } => 0,
     }
 }
@@ -2555,7 +2675,9 @@ mod tests {
         std::fs::create_dir_all(plugin.join("commands")).unwrap();
         std::fs::write(
             plugin.join(".codex-plugin").join("plugin.json"),
-            r#"{"name":"thing","version":"1.0.0"}"#,
+            r#"{"name":"thing","version":"1.0.0","runtime":{
+                "type":"wasm","module":"plugin.wasm",
+                "apiVersion":"deluxe.harness/plugin@0.1","provider":"general"}}"#,
         )
         .unwrap();
         std::fs::write(
@@ -2575,6 +2697,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                disabled_projects: Default::default(),
             },
             None => {
                 let mut settings = plugins::PluginSettings::default();
@@ -2594,6 +2717,36 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let catalogue = catalogue_with_one_command(home.path(), home.path(), None);
         app_at("/p", catalogue)
+    }
+
+    #[test]
+    fn opening_plugins_requests_a_worker_refresh_once() {
+        let (mut app, mut cmd_rx) = app_at("/p", no_plugins());
+
+        app.apply_intents(vec![UiIntent::OpenPlugins]);
+
+        assert!(
+            app.show_plugins,
+            "opening the rail entry shows the plugin page"
+        );
+        match cmd_rx.try_recv() {
+            Ok(Cmd::RefreshPlugins {
+                projects, settings, ..
+            }) => {
+                assert_eq!(projects, vec![PathBuf::from("/p")]);
+                assert!(
+                    settings.plugins.is_empty(),
+                    "the current trust settings cross IPC"
+                );
+            }
+            other => panic!("expected a worker plugin refresh, got {other:?}"),
+        }
+
+        app.apply_intents(vec![UiIntent::RefreshPlugins]);
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "a second refresh is ignored while the first discovery is pending"
+        );
     }
 
     /// An app rooted at `project`, holding `catalogue`.
@@ -2681,7 +2834,9 @@ mod tests {
         std::fs::create_dir_all(plugin.join(".codex-plugin")).unwrap();
         std::fs::write(
             plugin.join(".codex-plugin").join("plugin.json"),
-            r#"{"name":"thing","version":"1.0.0","description":"The thing."}"#,
+            r#"{"name":"thing","version":"1.0.0","description":"The thing.",
+                "runtime":{"type":"wasm","module":"plugin.wasm",
+                "apiVersion":"deluxe.harness/plugin@0.1","provider":"general"}}"#,
         )
         .unwrap();
 
@@ -2723,7 +2878,7 @@ mod tests {
         let (mut app, mut cmd_rx) = plugin_app(home.path(), config);
         assert_eq!(app.catalogue.global().len(), 1, "it starts enabled");
 
-        app.set_plugin_enabled("thing@test", false);
+        app.set_plugin_enabled("thing@test", &plugins::Scope::Global, false);
 
         let (request_id, saved) = match cmd_rx.try_recv() {
             Ok(Cmd::ReloadPlugins { request_id, config }) => (request_id, config),
@@ -2751,7 +2906,7 @@ mod tests {
         assert!(app.catalogue.global().is_empty(), "it starts disabled");
         assert_eq!(app.catalogue.disabled().len(), 1);
 
-        app.set_plugin_enabled("thing@test", true);
+        app.set_plugin_enabled("thing@test", &plugins::Scope::Global, true);
 
         let (request_id, saved) = match cmd_rx.try_recv() {
             Ok(Cmd::ReloadPlugins { request_id, config }) => (request_id, config),
@@ -2776,7 +2931,9 @@ mod tests {
         std::fs::create_dir_all(cached.join(".codex-plugin")).unwrap();
         std::fs::write(
             cached.join(".codex-plugin").join("plugin.json"),
-            r#"{"name":"thing","version":"1.0.0"}"#,
+            r#"{"name":"thing","version":"1.0.0","runtime":{
+                "type":"wasm","module":"plugin.wasm",
+                "apiVersion":"deluxe.harness/plugin@0.1","provider":"general"}}"#,
         )
         .unwrap();
 
@@ -2785,7 +2942,7 @@ mod tests {
         let (mut app, mut cmd_rx) = plugin_app(home.path(), config);
         assert_eq!(app.catalogue.global().len(), 1);
 
-        app.uninstall_plugin("thing@test");
+        app.uninstall_plugin("thing@test", &plugins::Scope::Global);
 
         match cmd_rx.try_recv() {
             Ok(Cmd::UninstallPlugin { id, config, .. }) => {
@@ -2809,7 +2966,7 @@ mod tests {
         let working_copy = home.path().join("plugins").join("thing");
         assert!(working_copy.is_dir());
 
-        app.uninstall_plugin("thing@test");
+        app.uninstall_plugin("thing@test", &plugins::Scope::Global);
 
         assert!(working_copy.is_dir(), "a working copy must not be deleted");
         assert!(matches!(
@@ -2824,7 +2981,7 @@ mod tests {
         let (mut app, mut cmd_rx) = plugin_app(home.path(), config);
         let original = app.catalogue.clone();
 
-        app.set_plugin_enabled("thing@test", false);
+        app.set_plugin_enabled("thing@test", &plugins::Scope::Global, false);
         let request_id = match cmd_rx.try_recv() {
             Ok(Cmd::ReloadPlugins { request_id, .. }) => request_id,
             other => panic!("expected a plugin refresh, got {other:?}"),

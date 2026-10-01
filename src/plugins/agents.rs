@@ -44,8 +44,8 @@ pub struct AgentRole {
 
 /// The directory a plugin's roles live in, relative to its root.
 ///
-/// Like `commands/` and `.mcp.json`, there is no manifest field pointing at it:
-/// the directory is the interface.
+/// Like `commands/`, there is no manifest field pointing at it: the directory
+/// is the resource interface.
 const AGENTS_DIR: &str = "agents";
 
 /// Reads every role a plugin declares, sorted by name.

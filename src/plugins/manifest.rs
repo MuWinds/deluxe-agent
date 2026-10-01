@@ -1,27 +1,13 @@
-//! The Codex plugin manifest, as this agent reads it.
+//! Wasmtime manifest and provider declarations for one installed plugin.
 //!
-//! The shapes here mirror `codex-rs`'s plugin format, because the whole point is
-//! to consume plugins that were written for Codex rather than for this agent. A
-//! field this agent does not understand must therefore be *ignored*, never a
-//! parse failure — Codex's schema is still growing, and a plugin that adds a key
-//! tomorrow must not stop loading here today. So every field except `name` is
-//! optional and unknown keys are dropped by serde's default behaviour.
-//!
-//! Only the fields this agent acts on are modelled. The format also carries
-//! icons, brand colours, screenshots, connector ids and the like; none of that
-//! is read here, so it is not declared, and a manifest full of it still parses.
-//! A field is added to these types when something starts reading it.
-//!
-//! Three files are modelled: `.codex-plugin/plugin.json`, which describes one
-//! plugin; `marketplace.json`, which only says where plugins are and whether
-//! they are offered; and `.mcp.json`, which names the MCP servers the plugin
-//! brings. They are separate types because they answer different questions and
-//! are read at different times.
+//! The companion files keep their Codex-compatible locations and shapes:
+//! `hooks.json` and `.mcp.json` are read from the plugin root, while the
+//! Wasmtime provider owns their executable semantics.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{AgentError, Result};
 
@@ -46,9 +32,28 @@ pub struct PluginManifest {
     pub skills: Option<String>,
     #[serde(default)]
     pub interface: Option<PluginInterface>,
+    #[serde(default)]
+    pub runtime: Option<serde_json::Value>,
 }
 
 impl PluginManifest {
+    /// Projects the Wasmtime component declaration, if one is present.
+    ///
+    /// Unknown runtime kinds and malformed declarations are logged and skipped.
+    pub fn wasm_runtime(&self) -> Option<super::wasm_manifest::WasmManifest> {
+        let runtime = self.runtime.as_ref()?;
+        if runtime.get("type").and_then(serde_json::Value::as_str) != Some("wasm") {
+            return None;
+        }
+        match serde_json::from_value(runtime.clone()) {
+            Ok(manifest) => Some(manifest),
+            Err(error) => {
+                tracing::warn!(plugin = %self.name, %error, "skipping an invalid component declaration");
+                None
+            }
+        }
+    }
+
     /// The name a person should see, falling back to the identifier.
     pub fn display_name(&self) -> &str {
         self.interface
@@ -155,24 +160,17 @@ pub struct MarketplacePolicy {
 /// `.mcp.json` — the MCP servers a plugin brings.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct McpServersFile {
-    /// The map is named `mcpServers` in the format. The snake_case spelling
-    /// Codex's own `config.toml` uses is accepted too, because a hand-written
-    /// file is as likely to reach for it.
+    /// The map is named `mcpServers` in the file format.
     #[serde(default, rename = "mcpServers", alias = "mcp_servers")]
     pub servers: BTreeMap<String, McpServerConfig>,
 }
 
-/// One MCP server, in either transport the format describes.
+/// One MCP transport declaration passed to a Wasm provider.
 ///
-/// One struct for both rather than an enum, for the reason [`PluginSource`] is
-/// a `String`: an entry whose `type` this agent has never heard of must be
-/// skipped on its own, not take the whole file down with it.
-///
-/// The field names are spelled out one by one instead of using
-/// `rename_all`, because the file mixes conventions — `mcpServers` is camelCase
-/// while `oauth_resource` and `startup_timeout_sec` are snake_case. Each field
-/// therefore names its wire spelling and accepts the other as an alias.
-#[derive(Debug, Clone, Deserialize)]
+/// The host uses this only to validate raw process/HTTP capability requests.
+/// MCP initialization, JSON-RPC, authentication flow, and message framing stay
+/// inside the provider.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpServerConfig {
     /// `stdio` | `http`. Absent means stdio; see [`McpServerConfig::is_http`].
     #[serde(default, rename = "type")]
@@ -180,9 +178,7 @@ pub struct McpServerConfig {
     /// The endpoint, for an `http` server.
     #[serde(default)]
     pub url: Option<String>,
-    /// Set when the server needs an OAuth flow. This agent does not do OAuth,
-    /// so a server carrying this is reported and skipped rather than attempted
-    /// — a silent failure here would look like a broken plugin.
+    /// Provider-owned metadata for an OAuth-capable endpoint.
     #[serde(default, rename = "oauth_resource", alias = "oauthResource")]
     pub oauth_resource: Option<String>,
     /// The executable, for a stdio server.
@@ -197,22 +193,14 @@ pub struct McpServerConfig {
     /// Extra environment for the child process.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// How long the handshake may take, for a server that is slow to start.
-    ///
-    /// The format's `tool_timeout_sec` is deliberately not read: the host
-    /// already bounds every tool call with its own timeout, and a second
-    /// authority over the same thing would only make the effective limit
-    /// depend on which one happened to be smaller.
+    /// Provider-owned startup budget metadata. The host still applies its own
+    /// component call timeout.
     #[serde(default, rename = "startup_timeout_sec", alias = "startupTimeoutSec")]
     pub startup_timeout_sec: Option<u64>,
 }
 
 impl McpServerConfig {
-    /// Which transport to speak.
-    ///
-    /// `type` is optional and its absence means stdio — the same default Codex
-    /// uses. A server with a `url` and no `command` is read as `http` even
-    /// without the field, because that is the only thing it can be.
+    /// Whether the provider declaration is HTTP rather than process-backed.
     pub fn is_http(&self) -> bool {
         match self.transport.as_deref() {
             Some("http") => true,
@@ -226,13 +214,10 @@ impl McpServerConfig {
 pub const MANIFEST_DIR: &str = ".codex-plugin";
 /// The manifest file inside [`MANIFEST_DIR`].
 pub const MANIFEST_FILE: &str = "plugin.json";
-/// The MCP servers a plugin brings, at the plugin root.
-///
-/// There is no manifest field pointing at this file — `plugin.json` carries
-/// `skills` and `apps` paths but nothing for MCP, and no plugin in a real
-/// install declares one — so the name is fixed.
+/// The hook configuration file at the plugin root.
+pub const HOOKS_FILE: &str = "hooks.json";
+/// The MCP configuration file at the plugin root.
 pub const MCP_FILE: &str = ".mcp.json";
-
 /// Reads and parses a plugin manifest from a plugin root.
 pub fn read_plugin(root: &Path) -> Result<PluginManifest> {
     let path = root.join(MANIFEST_DIR).join(MANIFEST_FILE);
@@ -264,21 +249,31 @@ pub fn read_marketplace(path: &Path) -> Result<MarketplaceManifest> {
     })
 }
 
-/// The MCP servers a plugin declares, keyed by the name they are exposed under.
+/// Reads an optional companion file without interpreting its provider-owned
+/// JSON semantics.
 ///
-/// A plugin with no `.mcp.json` — which is most of them — is not an error and
-/// not a warning: it is `Ok` with nothing in it. A file that exists but does not
-/// parse *is* an error, and the caller reports it; the plugin still loads, just
-/// without its servers.
-pub fn read_mcp_servers(root: &Path) -> Result<BTreeMap<String, McpServerConfig>> {
-    let path = root.join(MCP_FILE);
+/// Returns `Ok(None)` when the file is absent and `Err` when an existing file
+/// cannot be read as UTF-8.
+pub fn read_optional_file(root: &Path, file: &str) -> Result<Option<String>> {
+    let path = root.join(file);
     if !path.is_file() {
-        return Ok(BTreeMap::new());
+        return Ok(None);
     }
-    let text = std::fs::read_to_string(&path).map_err(|error| {
-        AgentError::from_io(&format!("Failed to read {}", path.display()), error)
-    })?;
-    Ok(parse_mcp_servers(&text, &path)?.servers)
+    std::fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|error| AgentError::from_io(&format!("Failed to read {}", path.display()), error))
+}
+
+/// Reads and parses the MCP declarations from a plugin's `.mcp.json`.
+///
+/// A missing file is the normal no-server case. The returned map is used only
+/// for host capability authorization; JSON-RPC and transport framing stay in
+/// the Wasm provider.
+pub fn read_mcp_servers(root: &Path) -> Result<BTreeMap<String, McpServerConfig>> {
+    let Some(text) = read_optional_file(root, MCP_FILE)? else {
+        return Ok(BTreeMap::new());
+    };
+    parse_mcp_servers(&text, &root.join(MCP_FILE)).map(|file| file.servers)
 }
 
 fn parse_mcp_servers(text: &str, path: &Path) -> Result<McpServersFile> {
@@ -493,129 +488,38 @@ mod tests {
         assert!(marketplace_root(std::path::Path::new("/tmp/.agents/marketplace.json")).is_none());
     }
 
-    /// The real `figma` plugin's `.mcp.json`, verbatim.
-    const FIGMA_MCP: &str = r#"{
-      "mcpServers": {
-        "figma": {
-          "type": "http",
-          "url": "https://mcp.figma.com/mcp",
-          "oauth_resource": "https://mcp.figma.com/mcp"
-        }
-      }
-    }"#;
-
-    /// The real stdio shape, including the two timeout fields — one of which
-    /// this agent reads and one it deliberately ignores, so both must at least
-    /// parse.
-    const STDIO_MCP: &str = r#"{
-      "mcpServers": {
-        "taskScheduler": {
-          "command": "python",
-          "args": ["./scripts/mcp_server.py"],
-          "cwd": ".",
-          "env": { "PYTHONUTF8": "1" },
-          "startup_timeout_sec": 20,
-          "tool_timeout_sec": 60
-        }
-      }
-    }"#;
-
-    fn servers(text: &str) -> BTreeMap<String, McpServerConfig> {
-        parse_mcp_servers(text, std::path::Path::new(".mcp.json"))
-            .unwrap()
-            .servers
-    }
-
     #[test]
-    fn a_real_http_mcp_file_parses() {
-        let servers = servers(FIGMA_MCP);
-        let figma = &servers["figma"];
-
-        assert_eq!(figma.url.as_deref(), Some("https://mcp.figma.com/mcp"));
-        assert_eq!(
-            figma.oauth_resource.as_deref(),
-            Some("https://mcp.figma.com/mcp"),
-            "the OAuth marker is what tells the host to skip this server"
-        );
-        assert!(figma.is_http());
-    }
-
-    #[test]
-    fn a_real_stdio_mcp_file_parses() {
-        let servers = servers(STDIO_MCP);
-        let scheduler = &servers["taskScheduler"];
-
-        assert_eq!(scheduler.command.as_deref(), Some("python"));
-        assert_eq!(scheduler.args, vec!["./scripts/mcp_server.py"]);
-        assert_eq!(scheduler.cwd.as_deref(), Some("."));
-        assert_eq!(
-            scheduler.env.get("PYTHONUTF8").map(String::as_str),
-            Some("1")
-        );
-        assert_eq!(
-            scheduler.startup_timeout_sec,
-            Some(20),
-            "a server that declares how slow it is gets to say so"
-        );
-        assert!(
-            !scheduler.is_http(),
-            "a server with a command and no type is stdio"
-        );
-    }
-
-    #[test]
-    fn the_camel_case_spelling_of_the_snake_case_fields_is_accepted() {
-        // The format mixes conventions, so each field takes both spellings
-        // rather than one of them being silently dropped.
-        let servers = servers(
-            r#"{"mcpServers":{"x":{"type":"http","url":"https://x/mcp",
-                "oauthResource":"https://x","startupTimeoutSec":5}}}"#,
-        );
-        let x = &servers["x"];
-
-        assert_eq!(x.oauth_resource.as_deref(), Some("https://x"));
-        assert_eq!(x.startup_timeout_sec, Some(5));
-    }
-
-    #[test]
-    fn the_transport_defaults_to_stdio_and_an_explicit_type_wins() {
-        let kind = |text: &str| servers(text).into_values().next().unwrap().is_http();
-
-        assert!(
-            !kind(r#"{"mcpServers":{"x":{"command":"node"}}}"#),
-            "no type means stdio"
-        );
-        assert!(
-            kind(r#"{"mcpServers":{"x":{"url":"https://x/mcp"}}}"#),
-            "a url with no command can only be http"
-        );
-        assert!(
-            !kind(r#"{"mcpServers":{"x":{"type":"stdio","url":"https://x/mcp"}}}"#),
-            "an explicit type is not overruled by a stray url"
-        );
-    }
-
-    #[test]
-    fn a_file_that_is_not_an_mcp_file_is_an_error() {
-        let error = parse_mcp_servers("{", std::path::Path::new(".mcp.json")).unwrap_err();
-        assert!(
-            error.message.contains("MCP server file"),
-            "{}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn a_plugin_without_an_mcp_file_declares_no_servers() {
-        // The common case, and not a warning: most plugins bring no server.
-        let root = tempfile::tempdir().unwrap();
-        assert!(read_mcp_servers(root.path()).unwrap().is_empty());
-
-        std::fs::write(
-            root.path().join(MCP_FILE),
-            r#"{"mcpServers":{"s":{"command":"node"}}}"#,
+    fn a_stdio_transport_declaration_round_trips_inside_a_wasm_manifest() {
+        let config: McpServerConfig = serde_json::from_str(
+            r#"{"type":"stdio","command":"python","args":["server.py"],
+                "cwd":".","env":{"PYTHONUTF8":"1"},"startupTimeoutSec":20}"#,
         )
-        .unwrap();
-        assert_eq!(read_mcp_servers(root.path()).unwrap().len(), 1);
+        .expect("the provider transport declaration is valid");
+
+        assert!(!config.is_http(), "a command-backed declaration is stdio");
+        assert_eq!(config.command.as_deref(), Some("python"));
+        assert_eq!(config.args, vec!["server.py"]);
+        assert_eq!(config.startup_timeout_sec, Some(20));
+        assert_eq!(
+            serde_json::to_value(config).expect("the declaration serializes")
+                ["startup_timeout_sec"],
+            20
+        );
+    }
+
+    #[test]
+    fn an_http_transport_declaration_round_trips_without_host_protocol_logic() {
+        let config: McpServerConfig = serde_json::from_str(
+            r#"{"type":"http","url":"https://mcp.example.test/mcp",
+                "oauth_resource":"https://mcp.example.test/mcp"}"#,
+        )
+        .expect("the provider transport declaration is valid");
+
+        assert!(config.is_http(), "a URL-backed declaration is HTTP");
+        assert_eq!(config.url.as_deref(), Some("https://mcp.example.test/mcp"));
+        assert_eq!(
+            config.oauth_resource.as_deref(),
+            Some("https://mcp.example.test/mcp")
+        );
     }
 }

@@ -15,7 +15,8 @@ use crate::config::{Config, InputModality};
 use crate::context::ContextSettings;
 pub use crate::harness::{AuditOutcome, HunkLines, RunId, RunState};
 use crate::llm::{Message, ThinkingLevel, Usage, UserTurn};
-use crate::plugins::PluginCatalogue;
+use crate::plugins::ui_protocol::{PluginUiAction, PluginUiDocument, SurfaceRequest};
+use crate::plugins::{PluginCatalogue, PluginSettings, Scope};
 use crate::session::Session;
 use crate::tools::jobs::{JobSnapshot, JobStatus};
 use crate::tools::ToolSettings;
@@ -94,6 +95,22 @@ impl std::fmt::Debug for LlmSettings {
 /// GUI → agent.
 #[derive(Debug)]
 pub enum Cmd {
+    OpenPluginSurface(SurfaceRequest),
+    PluginUiAction(PluginUiAction),
+    ClosePluginSurface(SurfaceRequest),
+    /// Imports one Wasmtime plugin directory into the managed cache.
+    InstallPlugin {
+        request_id: u64,
+        component_path: PathBuf,
+        scope: Scope,
+        config: Box<Config>,
+    },
+    /// Re-discovers global and project-scoped Wasmtime plugins for the page.
+    RefreshPlugins {
+        request_id: u64,
+        projects: Vec<PathBuf>,
+        settings: PluginSettings,
+    },
     Run {
         run_id: RunId,
         prompt: UserTurn,
@@ -150,6 +167,7 @@ pub enum Cmd {
     UninstallPlugin {
         request_id: u64,
         id: String,
+        scope: Scope,
         config: Box<Config>,
     },
     /// Stops the worker after commands already queued have been handled.
@@ -175,6 +193,17 @@ pub enum Cmd {
 /// agent → GUI.
 #[derive(Debug, Clone)]
 pub enum Event {
+    PluginUiUpdated {
+        request: SurfaceRequest,
+        document: Arc<PluginUiDocument>,
+    },
+    PluginUiClosed {
+        request: SurfaceRequest,
+    },
+    PluginUiFailed {
+        request: SurfaceRequest,
+        message: String,
+    },
     /// A coalesced batch of streamed assistant text.
     AssistantDelta {
         run_id: RunId,
@@ -314,6 +343,12 @@ pub enum Event {
     PluginOperationFailed {
         request_id: u64,
         message: String,
+    },
+    /// Confirms an imported Wasmtime plugin and replaces the catalogue/config.
+    PluginInstalled {
+        request_id: u64,
+        config: Box<Config>,
+        catalogue: Arc<PluginCatalogue>,
     },
     /// A delegated sub-agent has started: the role it runs and the brief it was
     /// handed.

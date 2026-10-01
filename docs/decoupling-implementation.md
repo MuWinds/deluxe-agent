@@ -10,11 +10,18 @@
 本计划的原则是：
 
 - 先稳定领域数据和调用方向，再引入动态插件；
-- 先使用 native adapter 验证接口，再实现 Wasm adapter；
+- 宿主内部可以保留文件、进程和 HTTP 的 native capability implementation，但插件
+  本体统一是 Wasmtime Component，所有插件可执行能力都以 Wasm provider 为边界；
 - 一个阶段只改变一类依赖；
 - 每个阶段保持现有行为、prompt 和工具协议不变；
 - 不为了抽象而抽象，只有跨模块变化点才建立 trait；
 - 所有 I/O 继续运行在 tokio worker，不把业务操作放回 egui 主线程。
+
+本项目的插件格式唯一固定为 Wasmtime Component，不兼容旧的可执行插件格式。
+每个插件都必须声明 Wasmtime Component；Component 可以同时提供 skills、commands、agents、tool
+和声明式 UI。Hooks 与 MCP 是两个特殊 provider：Hooks provider 读取并执行根目录
+`hooks.json`，MCP provider 读取根目录 `.mcp.json`，MCP loading、tool adapter 和
+transport 全部由对应 Wasm provider 实现。
 
 相关目标设计见：
 
@@ -140,7 +147,7 @@ session -> context
 - 缓存 project Agent；
 - 管理 run cancellation。
 
-这使得增加 native plugin、Wasm plugin 或新的 Agent runtime 都需要修改入口文件。
+这使得增加新的 Wasm provider 或 Agent runtime 都需要修改入口文件。
 
 ### 1.6 GUI 直接执行插件和配置 I/O
 
@@ -189,9 +196,8 @@ agent-runtime
 
 adapters
   ├── native LLM
-  ├── builtin tools
-  ├── MCP
-  ├── Codex resource plugins
+  ├── host capability implementations
+  ├── Wasmtime Component plugins
   ├── JSON session store
   └── Wasmtime components
 
@@ -219,7 +225,7 @@ main 只负责组装和生命周期
 - Agent 调用外部能力；
 - 一个能力有两个以上实现；
 - 测试需要替换外部依赖；
-- Wasm/MCP/native 需要使用相同协议。
+- Agent runtime 需要隔离多个宿主或 Wasm provider 实现。
 
 单一、纯函数、没有替代实现的代码继续使用普通 struct 和函数。
 
@@ -316,18 +322,17 @@ pub enum RunState {
 - `ToolStarted`；
 - `ToolFinished`。
 
-### 4.2 兼容旧类型
+### 4.2 稳定内部类型
 
-第一阶段不能直接删除 `ipc::AuditOutcome`、`ipc::RunState` 或
-`tools::HunkLines`。采用以下顺序：
+这些类型属于宿主内部和应用数据协议，不是旧插件 ABI。可以按依赖关系逐步移动，
+但不需要为旧可执行插件保留转换层：
 
 1. 在 harness 中定义新类型；
-2. 给旧类型增加 `From` 转换；
-3. 让新 runtime 内部使用 harness 类型；
-4. 让 `ipc` adapter 转回旧 `Event`；
-5. 等 UI 迁移完成后再删除旧类型。
+2. 让新 runtime 内部使用 harness 类型；
+3. 由 `ipc` adapter 转换为 GUI 所需的 `Event`；
+4. 删除已经没有生产调用方的旧定义。
 
-兼容层只保留一个方向的转换，避免两个类型互相转换后产生循环依赖：
+转换只保留一个方向，避免两个类型互相转换后产生循环依赖：
 
 ```text
 harness/domain -> ipc adapter -> legacy Event
@@ -491,8 +496,9 @@ pub trait HookRuntime: Send + Sync {
 }
 ```
 
-`HookRuntime` 不能依赖 GUI `Event`。原有 `Hook` 解析仍然保留在
-`plugins::hooks`，通过 native adapter 转成 `AgentHook`。
+`HookRuntime` 不能依赖 GUI `Event`。hook 声明、匹配语义和 hook 执行全部由
+Wasm provider export；宿主只负责调用 provider、传递 tool event、限制输出并处理
+取消。
 
 hook 行为不变：
 
@@ -500,7 +506,8 @@ hook 行为不变：
 - 顺序执行；
 - 输出追加到 tool result；
 - hook 失败作为 tool result 的可见错误；
-- hook 继续通过注册的 `exec` tool 执行；
+- hook 如需执行命令，必须调用 provider 被授予的 `invoke-tool` 或 raw process
+  capability；
 - hook 继承 host timeout 和 destructive command guard。
 
 ### 5.5 `JobRuntime`
@@ -596,8 +603,8 @@ Agent 不负责：
 
 - 工具 map；
 - 插件 discovery；
-- MCP handshake；
-- hooks.json 解析；
+- MCP handshake、JSON-RPC 和 transport framing；
+- `hooks.json` matcher、command 解析和 command 执行；
 - skill 文件扫描；
 - JSON session save；
 - GUI channel；
@@ -804,14 +811,24 @@ impl ProjectRuntimeFactory {
 2. 创建 builtin ToolRegistry；
 3. 根据输入 modality 注册 `read_image`；
 4. 通过 PluginManager 获取当前项目 plugins；
-5. 连接 MCP server；
-6. 注册 MCP tools；
-7. 加载 Wasm tools；
-8. 创建 native prompt provider；
-9. 创建 hook runtime；
-10. 创建 subagent runner；
-11. 创建 AgentServices；
-12. 创建 project Agent。
+5. 按 global/project scope 解析 Wasmtime provider；
+6. 仅为 Hooks provider 读取根目录 `hooks.json`，仅为 MCP provider 读取根目录
+   `.mcp.json`；
+7. 用 MCP provider 的 `.mcp.json` server map 建立 host raw process/HTTP transport
+   授权；
+8. 加载 bundled 和 project-scoped Wasmtime providers，并将对应 companion 文件
+   原样作为 provider input；
+9. 为 provider 创建 project-scoped `CapabilityHub`；
+10. 通过 provider export 加载 tools、hooks 和 MCP tools；
+11. 创建 native prompt provider；
+12. 创建 hook runtime；
+13. 创建 subagent runner；
+14. 创建 AgentServices；
+15. 创建 project Agent。
+
+MCP provider 自己实现 `initialize`、`initialized`、`tools/list`、`tools/call`、
+JSON-RPC、stdio framing 和 HTTP/event-stream framing。宿主只向它提供声明约束下的
+raw process/HTTP bytes。
 
 ### 8.2 `ProjectRuntime`
 
@@ -860,9 +877,10 @@ Worker 不负责：
 - scope；
 - skills；
 - commands；
-- hooks；
 - agents；
-- MCP servers。
+- Wasm runtime module 和 permissions；
+- 仅由对应 provider 读取的 raw `hooks.json` / `.mcp.json`；
+- 仅由 MCP provider 的 `.mcp.json` 投影出的 raw transport authorization map。
 
 它既是发现结果，又是 GUI 展示模型，又是运行时输入。
 
@@ -886,9 +904,9 @@ pub struct PluginSnapshot {
 pub struct ProjectCapabilities {
     pub tools: Vec<Arc<dyn Tool>>,
     pub prompts: Vec<Arc<dyn PromptProvider>>,
-    pub hooks: Vec<Arc<dyn AgentHook>>,
     pub roles: Vec<AgentRole>,
     pub commands: Vec<Command>,
+    pub wasm_providers: Vec<PluginRuntimeDescriptor>,
 }
 ```
 
@@ -934,7 +952,7 @@ pub trait PluginManager: Send + Sync {
 - scope 合并；
 - disabled 过滤；
 - shadowing；
-- MCP/Wasm provider 初始化；
+- Wasm provider 初始化、MCP discovery 和 provider lifecycle；
 - provider 生命周期。
 
 GUI 不再直接调用 `plugins::discover`。
@@ -1030,7 +1048,7 @@ GUI 修改开关
 - config save；
 - session save；
 - plugin manifest 读取；
-- MCP 启动；
+- Wasm provider 加载及其 raw transport capability；
 - Wasm component 加载。
 
 GUI 可以保留：
@@ -1163,12 +1181,12 @@ section id
 
 ## 13. 第十阶段：为 Wasmtime 留出 adapter 边界
 
-当上述 native ports 完成后，Wasmtime 只需要实现 adapter：
+当前 ports 负责宿主内的 Agent 编排；Wasmtime provider 通过独立 ABI 接入：
 
 ```text
 WasmComponent
-  -> WasmToolProvider
-  -> ToolRuntime adapter
+  -> tool/hook/MCP provider exports
+  -> ToolRuntime / HookRuntime adapters
   -> Agent
 ```
 
@@ -1185,9 +1203,12 @@ Wasm 插件不能直接依赖：
 
 - tool metadata；
 - execute tool；
-- 受权限控制的 host invoke；
-- plugin event；
-- 后续的 prompt/hook provider。
+- hook metadata 和 event；
+- MCP provider lifecycle；
+- 受权限控制的 host tool invocation；
+- raw process bytes；
+- raw HTTP request/response bytes；
+- 声明式 UI surface/action。
 
 这时 Wasm runtime 的依赖方向为：
 
@@ -1231,7 +1252,7 @@ Add service ports for LLM, tools, hooks, jobs, and sessions
 内容：
 
 - 新增 trait；
-- 为当前实现增加 native adapters；
+- 为宿主实现增加 adapters；
 - adapter 测试；
 - 暂不改变 Agent 构造。
 
@@ -1296,7 +1317,7 @@ Extract project runtime construction from main
 
 - `ProjectRuntimeFactory`；
 - `ProjectRuntime`；
-- MCP registration 从 `main.rs` 移出；
+- provider loading 从 `main.rs` 移出；
 - Worker 只管理 runtime cache。
 
 ### Commit 8
@@ -1521,12 +1542,13 @@ UI 再决定如何展示。
 - [ ] `context::summarize` 不再接收具体 `LlmClient`；
 - [ ] `session` 不再依赖 `ipc`；
 - [ ] `ipc` 不再作为所有领域类型的定义位置；
-- [ ] `main.rs` 不再实现 MCP tool registration；
+- [x] `main.rs` 不再实现 native MCP tool registration；
 - [ ] `main.rs` 主要负责组合和 Worker 生命周期；
 - [ ] `App` 不再做 plugin discovery；
 - [ ] `App` 不再删除 plugin cache；
 - [ ] plugin reload 在 worker 中完成；
-- [ ] native adapters 的行为与旧实现一致；
+- [ ] Wasm provider 的 tool、hook、MCP loading 和 transport 行为保持原有配置
+  语义；
 - [ ] prompt snapshot 测试通过；
 - [ ] Agent loop、MCP、hooks、task、image、jobs、session 测试通过；
 - [ ] 所有 I/O 仍在 tokio worker；

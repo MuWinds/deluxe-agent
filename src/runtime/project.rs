@@ -1,12 +1,13 @@
 //! Project-scoped runtime construction.
 //!
 //! The worker owns lifecycle and caching; this factory owns the concrete
-//! assembly of a model provider, tools, MCP clients, delegation, and an agent.
+//! assembly of a model provider, Wasm providers, delegation, and an agent.
 //! Keeping that composition here prevents the IPC loop from becoming another
 //! place where runtime dependencies are wired by hand.
 
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::RwLock;
 
@@ -19,10 +20,13 @@ use crate::harness::{
     PromptSkill, SubagentContext,
 };
 use crate::llm::LlmClient;
-use crate::mcp::{tool::McpTool, McpClient};
-use crate::plugins::{LoadedPlugin, PluginCatalogue};
+use crate::plugins::capabilities::CapabilityHub;
+use crate::plugins::providers::{all_tools, mcp_tools, WasmHookRuntime};
+use crate::plugins::wasm::tools;
+use crate::plugins::wasm_runtime::{ComponentActor, ProviderInputs};
+use crate::plugins::{PluginCatalogue, ProviderKind};
 use crate::tools::task::Task;
-use crate::tools::{ToolRegistry, ToolSettings};
+use crate::tools::{JobRegistry, ToolRegistry, ToolSettings};
 
 use super::subagents::NativeSubagentRunner;
 
@@ -41,24 +45,97 @@ pub struct RuntimeModelSettings {
 pub struct ProjectRuntime {
     pub agent: Arc<Agent>,
     pub jobs: Arc<dyn JobRuntime>,
+    pub host_tools: Arc<dyn crate::harness::ports::ToolRuntime>,
+    components: BTreeMap<String, Arc<ComponentActor>>,
+}
+
+impl ProjectRuntime {
+    /// Stops plugin calls and project jobs before invalidating the cached runtime.
+    ///
+    /// Individual job cancellation errors are logged so cleanup continues.
+    pub async fn shutdown(&self) {
+        for component in self.components.values() {
+            component.shutdown();
+        }
+        for job in self
+            .jobs
+            .list()
+            .into_iter()
+            .filter(|job| !job.status.is_settled())
+        {
+            if let Err(error) = self
+                .jobs
+                .kill(&job.id, Some("project runtime invalidated"))
+                .await
+            {
+                tracing::warn!(%error, "failed to stop a stale runtime job");
+            }
+        }
+    }
+
+    /// Returns the component belonging to an enabled plugin in this project.
+    pub fn component(&self, plugin_id: &str) -> Option<Arc<ComponentActor>> {
+        self.components.get(plugin_id).cloned()
+    }
+}
+
+#[derive(Clone)]
+pub struct HostCapabilities {
+    pub runtime: Arc<dyn crate::harness::ports::ToolRuntime>,
+    pub jobs: Arc<JobRegistry>,
 }
 
 #[derive(Clone)]
 pub struct ProjectRuntimeFactory {
     settings: Arc<RwLock<ToolSettings>>,
     sink: Arc<dyn AgentEventSink>,
+    host_capabilities: Arc<Mutex<BTreeMap<(std::path::PathBuf, bool), HostCapabilities>>>,
 }
 
 impl ProjectRuntimeFactory {
     /// Creates a factory that shares worker tool policy and UI event delivery.
     pub fn new(settings: Arc<RwLock<ToolSettings>>, sink: Arc<dyn AgentEventSink>) -> Self {
-        Self { settings, sink }
+        Self {
+            settings,
+            sink,
+            host_capabilities: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 
-    /// Builds the complete native runtime for one project and model setting.
+    /// Returns the project-scoped native capabilities used by Wasm providers.
     ///
-    /// MCP handshake failures are logged and skipped by design; one broken
-    /// plugin must not make the rest of the project's agent unusable.
+    /// The returned host registry is cached so a UI surface opened before the
+    /// agent shares the same job runtime with the later project runtime.
+    pub fn host_capabilities(&self, project: &Path, supports_images: bool) -> HostCapabilities {
+        let key = (project.to_path_buf(), supports_images);
+        let mut cached = match self.host_capabilities.lock() {
+            Ok(cached) => cached,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(capabilities) = cached.get(&key) {
+            return capabilities.clone();
+        }
+
+        let registry = if supports_images {
+            ToolRegistry::with_image_input()
+        } else {
+            ToolRegistry::with_builtins()
+        };
+        let jobs = registry.jobs().clone();
+        let runtime: Arc<dyn crate::harness::ports::ToolRuntime> =
+            Arc::new(crate::harness::services::RegistryToolRuntime::new(
+                Arc::new(registry),
+                self.settings.clone(),
+            ));
+        let capabilities = HostCapabilities { runtime, jobs };
+        cached.insert(key, capabilities.clone());
+        capabilities
+    }
+
+    /// Builds the worker runtime for one project and model setting.
+    ///
+    /// A broken Wasm provider is logged and skipped; one invalid plugin must
+    /// not make the rest of the project's agent unusable.
     pub async fn build(
         &self,
         project: &Path,
@@ -73,14 +150,100 @@ impl ProjectRuntimeFactory {
             model.retry_count,
         )?;
 
-        let mut registry = if model.supports_images {
-            ToolRegistry::with_image_input()
-        } else {
-            ToolRegistry::with_builtins()
-        };
+        let host = self.host_capabilities(project, model.supports_images);
+        let mut registry = ToolRegistry::empty_with_jobs(host.jobs.clone());
 
         let plugins = catalogue.for_project(project);
-        register_mcp_tools(&mut registry, &plugins).await;
+        let capabilities = host.runtime.clone();
+        let mut components = BTreeMap::new();
+        let mut provider_actors = Vec::new();
+        let builtin_manifest = builtin_manifest(model.supports_images)?;
+        let builtin_hub = CapabilityHub::new(
+            project.to_path_buf(),
+            project.to_path_buf(),
+            builtin_manifest.permissions.clone(),
+            BTreeMap::new(),
+            capabilities.clone(),
+        )?;
+        match ComponentActor::load_bytes(
+            include_bytes!("../../plugin-fixtures/builtin-tools/plugin.wasm"),
+            project.to_path_buf(),
+            builtin_manifest,
+            ProviderInputs::default(),
+            builtin_hub,
+        )
+        .await
+        {
+            Ok(actor) => {
+                components.insert("__deluxe_builtin_tools".into(), actor.clone());
+                match all_tools(actor.clone(), "deluxe-builtin").await {
+                    Ok(tools) => {
+                        for tool in tools {
+                            registry.register(tool);
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "bundled tool provider failed"),
+                }
+            }
+            Err(error) => tracing::warn!(%error, "bundled tool provider failed to load"),
+        }
+        for plugin in &plugins {
+            let Some(manifest) = plugin.manifest.wasm_runtime() else {
+                continue;
+            };
+            let provider = manifest.provider;
+            let hub = CapabilityHub::new(
+                project.to_path_buf(),
+                plugin.root.clone(),
+                manifest.permissions.clone(),
+                plugin.mcp_servers.clone(),
+                capabilities.clone(),
+            )?;
+            let inputs = ProviderInputs {
+                hooks_json: plugin.hooks_json.clone(),
+                mcp_json: plugin.mcp_json.clone(),
+            };
+            let loaded = async {
+                let actor =
+                    ComponentActor::load(plugin.root.clone(), manifest, inputs, hub).await?;
+                Ok::<_, crate::error::AgentError>(actor)
+            }
+            .await;
+            match loaded {
+                Ok(actor) => {
+                    let provider_tools = match provider {
+                        ProviderKind::Mcp => mcp_tools(actor.clone(), &plugin.id).await,
+                        _ => tools(actor.clone()).await,
+                    };
+                    let provider_tools = match provider_tools {
+                        Ok(tools) => tools,
+                        Err(error) => {
+                            tracing::warn!(
+                                plugin = %plugin.id,
+                                %error,
+                                "skipping Wasmtime provider tools"
+                            );
+                            Vec::new()
+                        }
+                    };
+                    for tool in provider_tools {
+                        let name = tool.descriptor().name;
+                        if registry.get(&name).is_some() {
+                            tracing::warn!(tool = %name, plugin = %plugin.id, "keeping the first tool registration");
+                        } else {
+                            registry.register(tool);
+                        }
+                    }
+                    if provider == ProviderKind::Hooks {
+                        provider_actors.push((plugin.id.clone(), actor.clone()));
+                    }
+                    components.insert(plugin.id.clone(), actor);
+                }
+                Err(error) => {
+                    tracing::warn!(plugin = %plugin.id, %error, "skipping a component plugin")
+                }
+            }
+        }
 
         let roles: Vec<AgentRole> = plugins
             .iter()
@@ -114,18 +277,23 @@ impl ProjectRuntimeFactory {
             )));
         }
 
-        let hooks = plugins
-            .iter()
-            .flat_map(|plugin| plugin.hooks.iter().cloned())
-            .collect();
         let registry = Arc::new(registry);
-        let services = Arc::new(native_services(
+        let mut native = native_services(
             client,
             registry,
             self.settings.clone(),
-            hooks,
             Arc::new(super::prompt::NativePromptProvider::new()),
-        ));
+        );
+        let hooks = match WasmHookRuntime::load(provider_actors).await {
+            Ok(hooks) => hooks,
+            Err(error) => {
+                tracing::warn!(%error, "Wasm hook providers failed to load");
+                WasmHookRuntime::empty()
+            }
+        };
+        native.hooks = Arc::new(hooks);
+        let services = Arc::new(native);
+        let host_tools = capabilities;
         let project_path = project.to_path_buf();
         let project_instructions = tokio::task::spawn_blocking(move || {
             super::prompt::read_project_instructions(&project_path)
@@ -175,45 +343,35 @@ impl ProjectRuntimeFactory {
             system_prompt,
         ));
 
-        Ok(Arc::new(ProjectRuntime { agent, jobs }))
+        Ok(Arc::new(ProjectRuntime {
+            agent,
+            jobs,
+            host_tools,
+            components,
+        }))
     }
 }
 
-async fn register_mcp_tools(registry: &mut ToolRegistry, plugins: &[&LoadedPlugin]) {
-    for plugin in plugins {
-        for (server, config) in &plugin.mcp_servers {
-            let mut client = match McpClient::connect(server, config, &plugin.root).await {
-                Ok(client) => client,
-                Err(error) => {
-                    tracing::warn!(server, plugin = %plugin.id, %error, "skipping an MCP server");
-                    continue;
-                }
-            };
-
-            let specs = match client.list_tools().await {
-                Ok(specs) => specs,
-                Err(error) => {
-                    tracing::warn!(server, plugin = %plugin.id, %error, "skipping an MCP server");
-                    continue;
-                }
-            };
-
-            let client = crate::mcp::shared(client);
-            for spec in specs {
-                let tool = McpTool::new(server, spec, client.clone());
-                let name = tool.name().to_string();
-                if registry.get(&name).is_some() {
-                    tracing::warn!(
-                        tool = %name,
-                        server,
-                        "another tool already has this name; keeping the first"
-                    );
-                    continue;
-                }
-
-                tracing::info!(tool = %name, server, plugin = %plugin.id, "registered an MCP tool");
-                registry.register(Arc::new(tool));
-            }
-        }
+fn builtin_manifest(supports_images: bool) -> Result<crate::plugins::wasm_manifest::WasmManifest> {
+    let mut invoke_tools = vec![
+        "read_file".to_string(),
+        "list_dir".to_string(),
+        "exec".to_string(),
+        "apply_patch".to_string(),
+        "job_output".to_string(),
+        "job_list".to_string(),
+        "job_kill".to_string(),
+    ];
+    if supports_images {
+        invoke_tools.push("read_image".to_string());
     }
+    serde_json::from_value(serde_json::json!({
+        "type": "wasm",
+        "module": "builtin-tools.wasm",
+        "apiVersion": crate::plugins::wasm_manifest::API_VERSION,
+        "permissions": { "invokeTools": invoke_tools }
+    }))
+    .map_err(|error| {
+        crate::error::AgentError::internal(format!("Build bundled provider manifest: {error}"))
+    })
 }
