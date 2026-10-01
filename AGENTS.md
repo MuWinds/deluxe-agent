@@ -78,7 +78,6 @@ deluxe-agent/
 ├── Cargo.toml             # 依赖、release profile、对 egui-winit 的 [patch.crates-io]
 ├── Cargo.lock             # 提交进仓库（二进制 crate）
 ├── AGENTS.md              # 本文件
-├── assets/fonts/          # 界面字体
 ├── vendor/egui-winit/     # 0.36.2 的本地补丁副本（见 Boundaries，勿删）
 └── src/
     ├── main.rs            # 入口：tracing、config/session/plugin 预加载、tokio runtime、eframe

@@ -123,11 +123,17 @@ impl App {
     /// Draws one frame.
     ///
     /// Intake and polling run before the draw pass so this frame reflects the
-    /// freshest state, and the deferred [`Actions`] are applied after it, once
+    /// freshest state, and the deferred [`UiIntent`] values are applied after it, once
     /// the borrows the widgets held have been released.
-    pub fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        _frame: &mut eframe::Frame,
+        resources: &mut GuiResources,
+    ) {
         let p = theme::palette(self.config.theme);
         let ctx = ui.ctx().clone();
+        let mut intents = Vec::new();
 
         // Image intake is a whole-frame concern, not the composer widget's: the
         // chord works wherever the focus is, and a file can be dropped onto any
@@ -138,33 +144,43 @@ impl App {
         // The composer's task list is a poll against the worker, throttled and
         // kept awake only while something is live. Before the draw pass so the
         // list reflects the freshest reply this frame.
-        self.poll_jobs(&ctx);
-
-        let mut actions = Actions::default();
-        self.draw_menu_bar(ui, &p, &mut actions);
-        self.draw_rail(ui, &p, &mut actions);
-        if self.show_sidebar {
-            self.draw_sidebar(ui, &p, &mut actions);
+        if let Some(intent) = self.poll_jobs_intent() {
+            intents.push(intent);
         }
-        self.draw_main(ui, &p, &mut actions);
 
-        self.draw_settings(&ctx, &p);
+        self.draw_menu_bar(ui, &p, &mut intents);
+        self.draw_rail(ui, &p, &mut intents);
+        if self.show_sidebar {
+            self.draw_sidebar(ui, &p, &mut intents);
+        }
+        self.draw_main(ui, &p, &mut intents, resources);
+
+        self.draw_settings(&ctx, &p, &mut intents);
         self.draw_about(&ctx, &p);
-        self.draw_plugins(&ctx, &mut actions);
-        self.draw_subagent_window(&ctx, &p);
+        self.draw_plugins(&ctx, &mut intents);
+        self.draw_subagent_window(&ctx, &p, resources, &mut intents);
 
-        self.apply_actions(actions, &ctx);
+        let effects = self.apply_intents(intents);
+        if effects.close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if let Some(theme) = effects.theme {
+            theme::apply(&ctx, theme);
+        }
+        if let Some(text) = effects.clipboard_text {
+            ctx.copy_text(text);
+        }
+        if effects.repaint_after {
+            ctx.request_repaint_after(JOBS_POLL_INTERVAL);
+        }
     }
 
     /// The top menu bar: 文件 / 编辑 / 视图 / 帮助.
-    fn draw_menu_bar(&mut self, ui: &mut egui::Ui, p: &Palette, actions: &mut Actions) {
+    fn draw_menu_bar(&mut self, ui: &mut egui::Ui, p: &Palette, intents: &mut Vec<UiIntent>) {
         let mut theme_choice = self.config.theme;
-        let mut theme_changed = false;
         // Seeded from the real state, not `false`: a checkbox bound to a local
         // that always starts out unchecked shows the wrong thing every frame.
         let mut show_sidebar = self.show_sidebar;
-        let mut copy_transcript = false;
-        let mut delete_session = false;
         let has_session = self.selected_session().is_some();
 
         egui::Panel::top("menubar")
@@ -177,16 +193,16 @@ impl App {
                 egui::MenuBar::new().ui(ui, |ui| {
                     ui.menu_button("文件", |ui| {
                         if ui.button("新建会话").clicked() {
-                            actions.new_session = true;
+                            intents.push(UiIntent::NewSession);
                             ui.close();
                         }
                         if ui.button("设置").clicked() {
-                            actions.open_settings = true;
+                            intents.push(UiIntent::OpenSettings);
                             ui.close();
                         }
                         ui.separator();
                         if ui.button("退出").clicked() {
-                            actions.quit = true;
+                            intents.push(UiIntent::Quit);
                             ui.close();
                         }
                     });
@@ -196,14 +212,16 @@ impl App {
                             .add_enabled(has_session, egui::Button::new("复制会话正文"))
                             .clicked()
                         {
-                            copy_transcript = true;
+                            intents.push(UiIntent::CopyTranscript);
                             ui.close();
                         }
                         if ui
                             .add_enabled(has_session, egui::Button::new("删除当前会话"))
                             .clicked()
                         {
-                            delete_session = true;
+                            if let Some(id) = self.selected {
+                                intents.push(UiIntent::DeleteSession(id));
+                            }
                             ui.close();
                         }
                     });
@@ -214,45 +232,28 @@ impl App {
                                 .selectable_value(&mut theme_choice, choice, choice.label())
                                 .clicked()
                             {
-                                theme_changed = true;
+                                intents.push(UiIntent::SetTheme(choice));
                                 ui.close();
                             }
                         }
                         ui.separator();
-                        ui.checkbox(&mut show_sidebar, "显示侧边栏");
+                        if ui.checkbox(&mut show_sidebar, "显示侧边栏").changed() {
+                            intents.push(UiIntent::SetSidebarVisible(show_sidebar));
+                        }
                     });
 
                     ui.menu_button("帮助", |ui| {
                         if ui.button("关于").clicked() {
-                            actions.open_about = true;
+                            intents.push(UiIntent::OpenAbout);
                             ui.close();
                         }
                     });
                 });
             });
-
-        if theme_changed && theme_choice != self.config.theme {
-            self.config.theme = theme_choice;
-            theme::apply(ui.ctx(), theme_choice);
-            self.save_settings();
-        }
-        if show_sidebar != self.show_sidebar {
-            self.show_sidebar = show_sidebar;
-        }
-        if copy_transcript {
-            if let Some(session) = self.selected_session() {
-                ui.ctx().copy_text(session.as_text());
-            }
-        }
-        if delete_session {
-            if let Some(id) = self.selected {
-                self.delete_session(id);
-            }
-        }
     }
 
     /// The far-left icon rail: home, plugins, settings, about, quit.
-    fn draw_rail(&mut self, ui: &mut egui::Ui, p: &Palette, actions: &mut Actions) {
+    fn draw_rail(&mut self, ui: &mut egui::Ui, p: &Palette, intents: &mut Vec<UiIntent>) {
         let selected = self.selected.is_some();
         let settings_open = self.show_settings;
         let about_open = self.show_about;
@@ -274,13 +275,13 @@ impl App {
                     // session open and starting a fresh one are the same act:
                     // deselect and show the empty state.
                     if rail_button(ui, icons::HOUSE, !selected, "主界面").clicked() {
-                        actions.new_session = true;
+                        intents.push(UiIntent::NewSession);
                     }
                     // What is installed: a plugin is only visible today through
                     // a slash command in the picker, which is no way to answer
                     // "did the one I just enabled load?".
                     if rail_button(ui, icons::PUZZLE_PIECE, plugins_open, "插件").clicked() {
-                        actions.open_plugins = true;
+                        intents.push(UiIntent::OpenPlugins);
                     }
                 });
 
@@ -288,17 +289,17 @@ impl App {
                 // window is.
                 ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
                     if rail_button(ui, icons::GEAR, settings_open, "设置").clicked() {
-                        actions.open_settings = true;
+                        intents.push(UiIntent::OpenSettings);
                     }
                     if rail_button(ui, icons::QUESTION, about_open, "关于").clicked() {
-                        actions.open_about = true;
+                        intents.push(UiIntent::OpenAbout);
                     }
                 });
             });
     }
 
     /// The session sidebar: search, projects, recent conversations.
-    fn draw_sidebar(&mut self, ui: &mut egui::Ui, p: &Palette, actions: &mut Actions) {
+    fn draw_sidebar(&mut self, ui: &mut egui::Ui, p: &Palette, intents: &mut Vec<UiIntent>) {
         let mut search = std::mem::take(&mut self.search);
         let now = session::now_unix();
         let query = search.trim().to_lowercase();
@@ -359,7 +360,7 @@ impl App {
 
                 ui.add_space(8.0);
                 if sidebar_row(ui, p, icons::NOTE_PENCIL, "新聊天", false, false).clicked() {
-                    actions.new_session = true;
+                    intents.push(UiIntent::NewSession);
                 }
                 ui.add_space(12.0);
 
@@ -372,7 +373,7 @@ impl App {
                         }
                         hits += 1;
                         if session_row(ui, p, session, selected, now, false).clicked() {
-                            actions.select = Some(session.id);
+                            intents.push(UiIntent::SelectSession(session.id));
                         }
                     }
                     if hits == 0 {
@@ -386,7 +387,7 @@ impl App {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if section_header_with_add(ui, p, "项目") {
-                            actions.add_project = true;
+                            intents.push(UiIntent::AddProject);
                         }
                         // A project list that could not be written is reported
                         // here, beside the projects it is about.
@@ -399,7 +400,7 @@ impl App {
                             let response =
                                 sidebar_row(ui, p, icons::FOLDER_SIMPLE, &name, is_open, true);
                             if response.clicked() {
-                                actions.select_project = Some(project.clone());
+                                intents.push(UiIntent::SelectProject(project.clone()));
                             }
                             response.context_menu(|ui| {
                                 if ui.button("复制路径").clicked() {
@@ -407,7 +408,7 @@ impl App {
                                     ui.close();
                                 }
                                 if ui.button("移除项目").clicked() {
-                                    actions.remove_project = Some(project.clone());
+                                    intents.push(UiIntent::RemoveProject(project.clone()));
                                     ui.close();
                                 }
                             });
@@ -417,7 +418,7 @@ impl App {
                                     sessions.iter().filter(|s| &s.project == project).rev()
                                 {
                                     if session_row(ui, p, session, selected, now, true).clicked() {
-                                        actions.select = Some(session.id);
+                                        intents.push(UiIntent::SelectSession(session.id));
                                     }
                                 }
                             }
@@ -431,11 +432,11 @@ impl App {
                         for session in sessions.iter().rev() {
                             let response = session_row(ui, p, session, selected, now, false);
                             if response.clicked() {
-                                actions.select = Some(session.id);
+                                intents.push(UiIntent::SelectSession(session.id));
                             }
                             response.context_menu(|ui| {
                                 if ui.button("删除").clicked() {
-                                    actions.delete = Some(session.id);
+                                    intents.push(UiIntent::DeleteSession(session.id));
                                     ui.close();
                                 }
                             });
@@ -450,12 +451,18 @@ impl App {
     ///
     /// The composer is drawn first so the bottom panel can claim its height
     /// before the transcript's scroll area sizes itself from what is left.
-    fn draw_main(&mut self, ui: &mut egui::Ui, p: &Palette, actions: &mut Actions) {
+    fn draw_main(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        intents: &mut Vec<UiIntent>,
+        resources: &mut GuiResources,
+    ) {
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(p.main_bg))
             .show(ui, |ui| {
-                self.draw_composer(ui, p, actions);
-                self.draw_transcript(ui, p);
+                self.draw_composer(ui, p, intents);
+                self.draw_transcript(ui, p, resources);
             });
     }
 
@@ -465,7 +472,12 @@ impl App {
     /// be toggled, and every other step through [`draw_step`]; the salt folds in
     /// the session id so a code block's scroll offset cannot leak between
     /// sessions.
-    pub(super) fn draw_transcript(&mut self, ui: &mut egui::Ui, p: &Palette) {
+    pub(super) fn draw_transcript(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        resources: &mut GuiResources,
+    ) {
         let stick = self.stick_to_bottom;
 
         let Some(index) = self
@@ -498,7 +510,7 @@ impl App {
         let expanded_reasoning = &mut self.expanded_reasoning;
         // Same story as `expanded_reasoning`: a thumbnail decode on miss writes
         // into the cache while the steps are still being read.
-        let thumbs = &mut self.thumbs;
+        let thumbs = &mut resources.thumbs;
 
         let output = egui::ScrollArea::vertical()
             .id_salt("transcript")
@@ -543,7 +555,7 @@ impl App {
     }
 
     /// The composer: the command picker, the input row and the queued images.
-    fn draw_composer(&mut self, ui: &mut egui::Ui, p: &Palette, actions: &mut Actions) {
+    fn draw_composer(&mut self, ui: &mut egui::Ui, p: &Palette, intents: &mut Vec<UiIntent>) {
         // Whether the *open* session is running, not whether anything is: the
         // composer is bound to that session, so another run in flight must leave
         // this one's Send button alone.
@@ -651,19 +663,19 @@ impl App {
                                     RichText::new(icons::PLUS).size(theme::font(16.0)),
                                     |ui| {
                                         if ui.button("新建会话").clicked() {
-                                            actions.new_session = true;
+                                            intents.push(UiIntent::NewSession);
                                             ui.close();
                                         }
                                         if ui.button("添加项目…").clicked() {
-                                            actions.add_project = true;
+                                            intents.push(UiIntent::AddProject);
                                             ui.close();
                                         }
                                         if ui.button("粘贴图片").clicked() {
-                                            actions.paste_image = true;
+                                            intents.push(UiIntent::PasteImage);
                                             ui.close();
                                         }
                                         if ui.button("插入图片…").clicked() {
-                                            actions.pick_image = true;
+                                            intents.push(UiIntent::PickImage);
                                             ui.close();
                                         }
                                     },
@@ -696,7 +708,7 @@ impl App {
                                         apply_command_choice(&mut self.prompt, name);
                                     }
                                 } else if editor.has_focus() && enter {
-                                    actions.send = true;
+                                    intents.push(UiIntent::SendPrompt);
                                 }
 
                                 // Ctrl+V on an image is handled app-side (see
@@ -717,14 +729,14 @@ impl App {
                                         .on_hover_text("停止")
                                         .clicked()
                                     {
-                                        actions.stop = true;
+                                        intents.push(UiIntent::CancelRun);
                                     }
                                 } else if ui
                                     .add_enabled(can_send, circle_button(icons::ARROW_UP, p))
                                     .on_hover_text("发送")
                                     .clicked()
                                 {
-                                    actions.send = true;
+                                    intents.push(UiIntent::SendPrompt);
                                 }
                             });
 
@@ -734,7 +746,7 @@ impl App {
                             // almost all of it — and push Send off the right
                             // edge of the window.
                             if !self.pending_images.is_empty() {
-                                self.draw_pending_image_strip(ui, p);
+                                self.draw_pending_image_strip(ui, p, intents);
                             }
                         });
 
@@ -742,7 +754,7 @@ impl App {
                     // status line's place: instead of a one-shot "已提交", the
                     // composer shows what is actually running — and nothing at
                     // all when nothing is.
-                    self.draw_jobs(ui, p);
+                    self.draw_jobs(ui, p, intents);
                 });
             });
     }
@@ -755,7 +767,7 @@ impl App {
     /// by older, settled rows; the rest fill up to [`MAX_JOB_ROWS`], newest
     /// first. With no jobs the list draws nothing and the composer keeps its
     /// height.
-    fn draw_jobs(&mut self, ui: &mut egui::Ui, p: &Palette) {
+    fn draw_jobs(&mut self, ui: &mut egui::Ui, p: &Palette, intents: &mut Vec<UiIntent>) {
         if self.jobs.is_empty() {
             return;
         }
@@ -806,11 +818,10 @@ impl App {
         });
 
         if let Some(job_id) = stop {
-            self.kill_job(&job_id);
+            intents.push(UiIntent::KillJob(job_id));
         }
         if let Some(job_id) = open {
-            // The button toggles, so a second press closes the window it opened.
-            self.open_subagent = (open_now.as_deref() != Some(job_id.as_str())).then_some(job_id);
+            intents.push(UiIntent::ToggleSubagent(job_id));
         }
     }
 
@@ -821,7 +832,13 @@ impl App {
     /// enters the parent's context. The steps render through the same
     /// [`draw_step`] the transcript uses, so a tool card looks the same here as
     /// it does in a conversation.
-    fn draw_subagent_window(&mut self, ctx: &egui::Context, p: &Palette) {
+    fn draw_subagent_window(
+        &mut self,
+        ctx: &egui::Context,
+        p: &Palette,
+        resources: &mut GuiResources,
+        intents: &mut Vec<UiIntent>,
+    ) {
         let Some(job_id) = self.open_subagent.clone() else {
             return;
         };
@@ -854,7 +871,7 @@ impl App {
         // are still being read.
         let steps = &self.subagent_runs[index].steps;
         let expanded_reasoning = &mut self.expanded_reasoning;
-        let thumbs = &mut self.thumbs;
+        let thumbs = &mut resources.thumbs;
 
         egui::Window::new(title)
             .id(egui::Id::new(("subagent-window", &job_id)))
@@ -919,10 +936,10 @@ impl App {
             });
 
         if stop {
-            self.kill_job(&job_id);
+            intents.push(UiIntent::KillJob(job_id.clone()));
         }
         if !open {
-            self.open_subagent = None;
+            intents.push(UiIntent::CloseSubagent);
         }
     }
 
@@ -1110,27 +1127,32 @@ impl App {
     }
 
     /// The queued images inside the composer, each removable.
-    fn draw_pending_image_strip(&mut self, ui: &mut egui::Ui, p: &Palette) {
+    fn draw_pending_image_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        intents: &mut Vec<UiIntent>,
+    ) {
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             for index in (0..self.pending_images.len()).rev() {
                 let id = format!("pending-image-{}", self.pending_images[index].id);
                 if remove_chip(ui, p, &id, &self.pending_images[index]).clicked() {
-                    self.pending_images.remove(index);
+                    intents.push(UiIntent::RemovePendingImage(
+                        self.pending_images[index].id.clone(),
+                    ));
                 }
             }
         });
     }
 
     /// The 设置 window: endpoint, key, context and safety settings.
-    fn draw_settings(&mut self, ctx: &egui::Context, p: &Palette) {
+    fn draw_settings(&mut self, ctx: &egui::Context, p: &Palette, intents: &mut Vec<UiIntent>) {
         if !self.show_settings {
             return;
         }
 
         let mut open = true;
-        let mut save = false;
-
         egui::Window::new("设置")
             .open(&mut open)
             .default_width(620.0)
@@ -1271,7 +1293,7 @@ impl App {
                 ui.add_space(10.0);
                 ui.separator();
                 if ui.button("保存").clicked() {
-                    save = true;
+                    intents.push(UiIntent::SaveSettings);
                 }
 
                 // Where a save failure is shown: on the page whose save failed,
@@ -1281,10 +1303,6 @@ impl App {
                     ui.label(RichText::new(error).color(BAD_RED));
                 }
             });
-
-        if save {
-            self.save_settings();
-        }
 
         let _ = p;
         if !open {
@@ -1359,7 +1377,7 @@ impl App {
     ///
     /// Each row expands to what the plugin brings and carries the two acts on
     /// it: a switch, which is reversible, and an uninstall, which asks first.
-    fn draw_plugins(&mut self, ctx: &egui::Context, actions: &mut Actions) {
+    fn draw_plugins(&mut self, ctx: &egui::Context, intents: &mut Vec<UiIntent>) {
         if !self.show_plugins {
             return;
         }
@@ -1401,7 +1419,7 @@ impl App {
                 if !enabled.is_empty() {
                     ui.label(RichText::new(format!("已启用（{}）", enabled.len())).strong());
                     for plugin in enabled {
-                        draw_plugin_row(ui, plugin, true, &mut pending, actions);
+                        draw_plugin_row(ui, plugin, true, &mut pending, intents);
                     }
                 }
 
@@ -1409,7 +1427,7 @@ impl App {
                     ui.add_space(10.0);
                     ui.label(RichText::new(format!("已停用（{}）", disabled.len())).strong());
                     for plugin in disabled {
-                        draw_plugin_row(ui, plugin, false, &mut pending, actions);
+                        draw_plugin_row(ui, plugin, false, &mut pending, intents);
                     }
                 }
             });
@@ -1434,7 +1452,7 @@ fn draw_plugin_row(
     plugin: &plugins::LoadedPlugin,
     enabled: bool,
     pending: &mut Option<String>,
-    actions: &mut Actions,
+    intents: &mut Vec<UiIntent>,
 ) {
     let version = plugin.manifest.version.as_deref().unwrap_or("版本未知");
     let title = format!("{}  {version}", plugin.display_name());
@@ -1465,7 +1483,10 @@ fn draw_plugin_row(
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui.button(if enabled { "停用" } else { "启用" }).clicked() {
-                    actions.set_plugin = Some((plugin.id.clone(), !enabled));
+                    intents.push(UiIntent::SetPluginEnabled {
+                        id: plugin.id.clone(),
+                        enabled: !enabled,
+                    });
                 }
                 if ui.button("卸载").clicked() {
                     *pending = Some(plugin.id.clone());
@@ -1476,7 +1497,7 @@ fn draw_plugin_row(
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("确认卸载？").color(BAD_RED));
                     if ui.button("确认").clicked() {
-                        actions.uninstall_plugin = Some(plugin.id.clone());
+                        intents.push(UiIntent::UninstallPlugin(plugin.id.clone()));
                         *pending = None;
                     }
                     if ui.button("取消").clicked() {

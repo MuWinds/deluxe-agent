@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
-use egui::TextureHandle;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -20,14 +19,24 @@ use uuid::Uuid;
 use crate::attachments::{self, ImageRef};
 use crate::code_view;
 use crate::config::{Config, API_KEY_ENV};
-use crate::harness::{AgentEvent, AgentEventSink};
 use crate::image_ops;
 use crate::ipc::{Cmd, Event, JobState, JobView, LlmSettings, RunId, RunState, SecretValue};
-use crate::llm::{ThinkingLevel, UserTurn};
+use crate::llm::UserTurn;
 use crate::plugins::{self, PluginCatalogue};
 use crate::session::{self, Session, Step, ToolResult};
 
+mod events;
+mod intents;
+mod resources;
+mod state;
 mod ui;
+
+use intents::{UiEffects, UiIntent};
+
+pub use events::{EventSink, RepaintSignal};
+pub use resources::GuiResources;
+use state::{ActiveRun, ConfigSurface, SubagentRun};
+pub use state::{App, Paths};
 
 /// How often the composer asks the worker for its project's background jobs.
 ///
@@ -43,16 +52,6 @@ const JOBS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// for days would hold one transcript per delegation ever made. Past the cap the
 /// oldest is dropped, never the one on screen.
 const MAX_SUBAGENT_RUNS: usize = 16;
-
-/// Pushes agent events into the GUI channel and wakes the window.
-///
-/// One repaint per event is affordable because the agent coalesces streamed text
-/// before emitting it; what is left is one event per tool call.
-#[derive(Clone)]
-pub struct ChannelSink {
-    tx: mpsc::UnboundedSender<Event>,
-    ctx: egui::Context,
-}
 
 /// A token count for the composer, in the shortest unit that fits.
 ///
@@ -110,242 +109,6 @@ fn parse_token_count(text: &str) -> Option<u64> {
     Some(count.saturating_mul(multiplier))
 }
 
-impl ChannelSink {
-    /// A sink that pushes events into `tx` and wakes the window through `ctx`.
-    pub fn new(tx: mpsc::UnboundedSender<Event>, ctx: egui::Context) -> Self {
-        Self { tx, ctx }
-    }
-
-    /// Publishes a UI protocol event and wakes the window.
-    pub fn emit_ui(&self, event: Event) {
-        if self.tx.send(event).is_ok() {
-            self.ctx.request_repaint();
-        }
-    }
-}
-
-impl AgentEventSink for ChannelSink {
-    fn emit(&self, event: AgentEvent) {
-        self.emit_ui(event.into());
-    }
-}
-
-/// One run in flight, and the session it writes into.
-///
-/// Several runs may be in flight at once, which is why [`App::active`] is a map
-/// rather than a slot: the correlation token is the key, and this is what it
-/// maps to. `RunId` is a per-process token and `Uuid` is the durable session
-/// id — keeping them apart is what stops a restarted process from reusing id 1
-/// and folding a fresh run into a session loaded from disk.
-#[derive(Debug, Clone, Copy)]
-struct ActiveRun {
-    session: Uuid,
-}
-
-/// One delegated sub-agent's own transcript, as its window shows it.
-///
-/// Kept as a plain step list rather than a [`Session`]: a sub-agent's
-/// conversation is not a session the user can reopen, rename or continue — it
-/// exists only for as long as its job does, and is never written to the store.
-#[derive(Debug, Clone)]
-struct SubagentRun {
-    /// The background job these steps belong to. The window and the task row
-    /// are two views of it.
-    job_id: String,
-    /// The `task` role the sub-agent runs, learned from its opening message.
-    /// Empty until that arrives.
-    agent: String,
-    /// Salt for the Markdown renderer's scroll areas, one per run: a step index
-    /// is only unique within a transcript, so two runs sharing a salt would
-    /// share a code block's scroll offset.
-    salt: Uuid,
-    steps: Vec<Step>,
-}
-
-impl SubagentRun {
-    /// An empty transcript for `job_id`; its role and steps arrive as events do.
-    fn new(job_id: impl Into<String>) -> Self {
-        Self {
-            job_id: job_id.into(),
-            agent: String::new(),
-            salt: Uuid::new_v4(),
-            steps: Vec::new(),
-        }
-    }
-}
-
-/// What a draw pass decided should happen, applied once the borrows are released.
-#[derive(Default)]
-struct Actions {
-    new_session: bool,
-    /// A session the user clicked.
-    select: Option<Uuid>,
-    /// A project the user clicked; it becomes the active project.
-    select_project: Option<String>,
-    delete: Option<Uuid>,
-    send: bool,
-    stop: bool,
-    open_settings: bool,
-    open_about: bool,
-    /// Show the window listing the installed plugins.
-    open_plugins: bool,
-    /// Turn one plugin on or off: its id, and the state to set it to.
-    set_plugin: Option<(String, bool)>,
-    /// Uninstall one plugin, by id.
-    uninstall_plugin: Option<String>,
-    quit: bool,
-    /// Pick a folder and add it to the project list.
-    add_project: bool,
-    /// Drop a project from the list. Its sessions are kept.
-    remove_project: Option<String>,
-    /// Pick an image file and queue it in the composer.
-    pick_image: bool,
-    /// Read an image out of the clipboard and queue it in the composer.
-    paste_image: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ConfigSurface {
-    Sidebar,
-    Settings,
-}
-
-/// Where this app's state lives on the machine, resolved once at startup.
-///
-/// The config path is retained for the About window; persistence is owned by
-/// the worker.
-pub struct Paths {
-    /// The config file, or `None` when the system offers no config directory.
-    pub config_path: Option<PathBuf>,
-}
-
-pub struct App {
-    cmd_tx: mpsc::UnboundedSender<Cmd>,
-    events: mpsc::UnboundedReceiver<Event>,
-
-    config: Config,
-    api_key: String,
-    /// Every plugin that loaded, both scopes.
-    ///
-    /// Held rather than resolved once because which plugins apply depends on
-    /// the project the open conversation belongs to, and that changes as the
-    /// user switches sessions — so the command list has to be asked for again
-    /// each time, not cached at startup. Re-derived whenever the plugins window
-    /// changes what is enabled, disabled or installed.
-    catalogue: Arc<PluginCatalogue>,
-    /// Where the marketplaces and the config live.
-    ///
-    /// Held so the window can re-run discovery after a plugin change — the
-    /// worker never reads a marketplace itself, it is handed the catalogue —
-    /// and so a save writes the file the app was started with.
-    paths: Paths,
-
-    /// Oldest first. The session store relies on that order.
-    sessions: Vec<Session>,
-    selected: Option<Uuid>,
-    /// The project new chats are rooted at, and the one the sidebar keeps
-    /// expanded. Follows the selection while a session is open, and is what
-    /// makes a project with no sessions yet still reachable.
-    active_project: Option<String>,
-    /// Every run in flight, keyed by its correlation token. Each run writes
-    /// only into the session recorded here, so an event can never land in the
-    /// session that merely happens to be open.
-    active: HashMap<RunId, ActiveRun>,
-    next_run_id: RunId,
-    /// Set when the store is worth writing. Deliberately *not* set by streamed
-    /// text: a run emits hundreds of fragments, and serialising up to 5 MB on the
-    /// GUI thread per fragment would be visible.
-    dirty: bool,
-    /// Identifies each durable session snapshot.
-    session_revision: u64,
-    /// At most one normal save is queued at a time.
-    save_pending: Option<u64>,
-    next_config_request_id: u64,
-    pending_config_saves: HashMap<u64, ConfigSurface>,
-    config_save_requests: HashMap<ConfigSurface, u64>,
-    pending_api_key_save: Option<u64>,
-    pending_plugin_request: Option<u64>,
-
-    prompt: String,
-    /// Images queued for the next send, oldest first. Filled by pasting
-    /// (Ctrl+V on an image), dropping image files, or the composer's picker;
-    /// handed to the run and cleared on send.
-    pending_images: Vec<ImageRef>,
-    /// The reasoning effort the composer will ask for on its next send.
-    ///
-    /// A per-conversation choice, not a global setting: it is synced from the
-    /// session when one is opened and written back into the session on send, so
-    /// two chats on one model can think at different strengths. Held here rather
-    /// than read straight off the session because a brand-new chat has no session
-    /// until its first prompt, yet the picker must still be usable.
-    thinking: Option<ThinkingLevel>,
-    /// Decoded thumbnails, keyed by attachment id. Filled on first draw; a
-    /// texture re-decoded every frame would burn the GUI thread, and egui's
-    /// `load_texture` allocates fresh per call — so the cache lives here.
-    thumbs: HashMap<String, TextureHandle>,
-    search: String,
-    /// The context-length field's text buffer. Source of truth stays
-    /// `config.context.context_limit`; this is what the user types into, and it
-    /// is reseeded whenever the settings panel opens so a failed parse does not
-    /// strand a stale figure on screen.
-    context_limit_text: String,
-    /// The max-output-length field's text buffer, same split as
-    /// [`App::context_limit_text`]. Empty means no budget.
-    max_output_tokens_text: String,
-    /// Which row of the composer's command picker the keyboard has highlighted.
-    ///
-    /// Clamped to the number of matches each time the picker is drawn, so a list
-    /// that shrinks as the user types cannot leave it pointing past the end.
-    command_highlight: usize,
-    /// The `/name` query the user pressed Escape on.
-    ///
-    /// Keyed by the query rather than held as a plain flag so it clears itself:
-    /// the next character typed makes the query differ, and the picker is back
-    /// without anything having to remember to reset it.
-    command_picker_dismissed: Option<String>,
-    /// Which reasoning blocks are open. Keyed by a stable id derived from the
-    /// step's text, so an expansion survives reopening a session.
-    expanded_reasoning: HashSet<Uuid>,
-    /// Whether the transcript was scrolled to the bottom last frame.
-    stick_to_bottom: bool,
-    /// The background jobs of [`App::jobs_project`], newest last, as the last
-    /// worker reply reported them.
-    jobs: Vec<JobView>,
-    /// The project `jobs` describes. A reply is accepted only when its project
-    /// matches, so switching conversations cannot show another project's jobs.
-    jobs_project: Option<PathBuf>,
-    /// When the worker was last asked for jobs, for the poll throttle.
-    jobs_last_poll: Option<Instant>,
-    /// The sub-agent transcripts the window has heard from, oldest first. Fed
-    /// by the events a delegated agent forwards (see [`Event::Subagent`]), not
-    /// by the poll, so a transcript is complete even if its window was never
-    /// opened.
-    subagent_runs: Vec<SubagentRun>,
-    /// The sub-agent whose transcript window is open, by job id.
-    open_subagent: Option<String>,
-
-    show_settings: bool,
-    show_about: bool,
-    /// The window listing the installed plugins.
-    show_plugins: bool,
-    /// The plugin the user asked to uninstall, awaiting confirmation.
-    ///
-    /// Held rather than a dialog spawned inline, because the confirmation has
-    /// to survive the frame the click happened in — the button that asked is
-    /// gone by the next one.
-    pending_uninstall: Option<String>,
-    show_sidebar: bool,
-
-    /// The last error each surface produced, shown where the problem happened
-    /// rather than in one shared line: a settings save failure belongs in the
-    /// settings window, a plugin failure in the plugins window, and a project
-    /// list that could not be written beside the projects. Cleared when the
-    /// surface closes, so a stale error cannot linger.
-    settings_error: Option<String>,
-    plugins_error: Option<String>,
-    sidebar_error: Option<String>,
-}
-
 impl App {
     /// Builds the window from the state `main` resolved before it opened.
     ///
@@ -389,7 +152,6 @@ impl App {
             prompt: String::new(),
             pending_images: Vec::new(),
             thinking: None,
-            thumbs: HashMap::new(),
             search: String::new(),
             context_limit_text: String::new(),
             max_output_tokens_text: String::new(),
@@ -933,7 +695,7 @@ impl App {
     /// the displayed project's jobs at most every [`JOBS_POLL_INTERVAL`], and
     /// schedules the next frame only while something is still live — a run in
     /// flight or an unfinished job — so an idle window does not spin.
-    fn poll_jobs(&mut self, ctx: &egui::Context) {
+    fn poll_jobs_intent(&mut self) -> Option<UiIntent> {
         let project = PathBuf::from(self.displayed_project());
         // Switching conversations switches projects: drop the old list at once
         // so another project's jobs are never shown, and ask again immediately
@@ -948,16 +710,10 @@ impl App {
             .jobs_last_poll
             .is_none_or(|at| at.elapsed() >= JOBS_POLL_INTERVAL);
         if due && !project.as_os_str().is_empty() {
-            let _ = self.cmd_tx.send(Cmd::ListJobs { project });
             self.jobs_last_poll = Some(Instant::now());
+            return Some(UiIntent::PollJobs(project));
         }
-
-        // Keep frames coming while a job or a run is still moving, so the list
-        // and its timers stay live; once everything has settled the window is
-        // free to idle.
-        if self.jobs.iter().any(|job| !job.is_settled()) || !self.active.is_empty() {
-            ctx.request_repaint_after(JOBS_POLL_INTERVAL);
-        }
+        None
     }
 
     /// The prompt as it should actually be sent, with a leading `/name`
@@ -1337,76 +1093,78 @@ impl App {
         }
     }
 
-    /// Applies the deferred [`Actions`] a draw pass recorded, once its borrows
-    /// have been released.
-    fn apply_actions(&mut self, actions: Actions, ctx: &egui::Context) {
-        if actions.quit {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        if actions.new_session {
-            self.new_session();
-        }
-        if let Some(id) = actions.select {
-            self.selected = Some(id);
-            // The project the session belongs to becomes the active one, so a
-            // following 新聊天 stays where the user is looking.
-            if let Some(session) = self.sessions.iter().find(|session| session.id == id) {
-                self.active_project = Some(session.project.clone());
-                // The picker follows the conversation being opened: the level is
-                // a property of the session, so switching sessions switches it.
-                self.thinking = session.thinking;
+    /// Applies controller inputs after the renderer releases its widget borrows.
+    ///
+    /// No egui value is required here. GUI-only effects such as closing the
+    /// viewport or copying text are returned to the renderer after state and
+    /// IPC side effects have been applied.
+    fn apply_intents(&mut self, intents: Vec<UiIntent>) -> UiEffects {
+        let mut effects = UiEffects::default();
+        for intent in intents {
+            match intent {
+                UiIntent::Quit => effects.close = true,
+                UiIntent::NewSession => self.new_session(),
+                UiIntent::SelectSession(id) => {
+                    self.selected = Some(id);
+                    if let Some(session) = self.sessions.iter().find(|session| session.id == id) {
+                        self.active_project = Some(session.project.clone());
+                        self.thinking = session.thinking;
+                    }
+                    self.stick_to_bottom = true;
+                }
+                UiIntent::SelectProject(project) => self.open_project(project),
+                UiIntent::DeleteSession(id) => self.delete_session(id),
+                UiIntent::RemoveProject(project) => self.remove_project(&project),
+                UiIntent::OpenSettings => {
+                    self.show_settings = true;
+                    self.context_limit_text = self.config.context.context_limit.to_string();
+                    self.max_output_tokens_text = self
+                        .config
+                        .llm
+                        .max_output_tokens
+                        .map(|tokens| tokens.to_string())
+                        .unwrap_or_default();
+                }
+                UiIntent::OpenAbout => self.show_about = true,
+                UiIntent::OpenPlugins => self.show_plugins = true,
+                UiIntent::SetTheme(theme) => {
+                    if self.config.theme != theme {
+                        self.config.theme = theme;
+                        self.save_settings();
+                        effects.theme = Some(theme);
+                    }
+                }
+                UiIntent::SetSidebarVisible(visible) => self.show_sidebar = visible,
+                UiIntent::CopyTranscript => {
+                    effects.clipboard_text = self.selected_session().map(Session::as_text);
+                }
+                UiIntent::SetPluginEnabled { id, enabled } => {
+                    self.set_plugin_enabled(&id, enabled);
+                }
+                UiIntent::UninstallPlugin(id) => self.uninstall_plugin(&id),
+                UiIntent::AddProject => self.add_project(),
+                UiIntent::PasteImage => self.paste_image(),
+                UiIntent::PickImage => self.pick_image(),
+                UiIntent::RemovePendingImage(id) => {
+                    self.pending_images.retain(|image| image.id != id);
+                }
+                UiIntent::SaveSettings => self.save_settings(),
+                UiIntent::CancelRun => self.cancel_run(),
+                UiIntent::KillJob(job_id) => self.kill_job(&job_id),
+                UiIntent::PollJobs(project) => {
+                    let _ = self.cmd_tx.send(Cmd::ListJobs { project });
+                }
+                UiIntent::ToggleSubagent(job_id) => {
+                    let current = self.open_subagent.as_deref();
+                    self.open_subagent = (current != Some(job_id.as_str())).then_some(job_id);
+                }
+                UiIntent::CloseSubagent => self.open_subagent = None,
+                UiIntent::SendPrompt => self.start_run(),
             }
-            self.stick_to_bottom = true;
         }
-        if let Some(project) = actions.select_project {
-            self.open_project(project);
-        }
-        if let Some(id) = actions.delete {
-            self.delete_session(id);
-        }
-        if let Some(project) = actions.remove_project {
-            self.remove_project(&project);
-        }
-        if actions.open_settings {
-            self.show_settings = true;
-            // The buffers, not the live values, are what the panel edits — so
-            // each opening reseeds them from the config, picking up both an
-            // external config edit and whatever the last panel visit left.
-            self.context_limit_text = self.config.context.context_limit.to_string();
-            self.max_output_tokens_text = self
-                .config
-                .llm
-                .max_output_tokens
-                .map(|tokens| tokens.to_string())
-                .unwrap_or_default();
-        }
-        if actions.open_about {
-            self.show_about = true;
-        }
-        if actions.open_plugins {
-            self.show_plugins = true;
-        }
-        if let Some((id, enabled)) = actions.set_plugin {
-            self.set_plugin_enabled(&id, enabled);
-        }
-        if let Some(id) = actions.uninstall_plugin {
-            self.uninstall_plugin(&id);
-        }
-        if actions.add_project {
-            self.add_project();
-        }
-        if actions.paste_image {
-            self.paste_image();
-        }
-        if actions.pick_image {
-            self.pick_image();
-        }
-        if actions.stop {
-            self.cancel_run();
-        }
-        if actions.send {
-            self.start_run();
-        }
+        effects.repaint_after =
+            self.jobs.iter().any(|job| !job.is_settled()) || !self.active.is_empty();
+        effects
     }
 
     /// Ctrl+V when the clipboard holds an image — the one paste egui-winit
@@ -1865,7 +1623,8 @@ mod tests {
             )),
             ..Default::default()
         };
-        let mut output = ctx.run_ui(input, |ui| app.draw_transcript(ui, &p));
+        let mut resources = GuiResources::default();
+        let mut output = ctx.run_ui(input, |ui| app.draw_transcript(ui, &p, &mut resources));
 
         // The bubble is the rect painted in the user's fill; the reply is
         // plain Markdown, so the column's left edge is where its text starts.

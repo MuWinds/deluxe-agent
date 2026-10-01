@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use agent::RunRequest;
-use app::{App, ChannelSink, Paths};
+use app::{App, EventSink, GuiResources, Paths, RepaintSignal};
 use harness::{
     AgentEvent, AgentEventSink, ConfigStore, NativeConfigStore, NativePluginManager,
     NativeSecretStore, PluginManager, SecretStore, SessionStore,
@@ -156,12 +156,9 @@ fn main() -> eframe::Result<()> {
             // conversation is open.
             let catalogue = worker.plugins.clone();
 
-            spawn_worker(
-                &handle,
-                worker,
-                cmd_rx,
-                ChannelSink::new(event_tx.clone(), cc.egui_ctx.clone()),
-            );
+            let (sink, repaint_rx) = EventSink::new(event_tx.clone());
+            RepaintSignal::spawn(cc.egui_ctx.clone(), repaint_rx);
+            spawn_worker(&handle, worker, cmd_rx, sink);
 
             // The model settings are global worker state, so they are pushed
             // once here; every session and every run uses whatever is current.
@@ -186,6 +183,7 @@ fn main() -> eframe::Result<()> {
                     catalogue,
                     Paths { config_path },
                 ),
+                resources: GuiResources::default(),
                 runtime: Some(runtime),
             }))
         }),
@@ -210,7 +208,7 @@ fn spawn_worker(
     handle: &tokio::runtime::Handle,
     mut worker: Worker,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
-    sink: ChannelSink,
+    sink: EventSink,
 ) {
     handle.spawn(async move {
         // Every run in flight, so a `Cancel` can reach whichever one it names.
@@ -494,6 +492,7 @@ fn spawn_worker(
 /// window instead of being dropped at the end of `main`.
 struct AgentFrame {
     app: App,
+    resources: GuiResources,
     /// Held for the process lifetime. Dropping it at the end of `main` would
     /// stop the agent the moment the window opens, so it lives here instead.
     runtime: Option<tokio::runtime::Runtime>,
@@ -507,7 +506,7 @@ impl eframe::App for AgentFrame {
     }
 
     fn ui(&mut self, ui: &mut eframe::egui::Ui, frame: &mut eframe::Frame) {
-        self.app.ui(ui, frame);
+        self.app.ui(ui, frame, &mut self.resources);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

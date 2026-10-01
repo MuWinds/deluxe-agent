@@ -35,7 +35,6 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{Align, Color32, FontId, Frame, Layout, Margin, RichText, Stroke, Vec2};
 
 use crate::code_view;
-use crate::fonts;
 use crate::theme::{self, Palette};
 
 /// The size a bubble's body text is drawn at, which is what `draw_bubble` used
@@ -826,8 +825,8 @@ fn draw_block(ui: &mut egui::Ui, p: &Palette, block: &Block, salt: u64) {
 
 /// A heading's size.
 ///
-/// The top three levels are visibly larger; 4 to 6 are body size in bold,
-/// because a chat bubble is narrow and six distinct sizes do not fit in it.
+/// The top three levels are visibly larger; 4 to 6 are body size, because a
+/// chat bubble is narrow and six distinct sizes do not fit in it.
 fn heading_size(level: u8) -> f32 {
     match level {
         1 => theme::font(19.0),
@@ -847,8 +846,6 @@ fn span_format(p: &Palette, span: &Span, size: f32, colour: Color32) -> TextForm
     let font = if span.style.code {
         // Monospace glyphs are wider, so the same size reads larger.
         FontId::monospace(size * 0.92)
-    } else if span.style.bold {
-        fonts::bold(size)
     } else {
         FontId::proportional(size)
     };
@@ -1031,8 +1028,7 @@ fn draw_table(
     }
 
     let regular = FontId::proportional(TABLE_SIZE);
-    let bold = fonts::bold(TABLE_SIZE);
-    let metrics = measure_columns(ui, header, rows, &regular, &bold, columns);
+    let metrics = measure_columns(ui, header, rows, &regular, columns);
 
     let gap_total = TABLE_SPACING * (columns - 1) as f32;
     let available = (ui.available_width() - gap_total).max(1.0);
@@ -1043,11 +1039,11 @@ fn draw_table(
     // becomes when the bubble is too narrow to hold even a record.
     let widths = fit_widths(&metrics, available);
     let Some(widths) = widths else {
-        record_or_source(ui, p, header, rows, source, &bold);
+        record_or_source(ui, p, header, rows, source, &regular);
         return;
     };
     if should_render_records(rows, &widths, &metrics) {
-        record_or_source(ui, p, header, rows, source, &bold);
+        record_or_source(ui, p, header, rows, source, &regular);
         return;
     }
 
@@ -1055,7 +1051,7 @@ fn draw_table(
     // A sub-`Ui` of the table's own width, so the separator rules stop at the
     // table rather than running on to the edge of the bubble.
     ui.allocate_ui_with_layout(Vec2::new(total, 0.0), Layout::top_down(Align::Min), |ui| {
-        draw_grid_row(ui, p, header, &widths, align, &bold);
+        draw_grid_row(ui, p, header, &widths, align, &regular);
         ui.add_space(TABLE_V_PAD);
         draw_rule(ui, p, total);
         ui.add_space(TABLE_V_PAD);
@@ -1077,7 +1073,7 @@ fn record_or_source(
     header: &[Vec<Span>],
     rows: &[Vec<Vec<Span>>],
     source: &str,
-    bold: &FontId,
+    font: &FontId,
 ) {
     let labels: Vec<String> = header
         .iter()
@@ -1085,7 +1081,7 @@ fn record_or_source(
         .collect();
     let label_width = labels
         .iter()
-        .map(|label| measure_spans(ui, &[Span::plain(label.clone())], bold))
+        .map(|label| measure_spans(ui, &[Span::plain(label.clone())], font))
         .fold(0.0f32, f32::max);
     // `  label  value` has to leave room for the value; below that, a record
     // is as unreadable as the grid was.
@@ -1219,8 +1215,6 @@ fn cell_format(p: &Palette, span: &Span, font: &FontId, colour: Color32) -> Text
     let mut format = span_format(p, span, font.size, colour);
     if span.style.code {
         format.font_id = FontId::monospace(font.size * 0.92);
-    } else if span.style.bold {
-        format.font_id = fonts::bold(font.size);
     } else {
         format.font_id = font.clone();
     }
@@ -1236,7 +1230,6 @@ fn measure_columns(
     header: &[Vec<Span>],
     rows: &[Vec<Vec<Span>>],
     regular: &FontId,
-    bold: &FontId,
     columns: usize,
 ) -> Vec<ColumnMetrics> {
     let mut metrics = (0..columns)
@@ -1248,9 +1241,9 @@ fn measure_columns(
         .collect::<Vec<_>>();
 
     for (column, cell) in header.iter().enumerate().take(columns) {
-        let width = measure_spans(ui, cell, bold);
+        let width = measure_spans(ui, cell, regular);
         metrics[column].max = metrics[column].max.max(width);
-        metrics[column].token = metrics[column].token.max(longest_token(ui, cell, bold));
+        metrics[column].token = metrics[column].token.max(longest_token(ui, cell, regular));
     }
 
     for row in rows {
@@ -1274,8 +1267,6 @@ fn measure_spans(ui: &egui::Ui, spans: &[Span], font: &FontId) -> f32 {
         .map(|span| {
             let font = if span.style.code {
                 FontId::monospace(font.size * 0.92)
-            } else if span.style.bold {
-                fonts::bold(font.size)
             } else {
                 font.clone()
             };
@@ -1478,8 +1469,8 @@ fn draw_records(
     label_width: f32,
     rows: &[Vec<Vec<Span>>],
 ) {
-    let label_font = fonts::bold(TABLE_SIZE);
     let regular = FontId::proportional(TABLE_SIZE);
+    let label_font = regular.clone();
     for (index, row) in rows.iter().enumerate() {
         for (head, value) in labels.iter().zip(row) {
             if value.is_empty() {
