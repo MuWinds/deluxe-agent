@@ -283,9 +283,7 @@ fn spawn_worker(
                         });
                         continue;
                     }
-                    let cached = runtimes
-                        .get(&request.project)
-                        .and_then(|runtime| runtime.component(&request.plugin_id));
+                    let cached = factory.component(&request.project, &request.plugin_id);
                     let host_tools: Arc<dyn harness::ports::ToolRuntime> = runtimes
                         .get(&request.project)
                         .map(|runtime| runtime.host_tools.clone())
@@ -315,12 +313,26 @@ fn spawn_worker(
                         }
                     };
                     let actions = manifest.ui.actions.clone();
+                    // A surface must act on the same actor the agent's tools use,
+                    // so a newly loaded one is registered in the shared cache and
+                    // a later runtime build reuses it instead of loading a second.
+                    let load_project = request.project.clone();
+                    let load_plugin = request.plugin_id.clone();
+                    let load_factory = factory.clone();
                     let load = async move {
                         let actor = match cached {
                             Some(actor) => actor,
                             None => {
-                                plugins::wasm_runtime::ComponentActor::load(root, manifest, hub)
-                                    .await?
+                                let actor = plugins::wasm_runtime::ComponentActor::load(
+                                    root, manifest, hub,
+                                )
+                                .await?;
+                                load_factory.cache_component(
+                                    &load_project,
+                                    &load_plugin,
+                                    actor.clone(),
+                                );
+                                actor
                             }
                         };
                         Ok(Box::new(plugins::wasm::WasmUiExecutor::new(actor))
@@ -407,7 +419,7 @@ fn spawn_worker(
                     match result {
                         Ok((config, plugins)) => {
                             surfaces.clear();
-                            invalidate_runtimes(&mut runtimes, &active).await;
+                            invalidate_runtimes(&factory, &mut runtimes, &active).await;
                             worker.plugins = plugins.clone();
                             sink.emit_ui(Event::PluginInstalled {
                                 request_id,
@@ -430,7 +442,7 @@ fn spawn_worker(
                     match result {
                         Ok(plugins) => {
                             surfaces.clear();
-                            invalidate_runtimes(&mut runtimes, &active).await;
+                            invalidate_runtimes(&factory, &mut runtimes, &active).await;
                             worker.plugins = plugins.clone();
                             sink.emit_ui(Event::PluginsUpdated {
                                 request_id,
@@ -456,7 +468,7 @@ fn spawn_worker(
                     // stale. A settings push that changes nothing — the theme
                     // toggle saves too — keeps the cache instead.
                     if llm_settings.as_ref() != Some(&settings) {
-                        invalidate_runtimes(&mut runtimes, &active).await;
+                        invalidate_runtimes(&factory, &mut runtimes, &active).await;
                     }
                     llm_settings = Some(settings);
                 }
@@ -511,7 +523,7 @@ fn spawn_worker(
                     match result {
                         Ok(plugins) => {
                             surfaces.clear();
-                            invalidate_runtimes(&mut runtimes, &active).await;
+                            invalidate_runtimes(&factory, &mut runtimes, &active).await;
                             worker.plugins = plugins.clone();
                             sink.emit_ui(Event::PluginsUpdated {
                                 request_id,
@@ -532,7 +544,7 @@ fn spawn_worker(
                     config,
                 } => {
                     surfaces.clear();
-                    invalidate_runtimes(&mut runtimes, &active).await;
+                    invalidate_runtimes(&factory, &mut runtimes, &active).await;
                     let result = async {
                         worker
                             .plugin_manager
@@ -565,7 +577,7 @@ fn spawn_worker(
 
                 Cmd::Shutdown => {
                     surfaces.clear();
-                    invalidate_runtimes(&mut runtimes, &active).await;
+                    invalidate_runtimes(&factory, &mut runtimes, &active).await;
                     break;
                 }
 
@@ -704,11 +716,12 @@ fn spawn_worker(
             }
         }
         surfaces.clear();
-        invalidate_runtimes(&mut runtimes, &active).await;
+        invalidate_runtimes(&factory, &mut runtimes, &active).await;
     });
 }
 
 async fn invalidate_runtimes(
+    factory: &ProjectRuntimeFactory,
     runtimes: &mut HashMap<PathBuf, Arc<ProjectRuntime>>,
     active: &Arc<Mutex<HashMap<RunId, CancellationToken>>>,
 ) {
@@ -724,6 +737,9 @@ async fn invalidate_runtimes(
         runtime.shutdown().await;
     }
     runtimes.clear();
+    // The cache outlives the runtimes it fed; a shut-down actor must not be
+    // handed back to the next surface or runtime build.
+    factory.clear_components();
 }
 
 /// Wraps the app so `eframe` can drive it, and so the runtime outlives the

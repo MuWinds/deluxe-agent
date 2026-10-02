@@ -493,6 +493,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_guest_error_does_not_reset_a_stopped_mcp_server() {
+        let project = tempfile::tempdir().expect("a temporary project root is available");
+        let package = crate::plugins::defaults::PLUGINS
+            .iter()
+            .find(|package| package.name == "mcp")
+            .expect("the application ships a bundled MCP Component");
+        std::fs::write(
+            project.path().join(".mcp.json"),
+            r#"{"mcpServers":{"alpha":{"url":"http://127.0.0.1:1/a"}}}"#,
+        )
+        .expect("the scoped MCP configuration is writable");
+        let hub = CapabilityHub::new(
+            project.path().to_path_buf(),
+            project.path().to_path_buf(),
+            Permissions {
+                write_plugin_files: true,
+                ..Default::default()
+            },
+            Arc::new(crate::harness::services::RegistryToolRuntime::new(
+                Arc::new(ToolRegistry::with_builtins()),
+                Arc::new(RwLock::new(ToolSettings::default())),
+            )),
+        )
+        .expect("scope host");
+        let actor = ComponentActor::load_bytes(package.component, hub)
+            .await
+            .expect("the bundled MCP Component reads its scoped configuration");
+        let request = SurfaceRequest {
+            plugin_id: "mcp@deluxe-defaults".into(),
+            project: project.path().to_path_buf(),
+            surface_id: "mcp".into(),
+            request_id: 1,
+        };
+        let mut ui = WasmUiExecutor::new(actor.clone());
+        let document = ui
+            .open_surface(&request)
+            .await
+            .expect("the MCP surface opens with the server listed");
+        let stopped = ui
+            .handle_action(&PluginUiAction {
+                surface: request.clone(),
+                revision: document.revision,
+                control_id: "toggle.alpha".into(),
+                action: "toggle_server".into(),
+                value: None,
+            })
+            .await
+            .expect("stopping the server returns a newer snapshot");
+        assert!(
+            format!("{:?}", stopped.root).contains("已停止"),
+            "the stopped server is reported as stopped"
+        );
+
+        // A guest error is normal control flow, not a trap. It must not rebuild
+        // the component and wipe the stopped flag the user just set.
+        let error = actor
+            .call(Operation::Execute {
+                name: "mcp__alpha__missing".into(),
+                arguments: "{}".into(),
+            })
+            .await
+            .expect_err("a stopped server has no callable tools");
+        assert_eq!(error.code, code::PLUGIN_INVALID_OUTPUT);
+
+        let reopened = ui
+            .open_surface(&request)
+            .await
+            .expect("the surface reopens after the guest error");
+        assert!(
+            format!("{:?}", reopened.root).contains("已停止"),
+            "the stopped server stays stopped across a guest error"
+        );
+        ui.close_surface(&request)
+            .await
+            .expect("the MCP surface closes");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_server_is_persisted_and_a_fresh_actor_reads_it_back() {
+        let project = tempfile::tempdir().expect("a temporary project root is available");
+        let package = crate::plugins::defaults::PLUGINS
+            .iter()
+            .find(|package| package.name == "mcp")
+            .expect("the application ships a bundled MCP Component");
+        std::fs::write(
+            project.path().join(".mcp.json"),
+            r#"{"mcpServers":{"alpha":{"url":"http://127.0.0.1:1/a"}}}"#,
+        )
+        .expect("the scoped MCP configuration is writable");
+        let request = SurfaceRequest {
+            plugin_id: "mcp@deluxe-defaults".into(),
+            project: project.path().to_path_buf(),
+            surface_id: "mcp".into(),
+            request_id: 1,
+        };
+        let hub = || {
+            CapabilityHub::new(
+                project.path().to_path_buf(),
+                project.path().to_path_buf(),
+                Permissions {
+                    write_plugin_files: true,
+                    ..Default::default()
+                },
+                Arc::new(crate::harness::services::RegistryToolRuntime::new(
+                    Arc::new(ToolRegistry::with_builtins()),
+                    Arc::new(RwLock::new(ToolSettings::default())),
+                )),
+            )
+            .expect("scope host")
+        };
+
+        let first = ComponentActor::load_bytes(package.component, hub())
+            .await
+            .expect("the bundled MCP Component loads");
+        let mut ui = WasmUiExecutor::new(first);
+        let document = ui
+            .open_surface(&request)
+            .await
+            .expect("the MCP surface opens with the server listed");
+        let stopped = ui
+            .handle_action(&PluginUiAction {
+                surface: request.clone(),
+                revision: document.revision,
+                control_id: "toggle.alpha".into(),
+                action: "toggle_server".into(),
+                value: None,
+            })
+            .await
+            .expect("stopping the server returns a newer snapshot");
+        assert!(format!("{:?}", stopped.root).contains("已停止"));
+
+        let persisted =
+            std::fs::read_to_string(project.path().join(".mcp.json")).expect("the config remains");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&persisted).expect("the rewritten config is JSON");
+        assert_eq!(
+            parsed["mcpServers"]["alpha"]["disabled"],
+            serde_json::Value::Bool(true),
+            "the stop switch is persisted to `.mcp.json`: {persisted}"
+        );
+
+        // A brand-new actor, as after a reload or an application restart, must
+        // read the switch back rather than silently starting the server.
+        let second = ComponentActor::load_bytes(package.component, hub())
+            .await
+            .expect("a fresh MCP Component loads");
+        let mut fresh_ui = WasmUiExecutor::new(second);
+        let reopened = fresh_ui
+            .open_surface(&request)
+            .await
+            .expect("the fresh surface opens");
+        assert!(
+            format!("{:?}", reopened.root).contains("已停止"),
+            "a fresh actor reads the persisted stop"
+        );
+        fresh_ui
+            .close_surface(&request)
+            .await
+            .expect("the fresh surface closes");
+    }
+
+    #[tokio::test]
     async fn wasm_provider_owns_mcp_http_protocol_and_transport_framing() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await

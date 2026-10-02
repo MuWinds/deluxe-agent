@@ -72,11 +72,6 @@ impl ProjectRuntime {
             }
         }
     }
-
-    /// Returns the component belonging to an enabled plugin in this project.
-    pub fn component(&self, plugin_id: &str) -> Option<Arc<ComponentActor>> {
-        self.components.get(plugin_id).cloned()
-    }
 }
 
 #[derive(Clone)]
@@ -85,12 +80,20 @@ pub struct HostCapabilities {
     pub jobs: Arc<JobRegistry>,
 }
 
+/// Live component actors, keyed by project root and plugin id.
+type ComponentActors = BTreeMap<(PathBuf, String), Arc<ComponentActor>>;
+
 #[derive(Clone)]
 pub struct ProjectRuntimeFactory {
     settings: Arc<RwLock<ToolSettings>>,
     sink: Arc<dyn AgentEventSink>,
     global_configuration_root: PathBuf,
     host_capabilities: Arc<Mutex<BTreeMap<(std::path::PathBuf, bool), HostCapabilities>>>,
+    /// One live actor per project and plugin, shared by the agent's tools and
+    /// the plugin's UI surface. Without this, a surface opened before the first
+    /// run would load a second actor with its own process registry, so a
+    /// surface action could not reach the server the agent is using.
+    components: Arc<Mutex<ComponentActors>>,
 }
 
 impl ProjectRuntimeFactory {
@@ -105,7 +108,37 @@ impl ProjectRuntimeFactory {
             sink,
             global_configuration_root,
             host_capabilities: Arc::new(Mutex::new(BTreeMap::new())),
+            components: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Returns the live component actor for one enabled plugin in a project.
+    pub fn component(&self, project: &Path, plugin_id: &str) -> Option<Arc<ComponentActor>> {
+        let components = match self.components.lock() {
+            Ok(components) => components,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        components
+            .get(&(project.to_path_buf(), plugin_id.to_string()))
+            .cloned()
+    }
+
+    /// Registers an actor so later runtime builds and surfaces reuse it.
+    pub fn cache_component(&self, project: &Path, plugin_id: &str, actor: Arc<ComponentActor>) {
+        let mut components = match self.components.lock() {
+            Ok(components) => components,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        components.insert((project.to_path_buf(), plugin_id.to_string()), actor);
+    }
+
+    /// Drops every cached actor after their runtimes were shut down.
+    pub fn clear_components(&self) {
+        let mut components = match self.components.lock() {
+            Ok(components) => components,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        components.clear();
     }
 
     /// Resolves the global/project configuration root exposed to a Component's
@@ -203,18 +236,25 @@ impl ProjectRuntimeFactory {
             let Some(manifest) = plugin.manifest.wasm_runtime() else {
                 continue;
             };
-            let configuration_root = self.configuration_root(&plugin.scope, project);
-            let hub = CapabilityHub::new(
-                project.to_path_buf(),
-                configuration_root,
-                manifest.permissions.clone(),
-                capabilities.clone(),
-            )?;
-            let loaded = async {
-                let actor = ComponentActor::load(plugin.root.clone(), manifest, hub).await?;
-                Ok::<_, crate::error::AgentError>(actor)
-            }
-            .await;
+            let loaded = match self.component(project, &plugin.id) {
+                Some(actor) => Ok(actor),
+                None => {
+                    let configuration_root = self.configuration_root(&plugin.scope, project);
+                    let hub = CapabilityHub::new(
+                        project.to_path_buf(),
+                        configuration_root,
+                        manifest.permissions.clone(),
+                        capabilities.clone(),
+                    )?;
+                    match ComponentActor::load(plugin.root.clone(), manifest, hub).await {
+                        Ok(actor) => {
+                            self.cache_component(project, &plugin.id, actor.clone());
+                            Ok(actor)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            };
             match loaded {
                 Ok(actor) => {
                     let provider_tools = match tools(actor.clone()).await {
@@ -374,4 +414,74 @@ fn builtin_manifest(supports_images: bool) -> Result<crate::plugins::wasm_manife
     .map_err(|error| {
         crate::error::AgentError::internal(format!("Build bundled provider manifest: {error}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::harness::AgentEvent;
+    use crate::plugins::capabilities::CapabilityHub;
+    use crate::tools::{ToolRegistry, ToolSettings};
+
+    struct NoopSink;
+
+    impl AgentEventSink for NoopSink {
+        fn emit(&self, _event: AgentEvent) {}
+    }
+
+    fn factory() -> ProjectRuntimeFactory {
+        ProjectRuntimeFactory::new(
+            Arc::new(RwLock::new(ToolSettings::default())),
+            Arc::new(NoopSink),
+            PathBuf::from("/global"),
+        )
+    }
+
+    async fn load_actor() -> Arc<ComponentActor> {
+        let package = crate::plugins::defaults::PLUGINS
+            .iter()
+            .find(|package| package.name == "mcp")
+            .expect("the application ships a bundled MCP Component");
+        let root = tempfile::tempdir().expect("a temporary root is available");
+        let hub = CapabilityHub::new(
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            Default::default(),
+            Arc::new(crate::harness::services::RegistryToolRuntime::new(
+                Arc::new(ToolRegistry::with_builtins()),
+                Arc::new(RwLock::new(ToolSettings::default())),
+            )),
+        )
+        .expect("scope host");
+        ComponentActor::load_bytes(package.component, hub)
+            .await
+            .expect("the bundled MCP Component loads")
+    }
+
+    #[tokio::test]
+    async fn the_component_cache_is_scoped_and_clears() {
+        let factory = factory();
+        let project = Path::new("/work/repo");
+        assert!(factory.component(project, "mcp@deluxe-defaults").is_none());
+
+        let actor = load_actor().await;
+        factory.cache_component(project, "mcp@deluxe-defaults", actor.clone());
+        let cached = factory
+            .component(project, "mcp@deluxe-defaults")
+            .expect("the cached actor comes back");
+        assert!(
+            Arc::ptr_eq(&cached, &actor),
+            "the cache returns the same actor, not a copy"
+        );
+        assert!(
+            factory
+                .component(Path::new("/other"), "mcp@deluxe-defaults")
+                .is_none(),
+            "another project must not reuse the actor"
+        );
+
+        factory.clear_components();
+        assert!(factory.component(project, "mcp@deluxe-defaults").is_none());
+    }
 }

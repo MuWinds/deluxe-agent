@@ -368,12 +368,20 @@ impl ComponentActor {
                     }
                 };
                 cancel.cancel();
-                let failed = result.is_err();
+                // A guest that returns an error result is normal control flow and
+                // leaves the Store usable. Only a trap, a resource limit, a timed
+                // out call, or a cancelled one can leave it poisoned. Rebuilding
+                // on a guest error would silently discard the plugin's own memory
+                // state — for example the MCP provider's stopped servers.
+                let recover = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.code != code::PLUGIN_INVALID_OUTPUT);
                 let _ = request.reply.send(result);
                 if lifetime.is_cancelled() {
                     break;
                 }
-                if failed {
+                if recover {
                     capabilities.shutdown().await;
                     match tokio::time::timeout(
                         CALL_TIMEOUT,

@@ -66,13 +66,20 @@ async fn configured_servers() -> Result<BTreeMap<String, ServerState>, String> {
         let Some(config) = transport_config(server)? else {
             continue;
         };
+        // `disabled` is the persisted stop switch, so a stopped server stays
+        // stopped across a reload, a fresh actor, or an application restart —
+        // not just for the lifetime of one Wasm instance.
+        let stopped = server
+            .get("disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         result.insert(
             name.clone(),
             ServerState {
                 transport: config,
                 next_id: 1,
                 initialized: false,
-                stopped: false,
+                stopped,
             },
         );
     }
@@ -718,8 +725,8 @@ fn ui_document_with_revision(request: &Value, revision: u64) -> String {
     })];
     children.push(json!({
         "type": "text",
-        "text": "停止会断开连接但保留声明；卸载会从 .mcp.json 删掉该 server。\
-                 变更后请刷新插件，让 agent 重新读取工具列表。",
+        "text": "停止会断开连接并写入 .mcp.json 的 disabled，重开面板或重启应用后仍是停止；\
+                 卸载会从 .mcp.json 删掉该 server。变更后请刷新插件，让 agent 重新读取工具列表。",
         "emphasis": "muted"
     }));
     match snapshot() {
@@ -735,11 +742,11 @@ fn ui_document_with_revision(request: &Value, revision: u64) -> String {
             // list and a server name cannot be known when it is written.
             let status = if state.stopped {
                 format!(
-                    "{} MCP server · 已停止",
+                    "[已停止] {} · 该 server 的工具不再可用",
                     transport_label(&state.transport)
                 )
             } else {
-                format!("{} MCP server", transport_label(&state.transport))
+                format!("[运行中] {}", transport_label(&state.transport))
             };
             children.push(json!({
                 "type": "section",
@@ -821,19 +828,49 @@ async fn remove_server(name: &str) -> Result<(), String> {
     deluxe::harness::host::write_plugin_file(".mcp.json".into(), encoded.into_bytes()).await
 }
 
+/// Persists one server's stop switch in `.mcp.json`.
+///
+/// Stopping is a user decision, not a transient runtime detail: it has to
+/// outlive this Wasm instance, and the file is the only state that survives a
+/// reload. The whole file is rewritten through the host's bounded write
+/// capability, preserving every other key and server.
+async fn set_disabled(name: &str, disabled: bool) -> Result<(), String> {
+    let bytes = match deluxe::harness::host::read_plugin_file(".mcp.json".into()).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.starts_with("plugin_file_not_found:") => {
+            return Err(format!("MCP server `{name}` is not configured"))
+        }
+        Err(error) => return Err(error),
+    };
+    let text = String::from_utf8(bytes)
+        .map_err(|_| "MCP provider `.mcp.json` is not UTF-8".to_string())?;
+    let mut root: Value = serde_json::from_str(&text)
+        .map_err(|_| "MCP provider `.mcp.json` is invalid".to_string())?;
+    let Some(server) = root
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .and_then(|servers| servers.get_mut(name))
+        .and_then(Value::as_object_mut)
+    else {
+        return Err(format!("MCP server `{name}` is not configured"));
+    };
+    if disabled {
+        server.insert("disabled".into(), Value::Bool(true));
+    } else {
+        server.remove("disabled");
+    }
+    let encoded = serde_json::to_string_pretty(&root)
+        .map_err(|_| "MCP provider `.mcp.json` is not serializable".to_string())?;
+    deluxe::harness::host::write_plugin_file(".mcp.json".into(), encoded.into_bytes()).await
+}
+
 impl Guest for McpProvider {
     async fn configure() -> Result<(), String> {
-        let mut configured = configured_servers().await?;
+        // The stopped switch lives in `.mcp.json`, so a reload or a fresh
+        // instance restores the same set of stopped servers instead of
+        // silently starting everything the file still declares.
+        let configured = configured_servers().await?;
         close_processes().await;
-        // A stopped server stays stopped across a reload: the flag is UI state
-        // the user chose, and re-reading `.mcp.json` must not silently start it.
-        if let Some(previous) = MCP_CONFIG.get().and_then(|config| config.lock().ok()) {
-            for (name, state) in configured.iter_mut() {
-                if let Some(previous) = previous.get(name) {
-                    state.stopped = previous.stopped;
-                }
-            }
-        }
         MCP_CONFIG
             .get_or_init(|| Mutex::new(BTreeMap::new()))
             .lock()
@@ -927,7 +964,10 @@ impl Guest for McpProvider {
             // Stopping tears down the connection but leaves the declaration, so
             // the row stays and can be started again.
             "toggle_server" => {
+                // Persist before touching the live state: if the write fails,
+                // the in-memory switch must not claim a state a reload undoes.
                 let stopped = server_stopped(server);
+                set_disabled(server, !stopped).await?;
                 set_stopped(server, !stopped)?;
                 if !stopped {
                     disconnect(server).await;
