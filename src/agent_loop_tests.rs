@@ -27,7 +27,7 @@ use crate::ipc::{AuditOutcome, Event};
 use crate::llm::{LlmClient, Message};
 use crate::plugins::capabilities::CapabilityHub;
 use crate::plugins::providers::WasmHookRuntime;
-use crate::plugins::wasm_runtime::{ComponentActor, ProviderInputs};
+use crate::plugins::wasm_runtime::ComponentActor;
 use crate::tools::{to_openai_tools_from_descriptors, ToolRegistry, ToolSettings};
 
 /// Collects everything the agent emits, so a test can assert on the sequence.
@@ -382,11 +382,30 @@ async fn fixture_hook_runtime(
     settings: &ToolSettings,
 ) -> Arc<dyn HookRuntime> {
     let manifest = serde_json::from_str::<crate::plugins::PluginManifest>(include_str!(
-        "../plugin-fixtures/echo-tool/.codex-plugin/plugin.json"
+        "../plugin-fixtures/hooks-provider/plugin.json"
     ))
     .expect("the checked-in fixture manifest is valid")
     .wasm_runtime()
-    .expect("the fixture declares a Wasm runtime");
+    .expect("the Hooks fixture declares a Wasm runtime");
+    std::fs::write(
+        project.join(".hooks.json"),
+        r#"{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo wasm-hook-ran"
+          }
+        ]
+      }
+    ]
+  }
+}"#,
+    )
+    .expect("the scoped Hooks configuration is writable");
     let host_tools = Arc::new(crate::harness::services::RegistryToolRuntime::new(
         Arc::new(ToolRegistry::with_builtins()),
         Arc::new(tokio::sync::RwLock::new(settings.clone())),
@@ -395,18 +414,11 @@ async fn fixture_hook_runtime(
         project.to_path_buf(),
         project.to_path_buf(),
         manifest.permissions.clone(),
-        Default::default(),
         host_tools,
     )
     .expect("the fixture host capabilities are valid");
     let actor = ComponentActor::load_bytes(
-        include_bytes!("../plugin-fixtures/echo-tool/plugin.wasm"),
-        project.to_path_buf(),
-        manifest,
-        ProviderInputs {
-            hooks_json: Some(include_str!("../plugin-fixtures/echo-tool/hooks.json").into()),
-            ..Default::default()
-        },
+        include_bytes!("../plugin-fixtures/hooks-provider/plugin.wasm"),
         hub,
     )
     .await
@@ -464,6 +476,7 @@ async fn a_run_with_tool_calls_reports_each_turns_usage_as_it_lands() {
         ContextSettings {
             context_limit: 100_000,
             threshold_percent: 60,
+            ..ContextSettings::default()
         },
     );
     let sink = CollectingSink::default();
@@ -745,6 +758,86 @@ async fn the_system_prompt_carries_the_project_context() {
 }
 
 #[tokio::test]
+async fn the_runtime_context_rides_as_a_message_and_is_not_repeated() {
+    let directory = tempfile::tempdir().expect("a temp directory is available");
+    let server = FakeServer::start(vec![answered(10, "ok"), answered(10, "again")]).await;
+    let agent = agent_for(&server, directory.path());
+
+    // First run: the history is empty, so the environment block is appended
+    // after the prompt and recorded as a host message.
+    let sink = CollectingSink::default();
+    let _ = agent
+        .run(
+            1,
+            "hi".into(),
+            RunRequest {
+                history: &[],
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the first run completes");
+
+    let first = server.request_body(0);
+    assert!(
+        first.contains(crate::runtime_context::TAG) && first.contains("working_directory:"),
+        "the environment block must reach the model, got: {first}"
+    );
+    assert!(
+        sink.events().iter().any(|event| matches!(
+            event,
+            Event::Notice { text, .. } if text.starts_with(crate::runtime_context::TAG)
+        )),
+        "the block must be recorded as a host message, got: {:?}",
+        sink.events()
+    );
+
+    // Second run carrying that same block in its history: it must not be
+    // appended again, or the conversation would grow for no new information.
+    let block = crate::runtime_context::render(directory.path());
+    let history = vec![
+        Message::user("hi"),
+        Message::user(block),
+        Message::assistant("ok".into(), Vec::new()),
+    ];
+    let sink = CollectingSink::default();
+    let _ = agent
+        .run(
+            2,
+            "more".into(),
+            RunRequest {
+                history: &history,
+                thinking: None,
+                carried: None,
+            },
+            CancellationToken::new(),
+            &sink,
+        )
+        .await
+        .expect("the second run completes");
+
+    assert!(
+        !sink
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::Notice { .. })),
+        "an unchanged block must not be re-sent, got: {:?}",
+        sink.events()
+    );
+    assert_eq!(
+        server
+            .request_body(1)
+            .matches(crate::runtime_context::TAG)
+            .count(),
+        1,
+        "the block must appear exactly once in the second request"
+    );
+}
+
+#[tokio::test]
 async fn a_chosen_thinking_level_reaches_the_request() {
     let directory = tempfile::tempdir().expect("a temp directory is available");
     let server = FakeServer::start(vec![answered(10, "ok")]).await;
@@ -835,7 +928,11 @@ async fn a_completion_retries_provider_errors_and_returns_the_successful_answer(
         .expect("the client builds");
 
     let turn = client
-        .complete_turn(&[Message::user("summarize")], &CancellationToken::new())
+        .complete_turn(
+            &[Message::user("summarize")],
+            &json!([]),
+            &CancellationToken::new(),
+        )
         .await
         .expect("the retry returns the successful answer");
 
@@ -851,7 +948,11 @@ async fn a_completion_stops_after_the_configured_number_of_retries() {
         .expect("the client builds");
 
     let result = client
-        .complete_turn(&[Message::user("summarize")], &CancellationToken::new())
+        .complete_turn(
+            &[Message::user("summarize")],
+            &json!([]),
+            &CancellationToken::new(),
+        )
         .await;
 
     assert!(result.is_err(), "every scripted HTTP response is an error");
@@ -916,7 +1017,11 @@ async fn an_unlimited_completion_keeps_retrying_past_the_default_limit() {
         .expect("the client builds");
 
     let turn = client
-        .complete_turn(&[Message::user("summarize")], &CancellationToken::new())
+        .complete_turn(
+            &[Message::user("summarize")],
+            &json!([]),
+            &CancellationToken::new(),
+        )
         .await
         .expect("unlimited retries continue until the service recovers");
 
@@ -938,7 +1043,7 @@ async fn an_unlimited_completion_stops_retrying_when_cancelled() {
     let request_cancel = cancel.clone();
     let request = tokio::spawn(async move {
         client
-            .complete_turn(&[Message::user("summarize")], &request_cancel)
+            .complete_turn(&[Message::user("summarize")], &json!([]), &request_cancel)
             .await
     });
 
@@ -1020,8 +1125,9 @@ async fn crossing_the_threshold_compacts_the_history_before_the_next_turn() {
     let directory = tempfile::tempdir().expect("a temp directory is available");
 
     // Run one measures 90 tokens against a limit of 100 with a trigger of 60%,
-    // so the first request of run two must go out compacted: a summary request,
-    // then the real turn carrying nothing but that summary.
+    // so the first request of run two must go out compacted: a summary request
+    // over the folded prefix, then the real turn carrying the brief plus the
+    // recent tail verbatim.
     let server = FakeServer::start(vec![
         answered(90, "first answer"),
         // The summariser is a non-streaming call, so its reply is one plain
@@ -1044,6 +1150,7 @@ async fn crossing_the_threshold_compacts_the_history_before_the_next_turn() {
         ContextSettings {
             context_limit: 100,
             threshold_percent: 60,
+            ..ContextSettings::default()
         },
     );
 
@@ -1092,12 +1199,13 @@ async fn crossing_the_threshold_compacts_the_history_before_the_next_turn() {
         .expect("the follow-up completes");
 
     let events = sink.events();
-    // Everything goes: the system prompt, the history, and the prompt that
-    // started this run — all of it is what the brief replaces.
+    // Four older messages fold — everything up to "and a third" — while the
+    // last user turn, its answer, this run's prompt, and the runtime-context
+    // block are kept.
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, Event::CompactionStarted { dropping: 8, .. })),
+            .any(|event| matches!(event, Event::CompactionStarted { dropping: 4, .. })),
         "compaction must be announced, got: {events:?}"
     );
     assert!(
@@ -1109,12 +1217,17 @@ async fn crossing_the_threshold_compacts_the_history_before_the_next_turn() {
     );
 
     // Request 0 is run one's turn, request 1 the summariser, request 2 the
-    // compacted turn.
+    // compacted turn. The summariser gets only the folded prefix: the kept tail
+    // is not paid for twice, and the prefix is byte-identical to the start of
+    // the original request, so the provider still serves it from cache.
     let summary_request = server.request_body(1);
     assert!(
-        summary_request.contains("list files") && summary_request.contains("hello again"),
-        "the summariser must be given the whole conversation, including the prompt \
-         that started this run, got: {summary_request}"
+        summary_request.contains("list files") && summary_request.contains("and the second thing"),
+        "the summariser must be given the folded prefix, got: {summary_request}"
+    );
+    assert!(
+        !summary_request.contains("and a third") && !summary_request.contains("hello again"),
+        "the kept tail must not be folded, got: {summary_request}"
     );
 
     let second = server.request_body(2);
@@ -1125,9 +1238,14 @@ async fn crossing_the_threshold_compacts_the_history_before_the_next_turn() {
         "the compacted request must carry the brief and a turn to answer, got: {second}"
     );
     assert!(
-        !second.contains("list files") && !second.contains("hello again"),
-        "nothing survives verbatim, so neither the history nor the original prompt \
-         may ride along, got: {second}"
+        second.contains("and a third")
+            && second.contains("third answer")
+            && second.contains("hello again"),
+        "the kept tail must ride along verbatim, got: {second}"
+    );
+    assert!(
+        !second.contains("list files") && !second.contains("first answer"),
+        "the folded turns must not survive verbatim, got: {second}"
     );
 }
 
@@ -1151,6 +1269,7 @@ async fn a_failed_summary_request_still_lets_the_run_finish() {
         ContextSettings {
             context_limit: 100,
             threshold_percent: 60,
+            ..ContextSettings::default()
         },
     );
 

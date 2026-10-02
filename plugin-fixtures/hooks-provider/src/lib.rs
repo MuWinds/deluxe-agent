@@ -19,7 +19,6 @@ struct HookSpec {
 }
 
 static HOOKS: OnceLock<Mutex<Vec<HookSpec>>> = OnceLock::new();
-static PLUGIN_ROOT: OnceLock<Mutex<String>> = OnceLock::new();
 
 fn configured_hooks() -> Vec<HookSpec> {
     HOOKS
@@ -28,23 +27,22 @@ fn configured_hooks() -> Vec<HookSpec> {
         .unwrap_or_default()
 }
 
-fn configured_root() -> String {
-    PLUGIN_ROOT
-        .get()
-        .and_then(|root| root.lock().ok().map(|root| root.clone()))
-        .unwrap_or_default()
-}
-
-fn parse_hooks(config: &serde_json::Value) -> Vec<HookSpec> {
+async fn parse_hooks() -> Result<Vec<HookSpec>, String> {
+    let bytes = match deluxe::harness::host::read_plugin_file(".hooks.json".into()).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.starts_with("plugin_file_not_found:") => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let text =
+        String::from_utf8(bytes).map_err(|_| "Hooks configuration is not UTF-8".to_string())?;
+    let config: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| "Hooks configuration is invalid".to_string())?;
     let Some(groups) = config
-        .get("hooksJson")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-        .and_then(|hooks| hooks.get("hooks").cloned())
+        .get("hooks")
         .and_then(|hooks| hooks.get("PostToolUse").cloned())
         .and_then(|groups| groups.as_array().cloned())
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let mut result = Vec::new();
@@ -85,7 +83,7 @@ fn parse_hooks(config: &serde_json::Value) -> Vec<HookSpec> {
             });
         }
     }
-    result
+    Ok(result)
 }
 
 fn matches_tool(spec: &HookSpec, tool: &str) -> bool {
@@ -141,25 +139,13 @@ fn ui_document(request: &serde_json::Value) -> String {
 }
 
 impl Guest for HooksProvider {
-    async fn configure(config_json: String) -> Result<(), String> {
-        let config: serde_json::Value =
-            serde_json::from_str(&config_json).map_err(|_| "provider config is invalid")?;
+    async fn configure() -> Result<(), String> {
+        let hooks = parse_hooks().await?;
         HOOKS
             .get_or_init(|| Mutex::new(Vec::new()))
             .lock()
             .map_err(|_| "hook state is poisoned")?
-            .clone_from(&parse_hooks(&config));
-        PLUGIN_ROOT
-            .get_or_init(|| Mutex::new(String::new()))
-            .lock()
-            .map_err(|_| "plugin root state is poisoned")?
-            .clone_from(
-                &config
-                    .get("pluginRoot")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            );
+            .clone_from(&hooks);
         Ok(())
     }
 
@@ -199,7 +185,7 @@ impl Guest for HooksProvider {
         }
         let arguments = serde_json::json!({
             "command": hook.command,
-            "cwd": configured_root()
+            "cwd": event_field(&event, "project")
         })
         .to_string();
         let result = deluxe::harness::host::invoke_tool("exec".into(), arguments).await?;
@@ -223,22 +209,6 @@ impl Guest for HooksProvider {
             "matched": true
         })
         .to_string())
-    }
-
-    async fn list_mcp_servers() -> String {
-        "[]".into()
-    }
-
-    async fn list_mcp_tools(_server: String) -> String {
-        "[]".into()
-    }
-
-    async fn invoke_mcp_tool(
-        _server: String,
-        _name: String,
-        _arguments_json: String,
-    ) -> Result<String, String> {
-        Err("hooks provider has no MCP tools".into())
     }
 
     async fn open_surface(request_json: String) -> Result<String, String> {

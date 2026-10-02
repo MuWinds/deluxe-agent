@@ -378,12 +378,60 @@ pub struct Usage {
     pub completion_tokens: Option<u64>,
     #[serde(default)]
     pub total_tokens: Option<u64>,
+    /// DeepSeek reports the cache split at the top level, as a hit count and a
+    /// miss count that together add up to `prompt_tokens`.
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: Option<u64>,
+    #[serde(default)]
+    pub prompt_cache_miss_tokens: Option<u64>,
+    /// OpenAI reports the same fact nested, as `prompt_tokens_details`.
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+/// OpenAI's nested `prompt_tokens_details`.
+///
+/// A struct rather than a bare `u64` because the object carries other counters
+/// this client does not read; only `cached_tokens` is needed to price the
+/// cache.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
 }
 
 impl Usage {
     /// The measured size of the prompt, when the provider reported one.
     pub fn prompt_tokens(&self) -> Option<u64> {
         self.prompt_tokens
+    }
+
+    /// Prompt tokens the provider served from its cache, from whichever field
+    /// it used.
+    ///
+    /// DeepSeek's top-level `prompt_cache_hit_tokens` is tried first, then
+    /// OpenAI's nested `prompt_tokens_details.cached_tokens`. `None` means the
+    /// provider reported no cache figure at all, which is not the same as a
+    /// reported zero: a cold first request legitimately reports zero hits.
+    pub fn cached_prompt_tokens(&self) -> Option<u64> {
+        self.prompt_cache_hit_tokens.or_else(|| {
+            self.prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens)
+        })
+    }
+
+    /// The cached share of the prompt, in `0.0..=1.0`.
+    ///
+    /// `None` when the provider reported no prompt size, or no cache figure to
+    /// divide by it — a rate with no denominator would be a lie.
+    pub fn cache_hit_rate(&self) -> Option<f32> {
+        let prompt = self.prompt_tokens()?;
+        if prompt == 0 {
+            return None;
+        }
+        let cached = self.cached_prompt_tokens()?;
+        Some((cached as f32 / prompt as f32).clamp(0.0, 1.0))
     }
 }
 
@@ -726,21 +774,21 @@ impl LlmClient {
     /// One non-streaming assistant turn: the whole answer in one request.
     ///
     /// Used by the context-window compactor, which asks the model to summarise
-    /// dropped history. No tools are offered, and the reply is not streamed —
-    /// nothing here reaches the transcript until the summary text does.
+    /// the conversation. The reply is not streamed — nothing here reaches the
+    /// transcript until the summary text does.
+    ///
+    /// `tools` is the same schema the conversation's own requests carry. It is
+    /// sent so the request keeps the conversation's cached prefix; the body
+    /// pins `tool_choice` to `none` so the model answers with the summary
+    /// rather than a tool call.
     pub async fn complete_turn(
         &self,
         messages: &[Message],
+        tools: &Value,
         cancel: &CancellationToken,
     ) -> Result<Completion> {
         let url = format!("{}/chat/completions", self.base_url);
-        let mut body = json!({
-            "model": &self.model,
-            "messages": messages,
-        });
-        if let Some(tokens) = self.max_output_tokens {
-            body["max_tokens"] = json!(tokens);
-        }
+        let body = self.completion_body(messages, tools);
 
         let mut retry = 0_u64;
         loop {
@@ -775,6 +823,25 @@ impl LlmClient {
                 }
             }
         }
+    }
+
+    /// The request body for one non-streaming turn.
+    ///
+    /// Carries the conversation's `tools` so the prompt prefix — and therefore
+    /// the provider's cache — matches the request that triggered compaction.
+    /// `tool_choice: "none"` is what keeps the model from answering with a call
+    /// now that tools are on the table.
+    fn completion_body(&self, messages: &[Message], tools: &Value) -> Value {
+        let mut body = json!({
+            "model": &self.model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "none",
+        });
+        if let Some(tokens) = self.max_output_tokens {
+            body["max_tokens"] = json!(tokens);
+        }
+        body
     }
 
     async fn complete_turn_once(&self, url: &str, body: &Value) -> Result<Completion> {
@@ -1095,5 +1162,75 @@ mod tests {
             let body = client().turn_body(&[], &json!([]), Some(level));
             assert_eq!(body["reasoning_effort"], level.wire(), "{level:?}");
         }
+    }
+
+    #[test]
+    fn deepseek_reports_cache_hits_at_the_top_level() {
+        let usage: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "total_tokens": 105,
+            "prompt_cache_hit_tokens": 80,
+            "prompt_cache_miss_tokens": 20,
+        }))
+        .expect("the DeepSeek shape parses");
+
+        assert_eq!(usage.cached_prompt_tokens(), Some(80));
+        assert_eq!(usage.cache_hit_rate(), Some(0.8));
+    }
+
+    #[test]
+    fn openai_reports_cache_hits_nested_under_prompt_tokens_details() {
+        let usage: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "total_tokens": 105,
+            "prompt_tokens_details": { "cached_tokens": 25 },
+        }))
+        .expect("the OpenAI shape parses");
+
+        assert_eq!(usage.cached_prompt_tokens(), Some(25));
+        assert_eq!(usage.cache_hit_rate(), Some(0.25));
+    }
+
+    #[test]
+    fn a_provider_that_reports_no_cache_figure_yields_no_rate() {
+        // Absent must stay absent: a provider that never mentions caching must
+        // not read as a 0% hit rate, which would look like a cache that is
+        // broken rather than one that was never reported.
+        let usage: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+        }))
+        .expect("a usage without cache fields parses");
+
+        assert_eq!(usage.cached_prompt_tokens(), None);
+        assert_eq!(usage.cache_hit_rate(), None);
+    }
+
+    #[test]
+    fn a_zero_prompt_has_no_rate_to_report() {
+        let usage = Usage {
+            prompt_tokens: Some(0),
+            prompt_cache_hit_tokens: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(usage.cache_hit_rate(), None);
+    }
+
+    #[test]
+    fn the_completion_body_keeps_the_conversation_tools_without_allowing_calls() {
+        // The summary request has to carry the conversation's tools so it shares
+        // the cached prefix, and pin `tool_choice` to `none` so the model
+        // answers with the brief instead of calling a tool.
+        let tools = json!([{ "type": "function", "function": { "name": "read_file" } }]);
+        let body = client().completion_body(&[Message::user("summarise")], &tools);
+        assert_eq!(body["tools"], tools);
+        assert_eq!(body["tool_choice"], "none");
+        assert!(
+            body.get("stream").is_none(),
+            "the summary is not streamed: {}",
+            body
+        );
     }
 }

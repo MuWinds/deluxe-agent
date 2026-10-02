@@ -1,12 +1,12 @@
 //! Project-scoped runtime construction.
 //!
 //! The worker owns lifecycle and caching; this factory owns the concrete
-//! assembly of a model provider, Wasm providers, delegation, and an agent.
+//! assembly of a model provider, Wasmtime Components, delegation, and an agent.
 //! Keeping that composition here prevents the IPC loop from becoming another
 //! place where runtime dependencies are wired by hand.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::RwLock;
@@ -21,10 +21,10 @@ use crate::harness::{
 };
 use crate::llm::LlmClient;
 use crate::plugins::capabilities::CapabilityHub;
-use crate::plugins::providers::{all_tools, mcp_tools, WasmHookRuntime};
+use crate::plugins::providers::WasmHookRuntime;
 use crate::plugins::wasm::tools;
-use crate::plugins::wasm_runtime::{ComponentActor, ProviderInputs};
-use crate::plugins::{PluginCatalogue, ProviderKind};
+use crate::plugins::wasm_runtime::ComponentActor;
+use crate::plugins::PluginCatalogue;
 use crate::tools::task::Task;
 use crate::tools::{JobRegistry, ToolRegistry, ToolSettings};
 
@@ -89,20 +89,36 @@ pub struct HostCapabilities {
 pub struct ProjectRuntimeFactory {
     settings: Arc<RwLock<ToolSettings>>,
     sink: Arc<dyn AgentEventSink>,
+    global_configuration_root: PathBuf,
     host_capabilities: Arc<Mutex<BTreeMap<(std::path::PathBuf, bool), HostCapabilities>>>,
 }
 
 impl ProjectRuntimeFactory {
     /// Creates a factory that shares worker tool policy and UI event delivery.
-    pub fn new(settings: Arc<RwLock<ToolSettings>>, sink: Arc<dyn AgentEventSink>) -> Self {
+    pub fn new(
+        settings: Arc<RwLock<ToolSettings>>,
+        sink: Arc<dyn AgentEventSink>,
+        global_configuration_root: PathBuf,
+    ) -> Self {
         Self {
             settings,
             sink,
+            global_configuration_root,
             host_capabilities: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
-    /// Returns the project-scoped native capabilities used by Wasm providers.
+    /// Resolves the global/project configuration root exposed to a Component's
+    /// generic file capability.
+    pub fn configuration_root(&self, scope: &crate::plugins::Scope, project: &Path) -> PathBuf {
+        match scope {
+            crate::plugins::Scope::Global => self.global_configuration_root.clone(),
+            crate::plugins::Scope::Project(root) if !root.as_os_str().is_empty() => root.clone(),
+            crate::plugins::Scope::Project(_) => project.to_path_buf(),
+        }
+    }
+
+    /// Returns the project-scoped native capabilities used by Components.
     ///
     /// The returned host registry is cached so a UI surface opened before the
     /// agent shares the same job runtime with the later project runtime.
@@ -134,7 +150,7 @@ impl ProjectRuntimeFactory {
 
     /// Builds the worker runtime for one project and model setting.
     ///
-    /// A broken Wasm provider is logged and skipped; one invalid plugin must
+    /// A broken Component is logged and skipped; one invalid plugin must
     /// not make the rest of the project's agent unusable.
     pub async fn build(
         &self,
@@ -162,21 +178,17 @@ impl ProjectRuntimeFactory {
             project.to_path_buf(),
             project.to_path_buf(),
             builtin_manifest.permissions.clone(),
-            BTreeMap::new(),
             capabilities.clone(),
         )?;
         match ComponentActor::load_bytes(
             include_bytes!("../../plugin-fixtures/builtin-tools/plugin.wasm"),
-            project.to_path_buf(),
-            builtin_manifest,
-            ProviderInputs::default(),
             builtin_hub,
         )
         .await
         {
             Ok(actor) => {
                 components.insert("__deluxe_builtin_tools".into(), actor.clone());
-                match all_tools(actor.clone(), "deluxe-builtin").await {
+                match tools(actor.clone()).await {
                     Ok(tools) => {
                         for tool in tools {
                             registry.register(tool);
@@ -191,31 +203,21 @@ impl ProjectRuntimeFactory {
             let Some(manifest) = plugin.manifest.wasm_runtime() else {
                 continue;
             };
-            let provider = manifest.provider;
+            let configuration_root = self.configuration_root(&plugin.scope, project);
             let hub = CapabilityHub::new(
                 project.to_path_buf(),
-                plugin.root.clone(),
+                configuration_root,
                 manifest.permissions.clone(),
-                plugin.mcp_servers.clone(),
                 capabilities.clone(),
             )?;
-            let inputs = ProviderInputs {
-                hooks_json: plugin.hooks_json.clone(),
-                mcp_json: plugin.mcp_json.clone(),
-            };
             let loaded = async {
-                let actor =
-                    ComponentActor::load(plugin.root.clone(), manifest, inputs, hub).await?;
+                let actor = ComponentActor::load(plugin.root.clone(), manifest, hub).await?;
                 Ok::<_, crate::error::AgentError>(actor)
             }
             .await;
             match loaded {
                 Ok(actor) => {
-                    let provider_tools = match provider {
-                        ProviderKind::Mcp => mcp_tools(actor.clone(), &plugin.id).await,
-                        _ => tools(actor.clone()).await,
-                    };
-                    let provider_tools = match provider_tools {
+                    let provider_tools = match tools(actor.clone()).await {
                         Ok(tools) => tools,
                         Err(error) => {
                             tracing::warn!(
@@ -234,9 +236,7 @@ impl ProjectRuntimeFactory {
                             registry.register(tool);
                         }
                     }
-                    if provider == ProviderKind::Hooks {
-                        provider_actors.push((plugin.id.clone(), actor.clone()));
-                    }
+                    provider_actors.push((plugin.id.clone(), actor.clone()));
                     components.insert(plugin.id.clone(), actor);
                 }
                 Err(error) => {

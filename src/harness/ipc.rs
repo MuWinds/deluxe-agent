@@ -18,11 +18,13 @@ impl From<AgentEvent> for Event {
                 call_id,
                 name,
                 arguments,
+                raw_arguments,
             } => Self::ToolStarted {
                 run_id,
                 call_id,
                 name,
                 arguments,
+                raw_arguments,
             },
             AgentEvent::ToolFinished {
                 run_id,
@@ -44,9 +46,11 @@ impl From<AgentEvent> for Event {
             AgentEvent::UsageSampled {
                 run_id,
                 measurement,
+                usage,
             } => Self::UsageSampled {
                 run_id,
                 measurement,
+                usage,
             },
             AgentEvent::RunFinished {
                 run_id,
@@ -60,7 +64,15 @@ impl From<AgentEvent> for Event {
             AgentEvent::CompactionStarted { run_id, dropping } => {
                 Self::CompactionStarted { run_id, dropping }
             }
-            AgentEvent::Compacted { run_id, summary } => Self::Compacted { run_id, summary },
+            AgentEvent::Compacted {
+                run_id,
+                summary,
+                keep,
+            } => Self::Compacted {
+                run_id,
+                summary,
+                keep,
+            },
             AgentEvent::RunFailed { run_id, message } => Self::RunFailed { run_id, message },
             AgentEvent::SubagentStarted {
                 job_id,

@@ -5,17 +5,16 @@
 
 当前插件格式唯一固定为 Wasmtime Component，不兼容旧的可执行插件格式。每个插件
 都必须是 Wasmtime Component；tool、hook、MCP loading、MCP tool adapter 以及
-MCP transport 都由 Wasm provider 提供。宿主只提供显式授权的安全能力和 Agent
+MCP transport 都由对应 Component 提供。宿主只提供显式授权的安全能力和 Agent
 编排。Component 仍可提供 skills、commands、agents 等声明式内容，这些内容仍
 属于同一个 Wasmtime 插件。
 
-`hooks.json` 和 `.mcp.json` 保持原来的插件根目录位置和文件格式，不迁移到
-`.codex-plugin/plugin.json`。Plugin discovery 按 provider 和插件所属的 scope
-读取这些文件：只有 Hooks provider 读取 `hooks.json`，只有 MCP provider 读取
-`.mcp.json`。global marketplace 中的插件对所有项目生效，project marketplace 中
-的插件只对所属项目生效。文件内容原样作为对应 provider input 传入 Wasm；宿主不
-解析 hook matcher，也不执行 hook command，不实现 MCP 协议或 transport。宿主只从
-MCP provider 的 `.mcp.json` 建立 raw process/HTTP capability 所需的授权映射。
+`.mcp.json` 和 `.hooks.json` 不是插件包资源，也不属于 `plugin.json`。Plugin
+discovery 只读取插件根目录的 `plugin.json` 和 `plugin.wasm`，并根据插件的
+global/project scope 为 Component 实例绑定配置根目录。MCP 或 Hooks Component
+需要配置时，主动调用通用的 `read-plugin-file` host import 读取当前 scope 根目录
+下的文件。宿主返回原始字节，不做 UTF-8、JSON、MCP 或 Hooks 解析；MCP transport、
+Hooks matcher 和 command 执行都由对应 Component 自己负责。
 
 ## 1. 目标与非目标
 
@@ -26,9 +25,9 @@ MCP provider 的 `.mcp.json` 建立 raw process/HTTP capability 所需的授权�
 - 插件可以通过 Wasmtime Component 贡献工具、提示词片段、技能、命令、子 Agent
   角色和生命周期 hook；
 - 插件按 global/project scope 加载，project 插件不能泄漏到其他项目；
-- 所有插件都是 Wasm Component；General、Hooks、MCP 是 Component 的 provider
-  角色，不存在非 Wasm 插件；
-- bundled built-in tools 也通过内置 Wasm provider 暴露，宿主不把 native tool
+- 所有插件都是 Wasm Component，不存在非 Wasm 插件；MCP 和 Hooks 由对应
+  Component 实现，不是宿主识别的插件类型；
+- bundled built-in tools 也通过内置 Wasmtime Component 暴露，宿主不把 native tool
   registry 直接交给 Agent；
 - hooks 和 MCP server/tool discovery、连接、协议握手、framing、结果解析均在
   provider 内完成；
@@ -39,7 +38,7 @@ MCP provider 的 `.mcp.json` 建立 raw process/HTTP capability 所需的授权�
 - 宿主仍然掌握文件、进程、网络、LLM、会话和事件能力，但插件只能通过
   `CapabilityHub` 获得它们；
 - 现有 `Tool`、`ToolDescriptor`、`ToolSettings` 继续作为宿主内部执行契约；
-- bundled Wasm provider 缺失或加载失败时，宿主仍可启动并记录明确 warning。
+- bundled Wasmtime Component 缺失或加载失败时，宿主仍可启动并记录明确 warning。
 
 ### 1.2 非目标
 
@@ -70,9 +69,9 @@ main
         -> LlmClient
         -> host capability registry
            -> native safe implementations
-        -> bundled Wasm provider
+        -> bundled Wasmtime Component
            -> built-in tools
-        -> project Wasm providers
+        -> project Wasmtime Components
            -> tools / hooks / MCP tools
         -> Task Tool
         -> system prompt
@@ -97,7 +96,7 @@ main
 egui 主线程
   <== Cmd/Event channel ==> 
 tokio worker 线程
-  -> Agent / Wasm providers / 文件、进程和网络 I/O
+  -> Agent / Wasmtime Components / 文件、进程和网络 I/O
 ```
 
 Wasm 插件只能在 worker 侧运行。GUI 不得直接加载、实例化或调用 Wasm。
@@ -116,7 +115,7 @@ Wasm 插件只能在 worker 侧运行。GUI 不得直接加载、实例化或调
 | `src/session.rs` | 会话模型、transcript、JSON 持久化 | `SessionStore` |
 | `src/tools/jobs.rs::JobRegistry` | 后台任务、取消、通知 | `JobRuntime` |
 | `src/plugins/mod.rs` | Codex 插件发现、scope、启停 | `PluginManager` |
-| `src/plugins/providers.rs` | Wasm tool、hook、MCP provider adapter | `ToolProvider`、`HookRuntime` |
+| `src/plugins/providers.rs` | Wasm tool、hook adapter | `ToolProvider`、`HookRuntime` |
 | `src/plugins/capabilities.rs` | 显式授权的 tool/process/HTTP raw capability | `CapabilityHub` |
 | `wit/deluxe-harness.wit` | Wasm host capability 与 provider ABI | 版本化 Component ABI |
 | `src/ipc.rs::Event` | Agent 到 GUI 的传输协议 | 拆成 `AgentEvent` 和 `UiEvent` |
@@ -128,10 +127,10 @@ Wasm 插件只能在 worker 侧运行。GUI 不得直接加载、实例化或调
 1. LLM 请求如何发出；
 2. 工具如何查找、校验、执行和截断；
 3. tool output 如何变成 transcript；
-4. hook 如何通过 provider export 执行；
+4. hook 如何通过 Component export 执行；
 5. context compaction 如何请求摘要；
 6. JobRegistry 如何产生 notice；
-7. 插件的 skill、agent role 和 Wasm provider metadata 如何进入 prompt；
+7. 插件的 skill、agent role 和 Wasmtime metadata 如何进入 prompt；
 8. GUI 需要哪些 `Event`。
 
 这使得 `Agent` 成为所有机制的耦合中心。插件化的第一步不是 Wasmtime，而是把
@@ -419,7 +418,7 @@ pub struct PromptContext {
 
 ### 5.5 AgentHook
 
-当前 hook 已经由 Wasm provider export，宿主只负责匹配声明、传递事件和校验输出：
+当前 hook 已经由 Wasmtime Component export，宿主只负责传递事件和校验输出：
 
 ```rust
 #[async_trait::async_trait]
@@ -591,6 +590,9 @@ ABI 版本不跟随应用版本自动变化。只有 WIT 的兼容边界变化�
 package deluxe:harness@0.1.0;
 
 interface host {
+    read-plugin-file: async func(path: string) -> result<list<u8>, string>;
+    write-plugin-file: async func(path: string, contents: list<u8>)
+        -> result<_, string>;
     list-tools: async func() -> string;
     invoke-tool: async func(name: string, arguments-json: string)
         -> result<string, string>;
@@ -617,20 +619,13 @@ interface host {
 }
 
 interface plugin {
-    configure: async func(config-json: string) -> result<_, string>;
+    configure: async func() -> result<_, string>;
     list-tools: async func() -> string;
     execute-tool: async func(name: string, arguments-json: string)
         -> result<string, string>;
     list-hooks: async func() -> string;
     invoke-hook: async func(hook-id: string, event-json: string)
         -> result<string, string>;
-    list-mcp-servers: async func() -> string;
-    list-mcp-tools: async func(server: string) -> string;
-    invoke-mcp-tool: async func(
-        server: string,
-        name: string,
-        arguments-json: string
-    ) -> result<string, string>;
     open-surface: async func(request-json: string)
         -> result<string, string>;
     handle-action: async func(action-json: string)
@@ -659,22 +654,34 @@ WIT 负责稳定的函数、方向和异步语义，而宿主可以复用现有�
 
 当前导入约定：
 
+- `host.read-plugin-file` 只接受当前 global/project configuration root 下的相对
+  路径，并原样返回文件字节。这里的 configuration root 不是
+  `plugin.wasm` 所在的插件包目录。project root 是当前项目目录，global root 是
+  插件配置目录 `~/.agents` 而非整个 home，避免把 `.ssh`、`.aws` 等无关文件
+  暴露给通用读取能力；
+- `host.write-plugin-file` 用同一套相对路径规则替换 scope root 内的文件，且必须在
+  manifest 里声明 `permissions.writePluginFiles = true`，否则返回 permission denied。
+  写入先落到同目录的临时文件再 rename，读方不会看到半截配置；路径检查在
+  canonicalize 父目录之后进行，父目录符号链接跳出 scope 时会被拒绝。这是 MCP
+  Component 卸载 server 时改写 `.mcp.json` 的途径——Wasm 没有 WASI，写配置只能经
+  过宿主；
 - `host.list-tools` 和 `host.invoke-tool` 用于受 allowlist 约束的宿主工具能力；
 - `host.spawn-process`、`host.process-*` 提供 provider-owned stdio 的原始字节；
 - `host.http-*` 提供 provider-owned HTTP response 的原始字节；
 - 宿主在每次调用时检查 manifest 的 `permissions.invokeTools`；
 - 调用会经过正常的 `ToolRuntime` dispatch、schema 校验、工作目录、超时、
   cancellation 和输出限制；
-- process/HTTP 请求还会检查 discovery 从插件根目录 `.mcp.json` 读取的 server
-  declaration、manifest 的 server-id allowlist、host allowlist、句柄数量和
-  payload 上限；
+- process/HTTP 请求只检查 manifest 中通用的 `processCommands`/`networkHosts`
+  capability allowlist、句柄数量和 payload 上限；宿主不读取或解析 MCP 配置；
 - Wasm 没有 WASI import，因此不能直接访问文件系统、网络、进程、环境变量或
   keyring。
 
-当前 provider export 还包括 `list-hooks`/`invoke-hook`、MCP server/tool
-discovery 和 MCP tool invocation。MCP `initialize`、`initialized`、`tools/list`、
-`tools/call`、JSON-RPC、stdio line framing 以及 HTTP/event-stream framing 全部
-由 provider 自己实现；宿主只搬运 raw bytes 和校验声明。
+当前 Component export 包括通用的 `list-hooks`/`invoke-hook` 和
+`list-tools`/`execute-tool`。MCP Component 把 `tools/list` 的结果转换成普通
+Wasmtime tool descriptor，并在 `execute-tool` 内完成 `tools/call`。
+MCP `initialize`、`initialized`、`tools/list`、`tools/call`、JSON-RPC、
+stdio line framing 以及 HTTP/event-stream framing 全部由 MCP Component 自己实现；
+宿主只搬运 raw bytes 和执行通用 capability 边界。
 
 宿主还会验证 JSON 的 identity、revision、节点数、深度、文本大小、control id、
 声明过的 action 和 select option。guest 不能伪造宿主拥有的图片引用或 patch
@@ -725,12 +732,11 @@ LLM 或 agent loop 变成第一版 ABI 的隐式依赖。
 
 ## 8. Wasm 插件 Manifest
 
-Wasmtime 插件使用 `.codex-plugin/plugin.json` 声明其 Component：
+Wasmtime 插件使用根目录的 `plugin.json` 声明其 Component：
 
 ```text
 example-plugin/
-├── .codex-plugin/
-│   └── plugin.json
+├── plugin.json
 ├── plugin.wasm
 ├── README.md
 └── assets/
@@ -771,19 +777,25 @@ example-plugin/
 - `runtime.apiVersion`：WIT ABI 版本；
 - `runtime.ui`：允许暴露给宿主 UI 的 surface/action 名称；
 - `runtime.permissions.invokeTools`：宿主 tool capability allowlist；
-- `runtime.permissions.mcpServers`：允许该 provider 使用的 `.mcp.json` server id
-  allowlist，不包含 server 的 transport declaration。
+- `runtime.permissions.processCommands`：允许 Component 启动的进程命令；
+- `runtime.permissions.networkHosts`：允许 Component 访问的网络主机；
+- `runtime.permissions.writePluginFiles`：是否允许 Component 替换 scope root 内的
+  配置文件；未声明时只能读。MCP Component 声明它为 `true`，因为它要卸载 server。
 
-MCP server 的 `command`、`args`、`cwd`、`env`、`url` 和其他原有字段只能写在
-插件根目录的 `.mcp.json` 中。hook 的 matcher、command 和 command 参数只能写在
-插件根目录的 `hooks.json` 中；这些文件不需要、也不应该重复写入 manifest。
+MCP server 的 `command`、`args`、`cwd`、`env`、`url` 和其他字段由 MCP
+Component 通过 `read-plugin-file(".mcp.json")` 从当前 configuration root
+读取。Hooks matcher、command 和 command 参数由 Hooks Component 通过
+`read-plugin-file(".hooks.json")` 从当前 configuration root 读取。这些文件是
+global/project scope 的宿主配置资源，不属于插件包，也不需要重复写入 manifest。
 
 scope 仍由 marketplace 和 `PluginSettings` 决定，不由 Wasm manifest 自己声明。
 global marketplace 的插件会进入所有适用项目的 catalogue；project-scoped
 marketplace 的插件只会进入对应 project 的 catalogue。`PluginCatalogue::for_project`
 先合并 global plugins，再合并该项目的 plugins，并按 id 让项目级插件覆盖同 id 的
-global plugin。companion 文件随被选中的 plugin root 一起生效；disabled plugin
-不会进入 runtime。
+global plugin。宿主把 global Component 绑定到全局 configuration root（`~/.agents`），
+把 project Component 绑定到项目 configuration root；disabled
+plugin 不会进入 runtime。项目级插件覆盖同 id 的全局插件时，使用项目实例对应的
+项目 scope 配置。
 
 manifest 解析采用当前 `src/plugins/manifest.rs` 的容错原则：
 
@@ -804,17 +816,15 @@ manifest 解析采用当前 `src/plugins/manifest.rs` 的容错原则：
 
 1. 发现已启用插件；
 2. 根据 global/project scope 解析插件；
-3. 仅从 Hooks provider root 读取 `hooks.json`，仅从 MCP provider root 读取
-   `.mcp.json`，并保留对应 raw contents；
-4. 用 MCP provider 的 `.mcp.json` server map 建立 raw transport 授权；
+3. 为每个 Component 实例绑定 global 或 project scope 根目录；
+4. 提供通用的受限 `read-plugin-file` host import；
 5. 校验 manifest；
 6. 检查 WIT API 版本；
 7. 建立依赖顺序；
 8. 加载 `Component`；
 9. 为每个插件创建 runtime instance；
-10. 将 raw companion contents 和 capability 注册到当前 project 的 provider；
-11. 处理启用、禁用、卸载和 reload；
-12. 关闭插件时取消它创建的 job 和请求。
+10. 处理启用、禁用、卸载和 reload；
+11. 关闭插件时取消它创建的 job 和请求。
 
 PluginManager 不负责：
 
@@ -1076,9 +1086,7 @@ impl Tool for WasmTool {
 host_registry = native built-in implementations
   -> 根据 model modality加入 read_image
 registry = empty_with_jobs(host_registry.jobs())
-  -> bundled Wasm built-in provider list-tools/invoke-tool
-  -> 当前 project 的 Wasm providers list-tools/invoke-tool
-  -> provider-owned MCP list/call adapters
+  -> 当前 project 的 Wasmtime Components list-tools/execute-tool
   -> 注册 task
   -> 冻结 ToolRuntime 和 prompt snapshot
   -> 创建 Agent
@@ -1087,7 +1095,7 @@ registry = empty_with_jobs(host_registry.jobs())
 冲突处理：
 
 - bundled provider 先注册，保证 host built-in tool 名称稳定；
-- 其他 provider 和 MCP tool 保持“第一个注册者胜出”；
+- 其他 Component 和 MCP tool 保持“第一个注册者胜出”；
 - Wasm 工具不能覆盖已有工具；
 - 冲突写 warning；
 - prompt 只列出最终注册成功的工具。
@@ -1105,8 +1113,8 @@ registry = empty_with_jobs(host_registry.jobs())
 
 ## 13. Wasm Provider 统一模型
 
-当前 `LoadedPlugin` 承载资源发现结果、scope、插件 root，以及 discovery 读取的
-companion inputs。可执行能力统一由 Wasm provider 产生：
+当前 `LoadedPlugin` 承载资源发现结果、scope 和插件 root。可执行能力统一由
+Wasmtime Component 产生：
 
 ```rust
 pub struct PluginDescriptor {
@@ -1119,9 +1127,8 @@ pub struct PluginDescriptor {
     pub capabilities: Vec<CapabilityKind>,
 }
 
-pub enum ProviderKind {
-    BuiltinWasm,
-    PluginWasm,
+pub enum PluginRuntime {
+    WasmtimeComponent,
 }
 ```
 
@@ -1131,34 +1138,33 @@ pub enum ProviderKind {
 Agent
   -> ToolRuntime adapter
      -> ComponentActor
-        -> Wasm tool export
-        -> Wasm MCP provider
+        -> Wasmtime tool export
+        -> MCP Component 的通用 tool export
            -> JSON-RPC / initialize / tools/list / tools/call
            -> stdio byte framing or HTTP/event-stream framing
               -> CapabilityHub raw process/HTTP
 ```
 
-宿主没有 `McpClient`、`Transport` 或 native MCP tool registration。`McpServerConfig`
-来自插件根目录的 `.mcp.json`，只用于 host raw transport 授权；它不是 provider
-manifest 的 server declaration。协议、握手、消息 framing 和 transport 状态由
-Wasm provider 自己拥有。
+宿主没有 `McpClient`、`Transport`、`McpServerConfig` 或 native MCP tool
+registration。MCP Component 自己通过 `read-plugin-file(".mcp.json")` 读取并解析
+server declaration，自己拥有协议、握手、消息 framing、transport 状态和生命周期。
 
 ```text
 Wasmtime plugin
   -> skills / commands / agents
-  -> General provider tools
-  -> Hooks provider + hooks.json
-  -> MCP provider + .mcp.json
+  -> Component tools
+  -> Hooks Component + read-plugin-file(".hooks.json")
+  -> MCP Component + read-plugin-file(".mcp.json")
   -> MCP JSON-RPC and handshake
   -> stdio / HTTP transport framing
-  -> declarative UI provider
+  -> declarative UI surface
 ```
 
-没有合法 Wasmtime runtime 的目录不会进入 catalogue。`hooks.json` 只属于 Hooks
-provider，`.mcp.json` 只属于 MCP provider；General provider 即使目录里存在这些
-文件也不会读取。无论插件是 global 还是 project scope，provider 收到的 input 都
-来自当前 scope 选中的插件 root；项目级同 id 覆盖 global plugin 时，global plugin
-的 provider input 也随之被覆盖。
+没有合法 Wasmtime runtime 的目录不会进入 catalogue。只有 Component 自己请求时才
+会读取 `.hooks.json` 或 `.mcp.json`；宿主不根据文件名或 Component 职责预先读取它们。
+global Component 从全局 configuration root 读取，project Component 从项目
+configuration root 读取；项目级同 id 覆盖 global plugin 时，使用项目实例对应的
+项目 configuration root。
 
 ## 14. 分阶段实施计划
 
@@ -1221,9 +1227,9 @@ src/harness/runtime.rs
 
 1. 保留现有 `PluginCatalogue` 发现逻辑；
 2. 增加 `PluginDescriptor`；
-3. 将 Wasm component plugin 投影成 provider；
-4. 将 `hooks.json`、`.mcp.json` 的 scope-aware discovery inputs 传给 provider；
-5. 将 `.mcp.json` server map 转成 raw transport authorization；
+3. 将 Wasm component plugin 接入通用 Component runtime；
+4. 为 Component 绑定当前 global/project configuration root，并暴露通用
+   `read-plugin-file`；
 6. Worker 只向 PluginManager 请求 project scope 的 capabilities；
 7. `SetPlugins` 后清理旧 Agent 和旧 plugin instances。
 
@@ -1235,7 +1241,7 @@ src/harness/runtime.rs
 - MCP server 生命周期与 Agent 生命周期一致；
 - reload 不遗留旧进程或旧 job。
 
-### Phase 3：Wasm tool、hook 和 MCP provider
+### Phase 3：Wasmtime tool、hook 和 MCP Component
 
 工作：
 
@@ -1248,8 +1254,8 @@ src/harness/runtime.rs
 7. 实现 `host.invoke-tool`；
 8. 实现 timeout、cancel、fuel/epoch、memory limit；
 9. 将 Wasm tools 注册进现有 `ToolRegistry`；
-10. 由 provider 解析 `hooks.json` matcher 并执行 hook command；
-11. 由 provider 解析 `.mcp.json`，实现 MCP loading、initialize、JSON-RPC、
+10. 由 Hooks Component 解析 `.hooks.json` matcher 并执行 hook command；
+11. 由 MCP Component 解析 `.mcp.json`，实现 MCP loading、initialize、JSON-RPC、
     stdio/HTTP transport framing 和 MCP tool adapter。
 
 MVP 当前允许：
@@ -1260,8 +1266,8 @@ MVP 当前允许：
 - project-scoped 的 declarative UI surface；
 - UI action 的 revision、control、enabled 和 option 校验。
 
-当前不包含 `emit-event`、Wasm prompt、Wasm-created job 或完整 WASI。hooks 和
-MCP 已属于当前 provider ABI，不再恢复 native hook/MCP executor。
+当前不包含 `emit-event`、Wasm prompt、Wasm-created job 或完整 WASI。Hooks 和
+MCP 已属于当前 Component ABI，不再恢复宿主内置的 Hooks/MCP executor。
 
 验收：
 
@@ -1345,6 +1351,14 @@ src/plugins/wasm_runtime.rs 底部
 当前仓库已提交离线 `echo` Component fixture；其 componentizer 与 guest 使用
 和 Wasmtime 37 兼容的 `wasmparser/wit-* 0.239` 工具链，避免生成运行时无法
 解析的新 Component type 编码。
+
+构建产物也可以携带默认 Wasmtime 插件包。主程序通过 `include_bytes!` 嵌入
+Component 及其 manifest，首次启动时将它们写入普通的
+`.codex/plugins/cache/<marketplace>/<plugin>/<version>/` 缓存目录，再沿用同一套
+discovery、scope、启停、UI 和卸载逻辑。当前预置的 MCP Component id 是
+`mcp@deluxe-defaults`；它不携带 `.mcp.json`，运行时从当前 global/project scope
+根目录主动请求配置。
+用户明确将该插件设为 `enabled = false` 后，后续启动不会重新安装或强制启用它。
 
 测试不能访问真实 home、keyring 或网络。fixture 的文件读取使用临时目录。
 
@@ -1476,13 +1490,13 @@ filesystem 和 agent loop，否则每个细节都会变成 ABI 兼容负担。
 插件排序、工具排序、section 排序和序列化格式都必须稳定。任何依赖 hash map
 无序遍历的输出都必须改成 `BTreeMap` 或显式排序。
 
-### 18.6 Provider role 与 Wasmtime manifest 混淆
+### 18.6 Component 职责与 Wasmtime manifest
 
-所有插件都通过同一个 `.codex-plugin/plugin.json` 声明 Wasmtime Component。
-`runtime.provider` 只区分 Component 的职责：`general` 提供插件自身声明的
-Wasmtime tools，`hooks` 接管 Hooks，`mcp` 接管 MCP loading、tool adapter 和 transport。
-不要根据 `.mcp.json` 是否存在推断 provider。插件页面统一展示 Wasmtime
-Component，provider 只作为职责标识。
+所有插件都通过根目录的 `plugin.json` 声明 Wasmtime Component。manifest 不声明
+`general`、`hooks` 或 `mcp` 之类的宿主插件类型。Hooks Component 和 MCP
+Component 通过同一个通用 ABI 暴露 hooks/tools，并主动调用 `read-plugin-file`
+读取当前 global/project configuration root 的配置文件。插件页面统一展示 Wasmtime Component，宿主不根据
+配置文件存在与否推断插件职责。
 
 ## 19. 第一版完成标准
 
@@ -1502,7 +1516,7 @@ Component，provider 只作为职责标识。
   当前插件根目录中的 Wasmtime Component；
 - [x] 插件页面可以将选中的 Wasmtime 插件根目录导入全局或当前项目，并通过
   `name@deluxe-local` 登记后动态加载；
-- [x] Wasm provider tool、MCP transport、hooks、task、image、compaction 的既有
+- [x] Wasmtime Component tool、MCP transport、hooks、task、image、compaction 的既有
   测试通过。
 
 仍需继续补齐的运行时压力测试和扩展：
@@ -1518,7 +1532,7 @@ Component，provider 只作为职责标识。
 ## 20. 建议的下一步
 
 当前 Phase 1 的 harness 解耦、声明式 UI surface 和 Wasmtime tool/hook/MCP/UI
-provider MVP 已经落地。
+Component MVP 已经落地。
 后续工作按风险从运行时验证到 ABI 扩展推进：
 
 1. 增加专用 Wasm fixture，覆盖 timeout、cancel、fuel、memory/table limit、
@@ -1534,6 +1548,6 @@ provider MVP 已经落地。
 6. 最后评估 plugin-created job、context/session provider 等更大范围的扩展；
    这些能力不能与当前 Wasm tool MVP 共享未经验证的 ABI。
 
-每一步都应保持资源 discovery、Wasm provider、agent loop 和 GUI 测试通过，并在完成后
+每一步都应保持资源 discovery、Wasmtime Component、agent loop 和 GUI 测试通过，并在完成后
 重新运行 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings` 和
 `cargo test`。

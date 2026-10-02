@@ -241,6 +241,9 @@ pub enum Event {
         call_id: String,
         name: String,
         arguments: Value,
+        /// The model's own JSON text for the call, stored verbatim so a replay
+        /// sends the same bytes the live run did.
+        raw_arguments: String,
     },
     /// One tool call is over.
     ///
@@ -271,6 +274,12 @@ pub enum Event {
     UsageSampled {
         run_id: RunId,
         measurement: Option<(u64, usize)>,
+        /// The turn's provider usage, when it reported one. The context gauge
+        /// reads `measurement`, and the cache counters read this, so both move
+        /// the moment the turn comes back rather than waiting for the run to
+        /// end. `None` when the provider reported no usage — including the
+        /// reset sent after a compaction.
+        usage: Option<Usage>,
     },
     RunFinished {
         run_id: RunId,
@@ -279,8 +288,8 @@ pub enum Event {
         /// conversation. `None` when the provider reported no usage.
         measurement: Option<(u64, usize)>,
     },
-    /// Context compaction has begun: `dropping` messages — the whole
-    /// conversation — are about to be replaced by one summary.
+    /// Context compaction has begun: `dropping` older messages are about to be
+    /// folded into one summary, while the recent tail stays verbatim.
     CompactionStarted {
         run_id: RunId,
         /// How many messages the summary replaces. No longer rendered — the
@@ -290,10 +299,13 @@ pub enum Event {
         dropping: usize,
     },
     /// Context compaction is over. `summary` is what the model wrote about the
-    /// conversation, empty when no summary could be produced.
+    /// folded turns, empty when no summary could be produced. `keep` is how
+    /// many trailing messages survived verbatim.
     Compacted {
         run_id: RunId,
         summary: String,
+        #[allow(dead_code)]
+        keep: usize,
     },
     RunFailed {
         run_id: RunId,

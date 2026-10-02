@@ -16,7 +16,7 @@
 3. `ui.rs` 通过 `use super::*` 直接访问和修改大量 `App` 内部状态。
 4. 绘制函数中仍然包含配置修改、持久化、主题更新、图片读取、IPC 命令触发等副作用。
 5. `Actions` 虽然已经是延迟执行机制，但目前仍然是 GUI 内部私有结构，不是稳定的 UI 意图协议。
-6. [src/plugins/manifest.rs](C:/Users/MuWinds/Documents/Coding%20Project/github/deluxe-agent/src/plugins/manifest.rs) 描述 Wasmtime 插件的 manifest、skills、commands、agents、provider 和 UI 能力。
+6. [src/plugins/manifest.rs](C:/Users/MuWinds/Documents/Coding%20Project/github/deluxe-agent/src/plugins/manifest.rs) 描述 Wasmtime 插件的 manifest、skills、commands、agents 和 UI 能力。
 
 这些问题如果直接延伸到 Wasmtime，最容易出现的错误是让 Wasm 插件直接操作 `egui::Ui` 或 `egui::Painter`。这样会把 egui 的生命周期、线程模型、版本升级和宿主内部布局全部暴露给插件，最终形成另一种更严重的耦合。
 
@@ -528,9 +528,10 @@ GUI 应丢弃以下事件：
 worker 初始化项目：
     PluginCatalogue::for_project(project)
     过滤启用插件
-    按选中插件的 global/project scope 解析 Wasmtime provider
-    仅将 Hooks provider 的 hooks.json、MCP provider 的 .mcp.json 原样传给对应 provider
-    解析 provider 声明的 UI surface
+    按选中插件的 global/project scope 解析 Wasmtime Component
+    仅将当前 global/project configuration root 绑定给 Component；Hooks/MCP
+    Component 通过通用 read-plugin-file 自己读取其中的 .hooks.json/.mcp.json
+    解析 Component 声明的 UI surface
     创建 Wasmtime 实例
     注册允许的 capability
     获取初始 UI 文档
@@ -546,10 +547,12 @@ GUI：
 worker 再从该插件根目录动态实例化最新的 Wasmtime Component。GUI 不直接读取
 `.wasm`，也不在 egui 主线程执行 Wasmtime。
 
-插件页面的“添加到全局”和“添加到当前项目”会打开插件根目录选择器。worker
-校验 `.codex-plugin/plugin.json`、Wasmtime ABI 和 component entry 后，将目录复制
-到受管理的本地插件缓存，登记 `name@deluxe-local`，再按所选 scope 更新配置和
-catalogue。导入失败会回滚本次新复制的缓存，不覆盖已有同版本组件。
+插件页面的“添加到全局”和“添加到当前项目”会打开 Wasmtime Component
+（`.wasm`）文件选择器。worker 根据所选 Component 所在目录的
+根目录的 `plugin.json` 定位插件根目录，校验 manifest、Wasmtime ABI 和
+component entry 后，将整个插件根目录复制到受管理的本地插件缓存，登记
+`name@deluxe-local`，再按所选 scope 更新配置和 catalogue。导入失败会回滚本次
+新复制的缓存，不覆盖已有同版本组件。
 
 禁用插件不能实例化 Wasm，也不能创建 MCP、hook 或 UI runtime。
 
@@ -745,7 +748,6 @@ GUI 层不应该出现 `wasmtime::Store`、`wasmtime::Instance` 或任何 Wasm �
 
 - 每个插件必须声明合法的 Wasmtime `runtime`；缺失或非法时跳过整个插件。
 - 未知 runtime 类型不会回退到旧插件路径。
-- `runtime.provider` 只允许 `general`、`hooks` 和 `mcp`，决定 provider 角色。
 - UI surface 列表用于宿主展示入口，但实际权限仍由运行时校验。
 
 ---

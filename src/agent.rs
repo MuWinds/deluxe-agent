@@ -22,13 +22,14 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::attachments::ImageRef;
-use crate::context::{summary_turn, ContextSettings, ContextWindow};
+use crate::context::{compaction_split, summary_turn, ContextSettings, ContextWindow};
 use crate::error::{AgentError, Result};
 use crate::harness::{
     AgentEvent, AgentEventSink, AgentServices, AuditOutcome, HookContext, LlmStreamEvent,
     LlmStreamSink, RunId,
 };
 use crate::llm::{AssistantTurn, Message, ThinkingLevel, ToolCall, UserTurn};
+use crate::runtime_context;
 use crate::tools::ToolOutput;
 
 /// How often streamed text is flushed to the UI.
@@ -175,20 +176,36 @@ impl Agent {
         run_id: RunId,
         cancel: &CancellationToken,
     ) -> Result<Vec<Message>> {
-        let count = messages.len();
+        // Only the older turns are folded; the recent tail stays verbatim so
+        // the model keeps the last exchange in full instead of as a
+        // paraphrase. `None` means there is nothing worth folding.
+        let Some(split) = compaction_split(&messages, context.settings().keep_recent_turns) else {
+            return Ok(messages);
+        };
+        let kept = messages.len() - split;
 
         sink.emit(AgentEvent::CompactionStarted {
             run_id,
-            dropping: count,
+            dropping: split.saturating_sub(1),
         });
         tracing::info!(
             run_id,
-            dropping = count,
+            dropping = split.saturating_sub(1),
+            kept,
             measured_tokens = context.latest_usage().unwrap_or(0),
             "context threshold reached; compacting the history"
         );
 
-        match self.services.context.summarize(&messages, cancel).await {
+        // Only the prefix being folded goes to the summariser, carrying the
+        // conversation's own tool schema. It is a prefix of the request that
+        // triggered compaction, so the provider serves it from the same cache
+        // entry — and the kept tail is not paid for twice.
+        match self
+            .services
+            .context
+            .summarize(&messages[..split], &self.tools_schema, cancel)
+            .await
+        {
             Ok(Some(summary)) => {
                 // The measurement belonged to the pre-compaction shape and no
                 // longer describes what will go out next; the turn that
@@ -200,12 +217,14 @@ impl Agent {
                 sink.emit(AgentEvent::UsageSampled {
                     run_id,
                     measurement: None,
+                    usage: None,
                 });
                 sink.emit(AgentEvent::Compacted {
                     run_id,
                     summary: summary.clone(),
+                    keep: kept,
                 });
-                Ok(self.with_summary(&summary))
+                Ok(self.with_summary(&summary, &messages[split..]))
             }
             Ok(None) => {
                 // Nothing to summarise: the transcript rendered empty, or the
@@ -229,6 +248,7 @@ impl Agent {
                 sink.emit(AgentEvent::Compacted {
                     run_id,
                     summary: String::new(),
+                    keep: 0,
                 });
                 Ok(messages)
             }
@@ -237,14 +257,16 @@ impl Agent {
 
     /// Rebuilds the conversation around a compaction summary.
     ///
-    /// The brief is the whole of what the run carries on from, and it is built
-    /// by [`summary_turn`] so a later run replaying this session reconstructs
-    /// the identical message.
-    fn with_summary(&self, summary: &str) -> Vec<Message> {
-        vec![
-            Message::system(self.system_prompt.clone()),
-            summary_turn(summary),
-        ]
+    /// The brief replaces the folded prefix; `tail` is the recent exchange
+    /// that was kept verbatim and follows it. The brief is built by
+    /// [`summary_turn`] so a later run replaying this session reconstructs the
+    /// identical message.
+    fn with_summary(&self, summary: &str, tail: &[Message]) -> Vec<Message> {
+        let mut messages = Vec::with_capacity(tail.len() + 2);
+        messages.push(Message::system(self.system_prompt.clone()));
+        messages.push(summary_turn(summary));
+        messages.extend_from_slice(tail);
+        messages
     }
 
     /// Runs one prompt to completion.
@@ -275,10 +297,30 @@ impl Agent {
         // is byte-identical across every request this agent serves — until a
         // compaction replaces the whole conversation, see
         // [`Agent::with_summary`].
-        let mut messages = Vec::with_capacity(history.len() + 2);
+        let mut messages = Vec::with_capacity(history.len() + 3);
         messages.push(Message::system(self.system_prompt.clone()));
         messages.extend_from_slice(history);
         messages.push(Message::user_turn(prompt));
+
+        // Environment facts ride as a `user` turn *after* the prompt, so the
+        // system prompt above stays byte-stable and the provider's prefix
+        // cache keeps covering it. Appending after the prompt is also what
+        // keeps the wire order matching the session's own steps: the app
+        // records the prompt when the user sends, then this block when the
+        // notice arrives, so `to_messages` reproduces both in the same order.
+        //
+        // Only a block that differs from the newest one already in `history`
+        // is sent. Re-sending an identical block every turn would grow the
+        // conversation for no new information; a changed one (the date rolling
+        // over) lands at the tail, where a cache miss is expected anyway.
+        let context = runtime_context::render(&self.working_directory);
+        if runtime_context::last_emitted(history).as_deref() != Some(context.as_str()) {
+            messages.push(Message::user(context.clone()));
+            sink.emit(AgentEvent::Notice {
+                run_id,
+                text: context,
+            });
+        }
 
         // Fresh per run, but seeded with whatever the previous run of this same
         // conversation measured: the window itself lives on the frame, so a
@@ -330,6 +372,10 @@ impl Agent {
                 sink.emit(AgentEvent::UsageSampled {
                     run_id,
                     measurement: context.measurement(),
+                    // The final turn has no tool calls, so this is the only
+                    // sample a working turn gets; `RunFinished` carries the
+                    // final turn's figure, and the two branches never overlap.
+                    usage: turn.usage.clone(),
                 });
             }
 
@@ -454,6 +500,9 @@ impl Agent {
                 Ok(value) => value.clone(),
                 Err(_) => Value::String(call.function.arguments.clone()),
             },
+            // The raw text travels alongside the parsed form so the transcript
+            // can replay the exact bytes the model emitted.
+            raw_arguments: call.function.arguments.clone(),
         });
 
         match parsed {

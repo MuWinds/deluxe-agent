@@ -1008,8 +1008,8 @@ impl App {
     /// intake stay where they already were, in the plus menu — duplicating them
     /// here is what this slot used to do.
     fn draw_context_gauge(&self, ui: &mut egui::Ui, p: &Palette) {
-        let measured = self
-            .selected_session()
+        let session = self.selected_session();
+        let measured = session
             .and_then(|session| session.context_measurement)
             .map(|(tokens, _)| tokens);
         let limit = self.config.context.context_limit;
@@ -1050,6 +1050,24 @@ impl App {
         };
         if limit > 0 && ratio >= compaction && measured.is_some() {
             summary.push_str(" —— 达到压缩阈值，下一条消息会先压缩历史");
+        }
+
+        // The cache hit rate rides the same tooltip. The most recent request's
+        // share first, then the conversation's token-weighted share; both are
+        // omitted for a provider that never reported a cache figure, so the
+        // line never claims a rate it cannot back.
+        let mut cache = Vec::new();
+        if let Some(rate) = session
+            .and_then(|session| session.usage.as_ref())
+            .and_then(|usage| usage.cache_hit_rate())
+        {
+            cache.push(format!("最近一次 {:.0}%", rate * 100.0));
+        }
+        if let Some(rate) = session.and_then(Session::cache_hit_rate) {
+            cache.push(format!("本会话 {:.0}%", rate * 100.0));
+        }
+        if !cache.is_empty() {
+            summary.push_str(&format!("\n缓存命中：{}", cache.join("，")));
         }
 
         // The label decides the box, not the other way round: the painter clips
@@ -1274,6 +1292,19 @@ impl App {
                             if response.changed() {
                                 self.config.context.threshold_percent = threshold as u32;
                             }
+                        });
+                        ui.end_row();
+
+                        ui.label("保留最近轮次");
+                        ui.horizontal(|ui| {
+                            // How many recent user turns compaction keeps
+                            // verbatim; the rest is folded into the brief.
+                            ui.add(
+                                egui::DragValue::new(&mut self.config.context.keep_recent_turns)
+                                    .speed(1.0)
+                                    .range(0..=20),
+                            );
+                            ui.weak("压缩时逐字保留的最近用户轮次");
                         });
                         ui.end_row();
                     });
@@ -1643,18 +1674,13 @@ fn draw_plugin_contents(ui: &mut egui::Ui, plugin: &plugins::LoadedPlugin) {
             plugin.agents.iter().map(|a| a.name.as_str()).collect(),
         ),
     ];
-    let mut any = true;
+    let mut any = false;
     ui.horizontal_wrapped(|ui| {
         ui.weak("运行时：");
         ui.label(RichText::new("Wasmtime").strong());
     });
 
     let mut capabilities = Vec::new();
-    match runtime.provider {
-        plugins::ProviderKind::Hooks => capabilities.push("Hooks provider"),
-        plugins::ProviderKind::Mcp => capabilities.push("MCP provider"),
-        plugins::ProviderKind::General => {}
-    }
     if !runtime.permissions.invoke_tools.is_empty() {
         capabilities.push("工具");
     }
@@ -2049,6 +2075,11 @@ fn draw_step(
         Step::Notice { text } => {
             draw_bubble(ui, p, text, salt, p.bubble_notice, Align::Center, max_width);
         }
+        // A host message reached the model as a user turn, but it is not the
+        // user's own words — it renders like a notice, not like a user bubble.
+        Step::HostMessage { text } => {
+            draw_bubble(ui, p, text, salt, p.bubble_notice, Align::Center, max_width);
+        }
         // Reasoning needs the expanded set, which this function has no access to;
         // `draw_transcript` intercepts it before calling here. This arm only
         // exists to keep the match exhaustive, and renders collapsed. (The id
@@ -2062,6 +2093,7 @@ fn draw_step(
             name,
             arguments,
             result,
+            ..
         } => draw_tool_card(ui, p, call_id, name, arguments, result.as_ref(), max_width),
         Step::Compaction { summary } => {
             let text = if summary.trim().is_empty() {

@@ -13,10 +13,12 @@
 //! settings make th    at trade-off the user's call.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::harness::LlmProvider;
 use crate::llm::Message;
+use crate::runtime_context;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,6 +35,22 @@ pub struct ContextSettings {
     /// compaction; the alias lets a config written back then still load.
     #[serde(alias = "keepPercent")]
     pub threshold_percent: u32,
+    /// How many of the most recent user turns compaction keeps verbatim.
+    ///
+    /// Only the older turns are folded into the brief, so the model keeps the
+    /// recent exchange word-for-word instead of reading a paraphrase of it.
+    /// Zero folds everything, the behaviour compaction had before this field
+    /// existed; a value larger than the conversation simply leaves it alone.
+    ///
+    /// `serde(default)` so a config written before the field existed loads as
+    /// the default rather than as zero, which would silently drop the tail.
+    #[serde(default = "default_keep_recent_turns")]
+    pub keep_recent_turns: u32,
+}
+
+/// The default tail compaction keeps: the last two user turns.
+fn default_keep_recent_turns() -> u32 {
+    2
 }
 
 impl Default for ContextSettings {
@@ -40,6 +58,7 @@ impl Default for ContextSettings {
         Self {
             context_limit: 0,
             threshold_percent: 60,
+            keep_recent_turns: default_keep_recent_turns(),
         }
     }
 }
@@ -148,37 +167,47 @@ impl ContextWindow {
     }
 }
 
+/// The instruction appended to the conversation when it is summarised.
+///
+/// It rides at the end of the real conversation rather than in a prompt of its
+/// own, so the request's prefix is byte-identical to the turn that triggered
+/// compaction and the provider serves the whole history from its prompt cache.
+const SUMMARIZE_INSTRUCTION: &str = "\
+The conversation above is getting too long to carry in full. Do not continue it \
+and do not call any tools. Reply with only a continuation brief: the user's \
+goals, the decisions taken, the files touched, and anything still unfinished. \
+Two hundred words at most. Answer in the language the conversation used.";
+
 /// Summarises the whole conversation into one continuation brief.
 ///
-/// Returns `None` when there is nothing worth sending: a transcript with no
-/// text in it at all, or a brief that came back empty.
+/// Returns `None` when there is nothing worth sending: a conversation with no
+/// text but its system prompt, or a brief that came back empty.
 ///
-/// The summary comes back as plain text rather than as a ready-made message:
-/// the caller decides how it re-enters the wire — see [`summary_turn`].
+/// The request reuses the conversation's own messages — the same system prompt,
+/// the same tool schema, the same prefix — and appends [`SUMMARIZE_INSTRUCTION`],
+/// so the provider's prompt cache covers the history instead of re-reading a
+/// re-rendered transcript at full price. The summary comes back as plain text
+/// rather than a ready-made message: the caller decides how it re-enters the
+/// wire — see [`summary_turn`].
 pub async fn summarize(
     history: &[Message],
+    tools: &Value,
     llm: &dyn LlmProvider,
     cancel: &CancellationToken,
 ) -> crate::error::Result<Option<String>> {
-    let transcript = render(history);
-    if transcript.is_empty() {
+    // The system prompt is not conversation; a history of nothing but it has
+    // nothing to summarise.
+    let has_text = history
+        .iter()
+        .any(|message| message.role != "system" && !message.text().trim().is_empty());
+    if !has_text {
         return Ok(None);
     }
 
-    let turn = llm
-        .complete_turn(
-            &[
-                Message::system(
-                    "You compress a conversation between a user and a coding agent into a short \
-                 continuation brief. Keep the user's goals, the decisions taken, the files \
-                 touched, and anything still unfinished. Two hundred words at most. Answer in \
-                 the language the conversation used.",
-                ),
-                Message::user(transcript),
-            ],
-            cancel,
-        )
-        .await?;
+    let mut messages = history.to_vec();
+    messages.push(Message::user(SUMMARIZE_INSTRUCTION));
+
+    let turn = llm.complete_turn(&messages, tools, cancel).await?;
 
     let summary = turn.content.trim().to_string();
     if summary.is_empty() {
@@ -206,34 +235,47 @@ pub fn summary_turn(summary: &str) -> Message {
     ))
 }
 
-/// Renders a conversation as a readable transcript for the summariser.
+/// Where a compaction should cut `messages`: the index of the first message
+/// that survives verbatim, or `None` when there is nothing worth folding.
 ///
-/// Only text is rendered. A message that carries an image contributes its
-/// envelope and nothing else — inlining the picture's base64 into a prompt
-/// meant to be a short brief would be megabytes of noise. The system prompt is
-/// skipped too: it is the agent's standing instructions, not conversation, and
-/// re-summarising it every time would only crowd out what matters.
-fn render(messages: &[Message]) -> String {
-    let mut text = String::new();
-    for message in messages {
-        let label = match message.role.as_str() {
-            "user" => "User",
-            "assistant" => "Agent",
-            "tool" => "Tool result",
-            _ => continue,
-        };
-        let content = message.text();
-        if content.trim().is_empty() {
-            continue;
-        }
-        text.push_str(&format!("{label}: {content}\n\n"));
+/// The cut lands on a `user` turn, so a tool call is never separated from its
+/// result — a `tool` message answering nothing is rejected by the provider.
+/// Runtime-context blocks are skipped when counting turns: they are
+/// environment notes the host appended, not something the user asked, so they
+/// must not push a real turn out of the kept tail.
+///
+/// `keep_recent_turns` counts *user* messages, the current prompt included, so
+/// the default of two keeps the previous exchange plus the prompt being sent.
+pub fn compaction_split(messages: &[Message], keep_recent_turns: u32) -> Option<usize> {
+    let keep = keep_recent_turns as usize;
+    if keep == 0 {
+        // No tail: fold everything after the system prompt, as compaction did
+        // before the tail existed.
+        return (messages.len() > 1).then_some(messages.len());
     }
-    text
+
+    let users: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            message.role == "user" && !runtime_context::is_context_message(&message.text())
+        })
+        .map(|(index, _)| index)
+        .collect();
+
+    if users.len() <= keep {
+        return None;
+    }
+    let split = users[users.len() - keep];
+    // A cut at or before the first real turn leaves only the system prompt to
+    // summarise, which is not worth a request.
+    (split > 1).then_some(split)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn user(text: &str) -> Message {
         Message::user(text)
@@ -251,6 +293,7 @@ mod tests {
         ContextWindow::new(ContextSettings {
             context_limit: limit,
             threshold_percent,
+            ..ContextSettings::default()
         })
     }
 
@@ -335,6 +378,7 @@ mod tests {
         let settings = ContextSettings {
             context_limit: 131_072,
             threshold_percent: 45,
+            ..ContextSettings::default()
         };
         let text = toml::to_string(&settings).unwrap();
         let parsed: ContextSettings = toml::from_str(&text).unwrap();
@@ -358,34 +402,158 @@ mod tests {
         let settings = ContextSettings {
             context_limit: 100,
             threshold_percent: 45,
+            ..ContextSettings::default()
         };
         assert_eq!(settings.threshold_ratio(), 0.45);
         assert_eq!(settings.threshold(), 45);
     }
 
     #[test]
-    fn the_transcript_labels_every_turn_and_skips_the_system_prompt() {
-        // The summariser sees the conversation, never the agent's standing
-        // instructions: re-summarising those every time would crowd out what
-        // the brief is actually for.
+    fn the_split_keeps_the_configured_number_of_user_turns() {
         let messages = vec![
+            Message::system("sys"),
+            user("u1"),
+            assistant("a1"),
+            user("u2"),
+            assistant("a2"),
+            user("u3"),
+            assistant("a3"),
+            user("u4"),
+        ];
+        // Users sit at 1, 3, 5 and 7. Keeping two cuts at 5, so u3, a3 and the
+        // current prompt survive.
+        assert_eq!(compaction_split(&messages, 2), Some(5));
+        // Keeping one leaves only the prompt being sent.
+        assert_eq!(compaction_split(&messages, 1), Some(7));
+        // Keeping four would cut at u1, leaving only the system prompt.
+        assert_eq!(compaction_split(&messages, 4), None);
+        assert_eq!(compaction_split(&messages, 9), None);
+    }
+
+    #[test]
+    fn a_zero_tail_folds_everything_after_the_system_prompt() {
+        let messages = vec![Message::system("sys"), user("u1"), assistant("a1")];
+        assert_eq!(compaction_split(&messages, 0), Some(3));
+        // Nothing but the system prompt is nothing to fold.
+        assert_eq!(compaction_split(&[Message::system("sys")], 0), None);
+    }
+
+    #[test]
+    fn runtime_context_blocks_do_not_count_as_user_turns() {
+        let context = crate::runtime_context::render(std::path::Path::new("/tmp/proj"));
+        let messages = vec![
+            Message::system("sys"),
+            user("u1"),
+            assistant("a1"),
+            user("u2"),
+            assistant("a2"),
+            Message::user(context),
+            user("u3"),
+        ];
+        // The real users sit at 1, 3 and 6; the block at 5 is skipped, so
+        // keeping two still cuts at the second real turn.
+        assert_eq!(compaction_split(&messages, 2), Some(3));
+    }
+
+    /// An `LlmProvider` that records what the summariser sent and returns a
+    /// fixed brief.
+    struct RecordingLlm {
+        seen: std::sync::Mutex<Vec<Message>>,
+        tools_seen: std::sync::Mutex<Option<Value>>,
+        reply: String,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RecordingLlm {
+        async fn stream_turn(
+            &self,
+            _messages: &[Message],
+            _tools: &Value,
+            _thinking: Option<crate::llm::ThinkingLevel>,
+            _cancel: &CancellationToken,
+            _sink: &mut dyn crate::harness::LlmStreamSink,
+        ) -> crate::error::Result<crate::llm::AssistantTurn> {
+            unreachable!("the summariser never streams a turn")
+        }
+
+        async fn complete_turn(
+            &self,
+            messages: &[Message],
+            tools: &Value,
+            _cancel: &CancellationToken,
+        ) -> crate::error::Result<crate::llm::AssistantTurn> {
+            *self.seen.lock().unwrap() = messages.to_vec();
+            *self.tools_seen.lock().unwrap() = Some(tools.clone());
+            Ok(crate::llm::AssistantTurn {
+                content: self.reply.clone(),
+                tool_calls: Vec::new(),
+                usage: None,
+                finish_reason: None,
+            })
+        }
+    }
+
+    fn recording_llm(reply: &str) -> RecordingLlm {
+        RecordingLlm {
+            seen: std::sync::Mutex::new(Vec::new()),
+            tools_seen: std::sync::Mutex::new(None),
+            reply: reply.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_summary_request_reuses_the_conversation_and_appends_the_instruction() {
+        // The point of the whole exercise: the request carries the conversation
+        // verbatim — system prompt included — so the provider serves it from
+        // the prefix cache, with the instruction as the only new turn.
+        let llm = recording_llm("brief");
+        let tools = json!([{ "type": "function" }]);
+        let history = vec![
             Message::system("you are a coding agent"),
             user("list the files"),
             assistant("looking…"),
             tool(),
         ];
 
-        let transcript = render(&messages);
+        let summary = summarize(&history, &tools, &llm, &CancellationToken::new())
+            .await
+            .expect("the summary request succeeds")
+            .expect("a brief comes back");
+        assert_eq!(summary, "brief");
 
-        assert!(transcript.contains("User: list the files"), "{transcript}");
-        assert!(transcript.contains("Agent: looking…"), "{transcript}");
-        assert!(
-            transcript.contains("Tool result: the file says 42"),
-            "{transcript}"
+        let sent = llm.seen.lock().unwrap();
+        // Compare the serialised bytes, which is what the cache keys on.
+        assert_eq!(
+            serde_json::to_string(&sent[..history.len()]).unwrap(),
+            serde_json::to_string(&history).unwrap(),
+            "the conversation prefix must be byte-identical"
         );
+        assert_eq!(sent.len(), history.len() + 1);
+        assert_eq!(
+            sent.last().unwrap().text(),
+            SUMMARIZE_INSTRUCTION,
+            "the instruction is the one new turn"
+        );
+        assert_eq!(
+            llm.tools_seen.lock().unwrap().as_ref(),
+            Some(&tools),
+            "the tool schema travels with the request to keep the cached prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_history_of_nothing_but_the_system_prompt_is_not_summarised() {
+        let llm = recording_llm("brief");
+        let history = vec![Message::system("you are a coding agent")];
+
+        let summary = summarize(&history, &json!([]), &llm, &CancellationToken::new())
+            .await
+            .expect("an empty conversation is not an error");
+
+        assert_eq!(summary, None);
         assert!(
-            !transcript.contains("you are a coding agent"),
-            "the system prompt is not conversation: {transcript}"
+            llm.seen.lock().unwrap().is_empty(),
+            "no request is made when there is nothing to summarise"
         );
     }
 }

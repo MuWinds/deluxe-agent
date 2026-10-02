@@ -63,6 +63,11 @@ pub struct Session {
     /// ordering needs no calendar arithmetic and no date dependency.
     pub created_at: u64,
     pub state: RunState,
+    /// The most recent request's provider usage, when it reported one.
+    ///
+    /// Never cleared by a later request that reported nothing: the last figure
+    /// the provider gave is the honest "most recent" reading, and the cache
+    /// tooltip divides it to show the last request's hit rate.
     #[serde(default)]
     pub usage: Option<Usage>,
     /// The context measurement the last run reported: provider prompt tokens
@@ -74,6 +79,17 @@ pub struct Session {
     /// still loads.
     #[serde(default)]
     pub context_measurement: Option<(u64, usize)>,
+    /// Cumulative cache counters for this conversation, summed over every
+    /// request whose provider reported a cache figure.
+    ///
+    /// Stored as raw totals rather than a rate so the weighting survives: the
+    /// rate is `cache_hit_tokens / cache_measured_tokens`, token-weighted, and
+    /// recomputing it from totals never compounds a rounding error. `serde(default)`
+    /// so a session written before the fields existed loads as "nothing measured".
+    #[serde(default)]
+    pub cache_hit_tokens: u64,
+    #[serde(default)]
+    pub cache_measured_tokens: u64,
     /// The reasoning effort this conversation asks for, or `None` for "send no
     /// parameter". A property of the conversation, chosen in the composer like
     /// pi's shift+tab indicator, so it is stored beside the transcript rather
@@ -126,18 +142,37 @@ pub enum Step {
         call_id: String,
         name: String,
         arguments: Value,
+        /// The raw JSON text the model emitted for the call, kept verbatim.
+        ///
+        /// `arguments` is the parsed form the transcript renders; replaying
+        /// *that* would re-serialise it — reordering keys and dropping
+        /// whitespace — and the prompt prefix would diverge from the model's
+        /// own turn onward, invalidating the provider's cache. `serde(default)`
+        /// so a session written before the field existed still loads; its
+        /// replay falls back to re-serialising the parsed form.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_arguments: Option<String>,
         #[serde(default)]
         result: Option<ToolResult>,
     },
     Notice {
         text: String,
     },
-    /// A context compaction: the whole conversation was replaced by one
-    /// summary.
+    /// A host-authored message delivered to the model as a `user` turn.
+    ///
+    /// Distinct from [`Step::Notice`]: a notice is transcript-only, but this
+    /// one was on the wire when the run sent it — the agent loop's inbox for a
+    /// background job that settled mid-run — so the replay must reproduce it,
+    /// or every later turn's prefix shifts.
+    HostMessage {
+        text: String,
+    },
+    /// A context compaction: the older turns were folded into one summary,
+    /// while the turns after this marker were kept verbatim.
     ///
     /// Recorded so the transcript shows why the older turns vanished. It is
     /// never replayed to the model, which receives the summary itself as the
-    /// turn it continues from.
+    /// turn it continues from; everything *after* the marker still replays.
     Compaction {
         summary: String,
     },
@@ -235,11 +270,22 @@ pub fn push_answer(steps: &mut Vec<Step>, content: &str) {
 }
 
 /// Records a tool call, with its result still to come.
-pub fn push_tool(steps: &mut Vec<Step>, call_id: String, name: String, arguments: Value) {
+///
+/// `raw_arguments` is the model's own JSON text, kept so the replay can send
+/// the same bytes the live run did; `None` only for a caller that has no raw
+/// form (a legacy transcript), which replays by re-serialising `arguments`.
+pub fn push_tool(
+    steps: &mut Vec<Step>,
+    call_id: String,
+    name: String,
+    arguments: Value,
+    raw_arguments: Option<String>,
+) {
     steps.push(Step::Tool {
         call_id,
         name,
         arguments,
+        raw_arguments,
         result: None,
     });
 }
@@ -280,9 +326,43 @@ impl Session {
             state: RunState::Running,
             usage: None,
             context_measurement: None,
+            cache_hit_tokens: 0,
+            cache_measured_tokens: 0,
             thinking: None,
             steps: Vec::new(),
         }
+    }
+
+    /// Folds one request's usage into the conversation's cache counters.
+    ///
+    /// Only requests that reported *both* a prompt size and a cache figure are
+    /// counted. A provider that never mentions caching would otherwise inflate
+    /// the denominator with its whole prompt and report a hit rate of 0% —
+    /// which reads as a broken cache rather than an unreported one. A reported
+    /// zero is counted, because a cold first request genuinely misses.
+    pub fn record_cache_usage(&mut self, usage: Option<&Usage>) {
+        let Some(usage) = usage else {
+            return;
+        };
+        let (Some(prompt), Some(cached)) = (usage.prompt_tokens(), usage.cached_prompt_tokens())
+        else {
+            return;
+        };
+        if prompt == 0 {
+            return;
+        }
+        self.cache_hit_tokens = self.cache_hit_tokens.saturating_add(cached.min(prompt));
+        self.cache_measured_tokens = self.cache_measured_tokens.saturating_add(prompt);
+    }
+
+    /// The conversation's token-weighted cache hit rate, in `0.0..=1.0`.
+    ///
+    /// `None` until at least one request reported a cache figure.
+    pub fn cache_hit_rate(&self) -> Option<f32> {
+        if self.cache_measured_tokens == 0 {
+            return None;
+        }
+        Some((self.cache_hit_tokens as f32 / self.cache_measured_tokens as f32).clamp(0.0, 1.0))
     }
 
     /// Appends to the trailing reasoning step, or starts one.
@@ -335,8 +415,14 @@ impl Session {
     }
 
     /// See [`push_tool`], which holds the logic.
-    pub fn push_tool(&mut self, call_id: String, name: String, arguments: Value) {
-        push_tool(&mut self.steps, call_id, name, arguments);
+    pub fn push_tool(
+        &mut self,
+        call_id: String,
+        name: String,
+        arguments: Value,
+        raw_arguments: Option<String>,
+    ) {
+        push_tool(&mut self.steps, call_id, name, arguments, raw_arguments);
     }
 
     /// See [`finish_tool`], which holds the logic.
@@ -382,6 +468,10 @@ impl Session {
                     out.push_str("## 失败\n\n");
                     out.push_str(text);
                 }
+                Step::HostMessage { text } => {
+                    out.push_str("## 系统通知\n\n");
+                    out.push_str(text);
+                }
                 Step::Compaction { summary } => {
                     out.push_str("## 上下文压缩\n\n");
                     out.push_str(summary);
@@ -409,10 +499,12 @@ impl Session {
     /// A compaction cuts the replay short. Everything ahead of the last marker
     /// was folded into that marker's brief, so replaying those turns would both
     /// contradict the brief and undo the compaction — the very next prompt
-    /// would cross the threshold again. The marker itself replays as
-    /// [`summary_turn`], the same message the compacting run carried on from,
-    /// so a follow-up's history is the prefix that run's own messages had. This
-    /// is what makes a compaction outlive the run that produced it.
+    /// would cross the threshold again. The turns *after* the marker are the
+    /// tail the compacting run kept verbatim, and they replay in full. The
+    /// marker itself replays as [`summary_turn`], the same message the
+    /// compacting run carried on from, so a follow-up's history is the prefix
+    /// that run's own messages had. This is what makes a compaction outlive the
+    /// run that produced it.
     pub fn to_messages(&self) -> Vec<Message> {
         let Some(index) = self.last_compaction() else {
             return replay(&self.steps);
@@ -426,6 +518,53 @@ impl Session {
         messages
     }
 
+    /// Records a compaction whose brief replaces everything before the last
+    /// `keep` replayed messages, inserting the marker at that boundary.
+    ///
+    /// The marker must land *before* the kept tail, not at the end: the replay
+    /// cuts at the last non-empty marker, so a marker appended after the tail
+    /// would drop the very turns the compacting run kept. A marker with no
+    /// summary — a failed compaction — is appended instead, because nothing
+    /// was actually cut.
+    pub fn record_compaction(&mut self, summary: String, keep: usize) {
+        if summary.trim().is_empty() || keep == 0 {
+            self.steps.push(Step::Compaction { summary });
+            return;
+        }
+
+        // The current surface begins after the last brief that actually
+        // produced one; an empty marker does not cut anything.
+        let start = self.last_compaction().map_or(0, |index| index + 1);
+        let plan = replay_plan(&self.steps[start..]);
+
+        if keep >= plan.len() {
+            // The whole surface is the kept tail: the run folded only the
+            // previous brief. The new marker goes right after that brief, so
+            // it is the last marker and the whole surface still replays after
+            // it. With no previous marker this cannot happen — a kept tail is
+            // always shorter than the surface.
+            if start == 0 {
+                self.steps.push(Step::Compaction { summary });
+                return;
+            }
+            self.steps.insert(start, Step::Compaction { summary });
+            return;
+        }
+
+        let boundary = start + plan[plan.len() - keep].1;
+        // The agent cuts on a user turn, so this holds for any compaction it
+        // announced; a mismatch means the boundary is unusable, and folding
+        // nothing is safer than orphaning a tool result.
+        if !matches!(
+            self.steps[boundary],
+            Step::User { .. } | Step::HostMessage { .. }
+        ) {
+            self.steps.push(Step::Compaction { summary });
+            return;
+        }
+        self.steps.insert(boundary, Step::Compaction { summary });
+    }
+
     /// Where the last compaction that actually produced a brief sits.
     ///
     /// A marker carrying no summary is a compaction that failed: that run went
@@ -437,7 +576,15 @@ impl Session {
     }
 }
 
-/// The user / assistant / tool turns among `steps`, in order.
+/// One replayed message and the index of the step it came from.
+///
+/// The index is what [`Session::record_compaction`] uses to find where a kept
+/// tail begins: the compaction marker is inserted before the step that
+/// produced the first kept message.
+type Replayed = (Message, usize);
+
+/// The user / assistant / tool / host-message turns among `steps`, in order,
+/// each paired with the step it came from.
 ///
 /// Everything else — reasoning, notices, compaction markers — is transcript
 /// only and has no place on the wire.
@@ -454,17 +601,20 @@ impl Session {
 /// A call the run never answered — the process died mid-tool — is still given a
 /// result, because a `tool_calls` entry with no reply is the same rejection
 /// from the other side.
-fn replay(steps: &[Step]) -> Vec<Message> {
-    let mut messages = Vec::new();
+fn replay_plan(steps: &[Step]) -> Vec<Replayed> {
+    let mut plan = Vec::new();
     let mut index = 0;
 
     while index < steps.len() {
         match &steps[index] {
             Step::User { text, images } => {
-                messages.push(Message::user_turn(UserTurn {
-                    text: text.clone(),
-                    images: images.clone(),
-                }));
+                plan.push((
+                    Message::user_turn(UserTurn {
+                        text: text.clone(),
+                        images: images.clone(),
+                    }),
+                    index,
+                ));
                 index += 1;
             }
             // The prose of a turn. Any tool steps immediately after it are the
@@ -474,11 +624,11 @@ fn replay(steps: &[Step]) -> Vec<Message> {
                 let tools = tool_run(steps, index + 1);
                 if tools.is_empty() {
                     if !text.is_empty() {
-                        messages.push(Message::assistant(text.clone(), Vec::new()));
+                        plan.push((Message::assistant(text.clone(), Vec::new()), index));
                     }
                     index += 1;
                 } else {
-                    push_tool_turn(&mut messages, text, tools);
+                    push_tool_turn(&mut plan, text, tools, index + 1, index);
                     index += 1 + tools.len();
                 }
             }
@@ -487,14 +637,29 @@ fn replay(steps: &[Step]) -> Vec<Message> {
             // a tool-only turn has on the wire.
             Step::Tool { .. } => {
                 let tools = tool_run(steps, index);
-                push_tool_turn(&mut messages, "", tools);
+                push_tool_turn(&mut plan, "", tools, index, index);
                 index += tools.len();
+            }
+            // A host message was a `user` turn on the wire when the run sent
+            // it, so the replay reproduces it — unlike a transcript-only
+            // notice, which the run never sent to the model.
+            Step::HostMessage { text } => {
+                plan.push((Message::user(text.clone()), index));
+                index += 1;
             }
             _ => index += 1,
         }
     }
 
-    messages
+    plan
+}
+
+/// The replayed messages alone, in order.
+fn replay(steps: &[Step]) -> Vec<Message> {
+    replay_plan(steps)
+        .into_iter()
+        .map(|(message, _)| message)
+        .collect()
 }
 
 /// The consecutive [`Step::Tool`]s starting at `start`.
@@ -510,16 +675,30 @@ fn tool_run(steps: &[Step], start: usize) -> &[Step] {
 /// per call.
 ///
 /// `text` is the turn's prose, or empty for a turn that only called tools.
-fn push_tool_turn(messages: &mut Vec<Message>, text: &str, tools: &[Step]) {
+/// `base` is the position of the first call within the replayed slice, used to
+/// mint a stable id for a call the transcript never recorded one for and to
+/// record each call's originating step. `assistant_step` is the step the
+/// assistant message belongs to: the prose step when there is one, else the
+/// first call's step.
+fn push_tool_turn(
+    plan: &mut Vec<Replayed>,
+    text: &str,
+    tools: &[Step],
+    base: usize,
+    assistant_step: usize,
+) {
     // Pair every call with the id its result must name. The id is minted only
-    // when the transcript has none — a session written before it was kept — so
-    // that the call and its result always agree.
+    // when the transcript has none — a session written before it was kept — and
+    // it is derived from the call's position rather than randomised: a fresh
+    // UUID every replay would change the message bytes on every run and throw
+    // away the provider's prefix cache from this turn onward.
     let calls: Vec<(String, &Step)> = tools
         .iter()
-        .filter_map(|tool| match tool {
+        .enumerate()
+        .filter_map(|(offset, tool)| match tool {
             Step::Tool { call_id, .. } => Some((
                 if call_id.is_empty() {
-                    format!("call_{}", Uuid::new_v4())
+                    format!("call_replay_{}", base + offset)
                 } else {
                     call_id.clone()
                 },
@@ -533,41 +712,44 @@ fn push_tool_turn(messages: &mut Vec<Message>, text: &str, tools: &[Step]) {
         .iter()
         .filter_map(|(id, tool)| match tool {
             Step::Tool {
-                name, arguments, ..
+                name,
+                arguments,
+                raw_arguments,
+                ..
             } => Some(ToolCall {
                 id: id.clone(),
                 call_type: "function".into(),
                 function: FunctionCall {
                     name: name.clone(),
-                    // The wire wants the arguments as the raw JSON string the
-                    // model emitted; the transcript kept them parsed.
-                    arguments: serde_json::to_string(arguments).unwrap_or_else(|_| "{}".into()),
+                    // Prefer the model's own bytes; only a legacy transcript
+                    // without them falls back to re-serialising the parsed
+                    // form, which reorders keys and would shift the prefix.
+                    arguments: raw_arguments.clone().unwrap_or_else(|| {
+                        serde_json::to_string(arguments).unwrap_or_else(|_| "{}".into())
+                    }),
                 },
             }),
             _ => None,
         })
         .collect();
 
-    messages.push(Message::assistant(text.to_string(), tool_calls));
+    plan.push((
+        Message::assistant(text.to_string(), tool_calls),
+        assistant_step,
+    ));
 
-    for (id, tool) in calls {
+    for (offset, (id, tool)) in calls.into_iter().enumerate() {
         let Step::Tool { result, .. } = tool else {
             continue;
         };
-        match result {
+        let message = match result {
             // Replayed images are what make a follow-up question about one
             // still work: the reference is resolved back into the same picture
             // on every later turn.
-            Some(result) => messages.push(Message::tool_with_images(
-                id,
-                result.output.clone(),
-                &result.images,
-            )),
-            None => messages.push(Message::tool(
-                id,
-                "The tool call did not complete before the run ended.",
-            )),
-        }
+            Some(result) => Message::tool_with_images(id, result.output.clone(), &result.images),
+            None => Message::tool(id, "The tool call did not complete before the run ended."),
+        };
+        plan.push((message, base + offset));
     }
 }
 
@@ -744,7 +926,10 @@ fn encode(sessions: &[Session]) -> Result<String> {
 fn trim_payloads(session: &mut Session) {
     for step in &mut session.steps {
         match step {
-            Step::User { text, .. } | Step::Assistant { text } | Step::Notice { text } => {
+            Step::User { text, .. }
+            | Step::Assistant { text }
+            | Step::Notice { text }
+            | Step::HostMessage { text } => {
                 cap_bytes(text, MAX_STORED_TEXT_BYTES);
             }
             Step::Reasoning { text, .. } => {
@@ -805,6 +990,8 @@ mod tests {
             state: RunState::Finished,
             usage: None,
             context_measurement: None,
+            cache_hit_tokens: 0,
+            cache_measured_tokens: 0,
             thinking: None,
             steps,
         }
@@ -870,7 +1057,13 @@ mod tests {
         push_reasoning(&mut steps, "options");
         push_assistant(&mut steps, "the ");
         push_assistant(&mut steps, "answer");
-        push_tool(&mut steps, "call-1".into(), "read_file".into(), json!({}));
+        push_tool(
+            &mut steps,
+            "call-1".into(),
+            "read_file".into(),
+            json!({}),
+            None,
+        );
         finish_tool(
             &mut steps,
             "call-1",
@@ -971,6 +1164,7 @@ mod tests {
                 call_id: "call_1".into(),
                 name: "list_dir".into(),
                 arguments: serde_json::json!({}),
+                raw_arguments: None,
                 result: Some(ToolResult {
                     outcome: AuditOutcome::Executed,
                     output: "empty".into(),
@@ -1027,6 +1221,7 @@ mod tests {
                 call_id: "call_1".into(),
                 name: "read_file".into(),
                 arguments: serde_json::json!({}),
+                raw_arguments: None,
                 result: None,
             },
             Step::Notice {
@@ -1066,6 +1261,7 @@ mod tests {
                 call_id: "call_7".into(),
                 name: "read_file".into(),
                 arguments: serde_json::json!({ "path": "a.txt" }),
+                raw_arguments: None,
                 result: Some(ToolResult {
                     outcome: AuditOutcome::Executed,
                     output: "42".into(),
@@ -1090,6 +1286,108 @@ mod tests {
         assert_eq!(calls[0].id, "call_7");
         assert_eq!(calls[0].function.arguments, r#"{"path":"a.txt"}"#);
         assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_7"));
+    }
+
+    #[test]
+    fn replay_sends_the_models_own_tool_argument_bytes() {
+        // A model emits keys in schema order and with its own spacing; the
+        // transcript also keeps the parsed form. Replaying the parsed form
+        // would re-serialise to alphabetical keys and shift the prompt prefix
+        // from this call onward, so the raw text must win.
+        let raw = r#"{"startLine":1,"path":"a.txt"}"#;
+        let session = session_with(vec![
+            Step::User {
+                text: "read it".into(),
+                images: Vec::new(),
+            },
+            Step::Assistant {
+                text: "on it".into(),
+            },
+            Step::Tool {
+                call_id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: json!({ "startLine": 1, "path": "a.txt" }),
+                raw_arguments: Some(raw.into()),
+                result: None,
+            },
+        ]);
+
+        let messages = session.to_messages();
+        let call = &messages[1].tool_calls.as_ref().expect("the call replays")[0];
+        assert_eq!(call.function.arguments, raw);
+        // The canonical form would have sorted the keys; prove we did not.
+        assert_eq!(
+            serde_json::to_string(&json!({ "startLine": 1, "path": "a.txt" })).unwrap(),
+            r#"{"path":"a.txt","startLine":1}"#
+        );
+        assert_ne!(call.function.arguments, r#"{"path":"a.txt","startLine":1}"#);
+    }
+
+    #[test]
+    fn a_legacy_call_without_raw_bytes_falls_back_to_reserialising() {
+        let session = session_with(vec![Step::Tool {
+            call_id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: json!({ "path": "a.txt" }),
+            raw_arguments: None,
+            result: None,
+        }]);
+
+        let messages = session.to_messages();
+        let call = &messages[0].tool_calls.as_ref().expect("the call replays")[0];
+        assert_eq!(call.function.arguments, r#"{"path":"a.txt"}"#);
+    }
+
+    #[test]
+    fn a_call_with_no_recorded_id_replays_a_stable_id() {
+        // Legacy sessions kept no id; minting a fresh UUID per replay would
+        // change the message bytes on every run. Deriving it from the call's
+        // position makes two replays agree.
+        let session = session_with(vec![Step::Tool {
+            call_id: String::new(),
+            name: "read_file".into(),
+            arguments: json!({}),
+            raw_arguments: None,
+            result: None,
+        }]);
+
+        let id = |session: &Session| {
+            session.to_messages()[0]
+                .tool_calls
+                .as_ref()
+                .expect("the call replays")[0]
+                .id
+                .clone()
+        };
+        assert_eq!(id(&session), id(&session));
+        assert_eq!(id(&session), "call_replay_0");
+    }
+
+    #[test]
+    fn a_host_message_replays_as_a_user_turn() {
+        // The agent loop injects a background-job notice into the request as a
+        // user turn; a plain notice is transcript-only. The replay must
+        // reproduce the former or every later turn's prefix shifts.
+        let session = session_with(vec![
+            Step::User {
+                text: "run it".into(),
+                images: Vec::new(),
+            },
+            Step::HostMessage {
+                text: "job 3 finished".into(),
+            },
+            Step::Assistant {
+                text: "done".into(),
+            },
+        ]);
+
+        let messages = session.to_messages();
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect();
+        assert_eq!(roles, vec!["user", "user", "assistant"]);
+        assert_eq!(messages[1].text(), "job 3 finished");
     }
 
     #[test]
@@ -1126,7 +1424,12 @@ mod tests {
     #[test]
     fn a_tool_result_attaches_to_its_call() {
         let mut session = session_with(Vec::new());
-        session.push_tool("call_1".into(), "read_file".into(), json!({ "path": "a" }));
+        session.push_tool(
+            "call_1".into(),
+            "read_file".into(),
+            json!({ "path": "a" }),
+            None,
+        );
         session.finish_tool(
             "call_1",
             ToolResult {
@@ -1168,7 +1471,12 @@ mod tests {
     fn a_session_round_trips_through_json() {
         let mut session = session_with(Vec::new());
         session.push_assistant("hi");
-        session.push_tool("c".into(), "exec".into(), json!({ "lineNumbers": null }));
+        session.push_tool(
+            "c".into(),
+            "exec".into(),
+            json!({ "lineNumbers": null }),
+            None,
+        );
         session.finish_tool(
             "c",
             ToolResult {
@@ -1390,5 +1698,199 @@ mod tests {
             rendered,
             vec!["fix the build".to_string(), "on it".to_string()]
         );
+    }
+
+    fn step_user(text: &str) -> Step {
+        Step::User {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    fn step_assistant(text: &str) -> Step {
+        Step::Assistant { text: text.into() }
+    }
+
+    /// The replayed wire text, which is what the model actually receives.
+    fn rendered(session: &Session) -> Vec<String> {
+        session
+            .to_messages()
+            .iter()
+            .map(|message| message.text())
+            .collect()
+    }
+
+    #[test]
+    fn a_range_compaction_keeps_the_tail() {
+        let mut session = session_with(vec![
+            step_user("u1"),
+            step_assistant("a1"),
+            step_user("u2"),
+            step_assistant("a2"),
+            step_user("u3"),
+            step_assistant("a3"),
+            step_user("prompt"),
+        ]);
+        session.record_compaction("brief".into(), 3);
+
+        assert_eq!(
+            rendered(&session),
+            vec![
+                summary_turn("brief").text(),
+                "u3".to_string(),
+                "a3".to_string(),
+                "prompt".to_string(),
+            ],
+            "the brief must replace the folded prefix and keep the tail"
+        );
+        // The marker sits at the boundary, not at the end.
+        assert!(matches!(session.steps[4], Step::Compaction { .. }));
+    }
+
+    #[test]
+    fn a_second_compaction_cuts_inside_the_current_surface() {
+        let mut session = session_with(vec![
+            step_user("u1"),
+            step_assistant("a1"),
+            Step::Compaction {
+                summary: "old".into(),
+            },
+            step_user("u2"),
+            step_assistant("a2"),
+            step_user("u3"),
+            step_assistant("a3"),
+            step_user("prompt"),
+        ]);
+        session.record_compaction("new".into(), 3);
+
+        assert_eq!(
+            rendered(&session),
+            vec![
+                summary_turn("new").text(),
+                "u3".to_string(),
+                "a3".to_string(),
+                "prompt".to_string(),
+            ],
+            "the newest brief wins and the old one is folded away"
+        );
+        assert_eq!(
+            session
+                .steps
+                .iter()
+                .filter(|step| matches!(step, Step::Compaction { .. }))
+                .count(),
+            2,
+            "the old marker stays in the transcript"
+        );
+    }
+
+    #[test]
+    fn a_second_compaction_over_the_whole_surface_replaces_the_old_brief() {
+        // Keeping everything after the old marker means the run folded only
+        // that brief; the new marker follows it and becomes the one the replay
+        // cuts at, rather than cutting the surface it was meant to keep.
+        let mut session = session_with(vec![
+            step_user("u1"),
+            step_assistant("a1"),
+            Step::Compaction {
+                summary: "old".into(),
+            },
+            step_user("u2"),
+            step_assistant("a2"),
+            step_user("u3"),
+            step_assistant("a3"),
+            step_user("prompt"),
+        ]);
+        session.record_compaction("new".into(), 5);
+
+        assert_eq!(
+            rendered(&session),
+            vec![
+                summary_turn("new").text(),
+                "u2".to_string(),
+                "a2".to_string(),
+                "u3".to_string(),
+                "a3".to_string(),
+                "prompt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_summary_is_appended_rather_than_cutting_the_tail() {
+        let mut session = session_with(vec![step_user("u1"), step_assistant("a1")]);
+        session.record_compaction(String::new(), 1);
+
+        assert_eq!(
+            rendered(&session),
+            vec!["u1".to_string(), "a1".to_string()],
+            "a failed compaction must not drop anything"
+        );
+        assert!(matches!(
+            session.steps.last(),
+            Some(Step::Compaction { .. })
+        ));
+    }
+
+    #[test]
+    fn a_zero_tail_folds_the_whole_conversation() {
+        let mut session = session_with(vec![step_user("u1"), step_assistant("a1")]);
+        session.record_compaction("brief".into(), 0);
+
+        assert_eq!(rendered(&session), vec![summary_turn("brief").text()]);
+    }
+
+    #[test]
+    fn cache_counters_are_token_weighted_across_requests() {
+        let mut session = session_with(Vec::new());
+
+        // Two requests of different sizes: weighting by prompt tokens is what
+        // keeps a tiny cold request from dragging the rate of a large warm one.
+        session.record_cache_usage(Some(&Usage {
+            prompt_tokens: Some(100),
+            prompt_cache_hit_tokens: Some(0),
+            ..Default::default()
+        }));
+        session.record_cache_usage(Some(&Usage {
+            prompt_tokens: Some(900),
+            prompt_cache_hit_tokens: Some(810),
+            ..Default::default()
+        }));
+
+        assert_eq!(session.cache_hit_tokens, 810);
+        assert_eq!(session.cache_measured_tokens, 1_000);
+        assert_eq!(session.cache_hit_rate(), Some(0.81));
+    }
+
+    #[test]
+    fn a_provider_that_never_reports_caching_leaves_the_rate_unset() {
+        let mut session = session_with(Vec::new());
+        session.record_cache_usage(Some(&Usage {
+            prompt_tokens: Some(500),
+            completion_tokens: Some(5),
+            ..Default::default()
+        }));
+
+        assert_eq!(session.cache_measured_tokens, 0);
+        assert_eq!(
+            session.cache_hit_rate(),
+            None,
+            "an unreported cache must not read as 0%"
+        );
+    }
+
+    #[test]
+    fn the_openai_cache_shape_is_counted_too() {
+        let mut session = session_with(Vec::new());
+        session.record_cache_usage(Some(&Usage {
+            prompt_tokens: Some(200),
+            prompt_tokens_details: Some(crate::llm::PromptTokensDetails {
+                cached_tokens: Some(50),
+            }),
+            ..Default::default()
+        }));
+
+        assert_eq!(session.cache_hit_tokens, 50);
+        assert_eq!(session.cache_hit_rate(), Some(0.25));
     }
 }

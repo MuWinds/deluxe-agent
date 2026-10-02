@@ -61,9 +61,10 @@ impl LlmProvider for NativeLlmProvider {
     async fn complete_turn(
         &self,
         messages: &[Message],
+        tools: &Value,
         cancel: &CancellationToken,
     ) -> Result<AssistantTurn> {
-        self.client.complete_turn(messages, cancel).await
+        self.client.complete_turn(messages, tools, cancel).await
     }
 }
 
@@ -83,9 +84,10 @@ impl ContextCompactor for NativeContextCompactor {
     async fn summarize(
         &self,
         history: &[Message],
+        tools: &Value,
         cancel: &CancellationToken,
     ) -> Result<Option<String>> {
-        summarize(history, self.llm.as_ref(), cancel).await
+        summarize(history, tools, self.llm.as_ref(), cancel).await
     }
 }
 
@@ -190,6 +192,15 @@ impl PluginManager for NativePluginManager {
         .map_err(|error| AgentError::internal(format!("Plugin discovery worker failed: {error}")))
     }
 
+    async fn ensure_bundled_defaults(&self, settings: PluginSettings) -> Result<PluginSettings> {
+        let home = self.home.clone();
+        tokio::task::spawn_blocking(move || ensure_bundled_defaults(&home, settings))
+            .await
+            .map_err(|error| {
+                AgentError::internal(format!("Bundled plugin install worker failed: {error}"))
+            })?
+    }
+
     async fn install_local(&self, component_path: PathBuf) -> Result<InstalledPlugin> {
         let home = self.home.clone();
         tokio::task::spawn_blocking(move || install_local_plugin(&home, &component_path))
@@ -248,6 +259,112 @@ impl NativePluginManager {
 }
 
 const LOCAL_MARKETPLACE: &str = "deluxe-local";
+
+fn ensure_bundled_defaults(home: &Path, mut settings: PluginSettings) -> Result<PluginSettings> {
+    for package in plugins::defaults::PLUGINS {
+        let id = format!("{}@{}", package.name, plugins::defaults::MARKETPLACE);
+        if settings
+            .plugins
+            .get(&id)
+            .is_some_and(|entry| !entry.enabled)
+        {
+            continue;
+        }
+
+        let target = home
+            .join(".codex")
+            .join("plugins")
+            .join("cache")
+            .join(plugins::defaults::MARKETPLACE)
+            .join(package.name)
+            .join(package.version);
+        // The managed cache is host-owned and the embedded bytes are the source
+        // of truth, so a copy that no longer matches this build is refreshed
+        // rather than reported as fatal. A rebuilt bundled component whose
+        // version did not change would otherwise fail the whole install and
+        // blank the plugin list, taking the default MCP and Hooks providers
+        // down with it.
+        if !target.exists() || !is_embedded_plugin(package, &target)? {
+            install_embedded_plugin(package, &target)?;
+        }
+        settings.set_enabled(&id, true);
+    }
+    settings.normalize();
+    Ok(settings)
+}
+
+fn install_embedded_plugin(
+    package: &plugins::defaults::EmbeddedPlugin,
+    target: &Path,
+) -> Result<()> {
+    plugins::wasm_runtime::validate_component_bytes(package.component)?;
+    let manifest: plugins::PluginManifest =
+        serde_json::from_str(package.manifest).map_err(|error| {
+            AgentError::internal(format!("Bundled plugin manifest is invalid: {error}"))
+        })?;
+    let runtime = manifest.wasm_runtime().ok_or_else(|| {
+        AgentError::new(
+            crate::error::code::PLUGIN_LOAD_FAILED,
+            "Bundled plugin does not declare a supported Wasmtime runtime",
+        )
+    })?;
+    if manifest.name != package.name || manifest.version.as_deref() != Some(package.version) {
+        return Err(AgentError::internal(
+            "Bundled plugin metadata does not match its package declaration",
+        ));
+    }
+    if runtime.module != "plugin.wasm" {
+        return Err(AgentError::internal(
+            "Bundled plugin must use the embedded plugin.wasm entry",
+        ));
+    }
+
+    if let Err(error) = write_embedded_plugin(package, target) {
+        let _ = std::fs::remove_dir_all(target);
+        return Err(error);
+    }
+    if let Err(error) = is_embedded_plugin(package, target) {
+        let _ = std::fs::remove_dir_all(target);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn write_embedded_plugin(package: &plugins::defaults::EmbeddedPlugin, target: &Path) -> Result<()> {
+    std::fs::create_dir_all(target)
+        .map_err(|error| AgentError::from_io("Create bundled plugin directory", error))?;
+    std::fs::write(
+        target.join(plugins::manifest::MANIFEST_FILE),
+        package.manifest,
+    )
+    .map_err(|error| AgentError::from_io("Write bundled plugin manifest", error))?;
+    std::fs::write(target.join("plugin.wasm"), package.component)
+        .map_err(|error| AgentError::from_io("Write bundled Wasmtime component", error))?;
+    Ok(())
+}
+
+fn is_embedded_plugin(package: &plugins::defaults::EmbeddedPlugin, target: &Path) -> Result<bool> {
+    let manifest = match plugins::manifest::read_plugin(target) {
+        Ok(manifest) => manifest,
+        Err(_) => return Ok(false),
+    };
+    let Some(runtime) = manifest.wasm_runtime() else {
+        return Ok(false);
+    };
+    if manifest.name != package.name
+        || manifest.version.as_deref() != Some(package.version)
+        || runtime.module != "plugin.wasm"
+    {
+        return Ok(false);
+    }
+    let component = runtime.resolve_entry(target)?;
+    let bytes = std::fs::read(component)
+        .map_err(|error| AgentError::from_io("Read bundled Wasmtime component", error))?;
+    if bytes != package.component {
+        return Ok(false);
+    }
+    Ok(true)
+}
 
 fn install_local_plugin(home: &Path, selected_component: &Path) -> Result<InstalledPlugin> {
     let source = selected_plugin_root(selected_component)?;
@@ -335,9 +452,7 @@ fn selected_plugin_root(selected: &Path) -> Result<PathBuf> {
 
     let mut candidate = selected.parent();
     while let Some(root) = candidate {
-        let manifest_path = root
-            .join(plugins::manifest::MANIFEST_DIR)
-            .join(plugins::manifest::MANIFEST_FILE);
+        let manifest_path = root.join(plugins::manifest::MANIFEST_FILE);
         if manifest_path.is_file() {
             let manifest = plugins::manifest::read_plugin(root)?;
             let runtime = manifest.wasm_runtime().ok_or_else(|| {
@@ -357,7 +472,7 @@ fn selected_plugin_root(selected: &Path) -> Result<PathBuf> {
     }
 
     Err(AgentError::invalid_params(
-        "No `.codex-plugin/plugin.json` declares the selected component; choose the `.wasm` file referenced by `runtime.module`",
+        "No root `plugin.json` declares the selected component; choose the `.wasm` file referenced by `runtime.module`",
     ))
 }
 
@@ -564,12 +679,12 @@ mod tests {
     async fn native_plugin_manager_only_deletes_cached_plugin_copies() {
         let home = tempfile::tempdir().expect("a temp directory is available");
         let cached = home.path().join(".codex/plugins/cache/test/thing/1.0.0");
-        fs::create_dir_all(cached.join(".codex-plugin")).expect("the cache is created");
+        fs::create_dir_all(&cached).expect("the cached plugin directory is writable");
         fs::write(
-            cached.join(".codex-plugin/plugin.json"),
+            cached.join("plugin.json"),
             r#"{"name":"thing","version":"1.0.0","runtime":{
                 "type":"wasm","module":"plugin.wasm",
-                "apiVersion":"deluxe.harness/plugin@0.1","provider":"general"}}"#,
+                "apiVersion":"deluxe.harness/plugin@0.1"}}"#,
         )
         .expect("the manifest is written");
         let mut settings = PluginSettings::default();
@@ -586,16 +701,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_plugin_manager_installs_bundled_defaults_into_the_plugin_cache() {
+        let home = tempfile::tempdir().expect("a temporary home is available");
+        let manager = NativePluginManager::new(home.path().to_path_buf());
+
+        let settings = manager
+            .ensure_bundled_defaults(PluginSettings::default())
+            .await
+            .expect("bundled defaults are installed");
+        for name in ["hooks", "mcp"] {
+            let id = format!("{name}@deluxe-defaults");
+            let root = home
+                .path()
+                .join(".codex/plugins/cache/deluxe-defaults")
+                .join(name)
+                .join("0.1.0");
+
+            assert!(
+                settings.plugins.get(&id).is_some_and(|entry| entry.enabled),
+                "the first run enables the bundled `{name}` Component"
+            );
+            assert!(
+                root.join("plugin.json").is_file(),
+                "the bundled `{name}` manifest is written beside the Component"
+            );
+            assert!(
+                root.join("plugin.wasm").is_file(),
+                "the bundled `{name}` Wasmtime Component is written to the managed cache"
+            );
+            assert!(
+                !root.join(".hooks.json").is_file() && !root.join(".mcp.json").is_file(),
+                "the bundled `{name}` package does not carry scope configuration"
+            );
+        }
+
+        let catalogue = plugins::discover(home.path(), &[], &settings);
+        for id in ["hooks@deluxe-defaults", "mcp@deluxe-defaults"] {
+            assert!(
+                catalogue.global().iter().any(|plugin| plugin.id == id),
+                "the bundled `{id}` Component is discoverable through the normal plugin path"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_plugin_manager_keeps_bundled_defaults_idempotent() {
+        let home = tempfile::tempdir().expect("a temporary home is available");
+        let manager = NativePluginManager::new(home.path().to_path_buf());
+        let first = manager
+            .ensure_bundled_defaults(PluginSettings::default())
+            .await
+            .expect("the bundled provider is installed");
+        let root = home
+            .path()
+            .join(".codex/plugins/cache/deluxe-defaults/mcp/0.1.0");
+        let component = fs::read(root.join("plugin.wasm")).expect("the component is readable");
+        fs::write(root.join("user-note.txt"), b"keep this file")
+            .expect("an unrelated cache file is writable");
+
+        let second = manager
+            .ensure_bundled_defaults(first.clone())
+            .await
+            .expect("a second startup is idempotent");
+
+        assert_eq!(
+            second, first,
+            "a second startup does not churn plugin settings"
+        );
+        assert_eq!(
+            fs::read(root.join("plugin.wasm")).expect("the component remains readable"),
+            component,
+            "a second startup does not rewrite the embedded Component"
+        );
+        assert_eq!(
+            fs::read(root.join("user-note.txt")).expect("the unrelated file remains"),
+            b"keep this file",
+            "a second startup leaves other managed-cache files untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_plugin_manager_refreshes_a_stale_bundled_default() {
+        // The cache is host-owned and the embedded bytes are authoritative, so a
+        // copy left by an older build must be rewritten rather than reported as
+        // fatal. Failing here used to blank the whole plugin list — including the
+        // default MCP provider the user is asking for.
+        let home = tempfile::tempdir().expect("a temporary home is available");
+        let manager = NativePluginManager::new(home.path().to_path_buf());
+        let first = manager
+            .ensure_bundled_defaults(PluginSettings::default())
+            .await
+            .expect("the bundled defaults are installed");
+        let root = home
+            .path()
+            .join(".codex/plugins/cache/deluxe-defaults/mcp/0.1.0");
+        fs::write(
+            root.join("plugin.wasm"),
+            b"a stale component from an old build",
+        )
+        .expect("the cache copy is overwritable");
+
+        let second = manager
+            .ensure_bundled_defaults(first.clone())
+            .await
+            .expect("a mismatched bundled copy is refreshed, not fatal");
+
+        assert_eq!(second, first, "the refresh does not churn plugin settings");
+        let refreshed = fs::read(root.join("plugin.wasm")).expect("the component is readable");
+        assert_ne!(
+            refreshed, b"a stale component from an old build",
+            "the stale bytes are overwritten with the embedded Component"
+        );
+        assert_eq!(
+            plugins::discover(home.path(), &[], &second)
+                .global()
+                .iter()
+                .filter(|plugin| plugin.id == "mcp@deluxe-defaults")
+                .count(),
+            1,
+            "the default MCP Component is discoverable after the refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_plugin_manager_respects_an_explicitly_disabled_bundled_default() {
+        let home = tempfile::tempdir().expect("a temporary home is available");
+        let manager = NativePluginManager::new(home.path().to_path_buf());
+        let mut settings = PluginSettings::default();
+        settings.set_enabled("mcp@deluxe-defaults", false);
+
+        let returned = manager
+            .ensure_bundled_defaults(settings.clone())
+            .await
+            .expect("an explicit disabled setting is preserved");
+
+        // Only the MCP entry is asserted: `settings` starts with nothing but the
+        // MCP id, and the startup pass legitimately *adds* the Hooks Component, so
+        // a whole-struct equality could never hold. What must not change is that
+        // the user's explicit off switch survives.
+        assert!(
+            returned
+                .plugins
+                .get("mcp@deluxe-defaults")
+                .is_some_and(|entry| !entry.enabled),
+            "the startup default does not force-enable the MCP Component the user disabled"
+        );
+        assert!(
+            !home
+                .path()
+                .join(".codex/plugins/cache/deluxe-defaults/mcp/0.1.0")
+                .exists(),
+            "a disabled bundled MCP Component is not installed"
+        );
+        assert!(
+            returned
+                .plugins
+                .get("hooks@deluxe-defaults")
+                .is_some_and(|entry| entry.enabled),
+            "disabling MCP does not disable the separate Hooks Component"
+        );
+    }
+
+    #[tokio::test]
     async fn native_plugin_manager_imports_a_wasmtime_plugin_into_its_cache() {
         let home = tempfile::tempdir().expect("a temp directory is available");
         let source = tempfile::tempdir().expect("a source plugin directory is available");
-        std::fs::create_dir_all(source.path().join(".codex-plugin"))
-            .expect("the source manifest directory is created");
+        fs::create_dir_all(source.path()).expect("the source plugin directory is writable");
         std::fs::write(
-            source.path().join(".codex-plugin/plugin.json"),
+            source.path().join("plugin.json"),
             r#"{"name":"echo-tool","version":"1.0.0","runtime":{
                 "type":"wasm","module":"plugin.wasm",
-                "apiVersion":"deluxe.harness/plugin@0.1","provider":"general"}}"#,
+                "apiVersion":"deluxe.harness/plugin@0.1"}}"#,
         )
         .expect("the source manifest is written");
         std::fs::write(
@@ -628,13 +904,11 @@ mod tests {
     async fn native_plugin_manager_rejects_a_wasm_file_not_declared_by_a_plugin_manifest() {
         let home = tempfile::tempdir().expect("a temp home is available");
         let source = tempfile::tempdir().expect("a source directory is available");
-        fs::create_dir_all(source.path().join(".codex-plugin"))
-            .expect("the manifest directory is created");
         fs::write(
-            source.path().join(".codex-plugin/plugin.json"),
+            source.path().join("plugin.json"),
             r#"{"name":"echo-tool","version":"1.0.0","runtime":{
                 "type":"wasm","module":"different.wasm",
-                "apiVersion":"deluxe.harness/plugin@0.1","provider":"general"}}"#,
+                "apiVersion":"deluxe.harness/plugin@0.1"}}"#,
         )
         .expect("the manifest is written");
         fs::write(
@@ -668,13 +942,12 @@ mod tests {
         )
         .expect("the marketplace is written");
         let working_copy = home.path().join("plugins/thing");
-        fs::create_dir_all(working_copy.join(".codex-plugin"))
-            .expect("the working copy is created");
+        fs::create_dir_all(&working_copy).expect("the working plugin directory is writable");
         fs::write(
-            working_copy.join(".codex-plugin/plugin.json"),
+            working_copy.join("plugin.json"),
             r#"{"name":"thing","version":"1.0.0","runtime":{
                 "type":"wasm","module":"plugin.wasm",
-                "apiVersion":"deluxe.harness/plugin@0.1","provider":"general"}}"#,
+                "apiVersion":"deluxe.harness/plugin@0.1"}}"#,
         )
         .expect("the manifest is written");
         let mut settings = PluginSettings::default();

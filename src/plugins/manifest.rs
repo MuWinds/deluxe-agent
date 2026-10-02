@@ -1,17 +1,16 @@
-//! Wasmtime manifest and provider declarations for one installed plugin.
+//! Wasmtime manifest declarations for one installed plugin.
 //!
-//! The companion files keep their Codex-compatible locations and shapes:
-//! `hooks.json` and `.mcp.json` are read from the plugin root, while the
-//! Wasmtime provider owns their executable semantics.
+//! Plugin manifests describe Wasmtime Components. Provider-owned configuration
+//! is intentionally not represented here: Components request their own files
+//! through the generic host file capability.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::error::{AgentError, Result};
 
-/// `.codex-plugin/plugin.json` — the one file a plugin cannot omit.
+/// `plugin.json` — the one file a Wasmtime plugin cannot omit.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginManifest {
@@ -157,70 +156,11 @@ pub struct MarketplacePolicy {
     pub installation: Option<String>,
 }
 
-/// `.mcp.json` — the MCP servers a plugin brings.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct McpServersFile {
-    /// The map is named `mcpServers` in the file format.
-    #[serde(default, rename = "mcpServers", alias = "mcp_servers")]
-    pub servers: BTreeMap<String, McpServerConfig>,
-}
-
-/// One MCP transport declaration passed to a Wasm provider.
-///
-/// The host uses this only to validate raw process/HTTP capability requests.
-/// MCP initialization, JSON-RPC, authentication flow, and message framing stay
-/// inside the provider.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct McpServerConfig {
-    /// `stdio` | `http`. Absent means stdio; see [`McpServerConfig::is_http`].
-    #[serde(default, rename = "type")]
-    pub transport: Option<String>,
-    /// The endpoint, for an `http` server.
-    #[serde(default)]
-    pub url: Option<String>,
-    /// Provider-owned metadata for an OAuth-capable endpoint.
-    #[serde(default, rename = "oauth_resource", alias = "oauthResource")]
-    pub oauth_resource: Option<String>,
-    /// The executable, for a stdio server.
-    #[serde(default)]
-    pub command: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// The child's working directory. Relative means relative to the plugin
-    /// root, which is what makes a plugin's `./scripts/server.py` resolve.
-    #[serde(default)]
-    pub cwd: Option<String>,
-    /// Extra environment for the child process.
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-    /// Provider-owned startup budget metadata. The host still applies its own
-    /// component call timeout.
-    #[serde(default, rename = "startup_timeout_sec", alias = "startupTimeoutSec")]
-    pub startup_timeout_sec: Option<u64>,
-}
-
-impl McpServerConfig {
-    /// Whether the provider declaration is HTTP rather than process-backed.
-    pub fn is_http(&self) -> bool {
-        match self.transport.as_deref() {
-            Some("http") => true,
-            Some("stdio") => false,
-            _ => self.command.is_none() && self.url.is_some(),
-        }
-    }
-}
-
-/// The `<plugin>/.codex-plugin/` directory name, relative to a plugin root.
-pub const MANIFEST_DIR: &str = ".codex-plugin";
-/// The manifest file inside [`MANIFEST_DIR`].
+/// The manifest file at the root of a Wasmtime plugin.
 pub const MANIFEST_FILE: &str = "plugin.json";
-/// The hook configuration file at the plugin root.
-pub const HOOKS_FILE: &str = "hooks.json";
-/// The MCP configuration file at the plugin root.
-pub const MCP_FILE: &str = ".mcp.json";
 /// Reads and parses a plugin manifest from a plugin root.
 pub fn read_plugin(root: &Path) -> Result<PluginManifest> {
-    let path = root.join(MANIFEST_DIR).join(MANIFEST_FILE);
+    let path = root.join(MANIFEST_FILE);
     let text = std::fs::read_to_string(&path).map_err(|error| {
         AgentError::from_io(&format!("Failed to read {}", path.display()), error)
     })?;
@@ -244,42 +184,6 @@ pub fn read_marketplace(path: &Path) -> Result<MarketplaceManifest> {
     serde_json::from_str(&text).map_err(|error| {
         AgentError::internal(format!(
             "{} is not a valid marketplace manifest: {error}",
-            path.display()
-        ))
-    })
-}
-
-/// Reads an optional companion file without interpreting its provider-owned
-/// JSON semantics.
-///
-/// Returns `Ok(None)` when the file is absent and `Err` when an existing file
-/// cannot be read as UTF-8.
-pub fn read_optional_file(root: &Path, file: &str) -> Result<Option<String>> {
-    let path = root.join(file);
-    if !path.is_file() {
-        return Ok(None);
-    }
-    std::fs::read_to_string(&path)
-        .map(Some)
-        .map_err(|error| AgentError::from_io(&format!("Failed to read {}", path.display()), error))
-}
-
-/// Reads and parses the MCP declarations from a plugin's `.mcp.json`.
-///
-/// A missing file is the normal no-server case. The returned map is used only
-/// for host capability authorization; JSON-RPC and transport framing stay in
-/// the Wasm provider.
-pub fn read_mcp_servers(root: &Path) -> Result<BTreeMap<String, McpServerConfig>> {
-    let Some(text) = read_optional_file(root, MCP_FILE)? else {
-        return Ok(BTreeMap::new());
-    };
-    parse_mcp_servers(&text, &root.join(MCP_FILE)).map(|file| file.servers)
-}
-
-fn parse_mcp_servers(text: &str, path: &Path) -> Result<McpServersFile> {
-    serde_json::from_str(text).map_err(|error| {
-        AgentError::internal(format!(
-            "{} is not a valid MCP server file: {error}",
             path.display()
         ))
     })
@@ -486,40 +390,5 @@ mod tests {
         // caller is told instead.
         assert!(marketplace_root(std::path::Path::new("/tmp/marketplace.json")).is_none());
         assert!(marketplace_root(std::path::Path::new("/tmp/.agents/marketplace.json")).is_none());
-    }
-
-    #[test]
-    fn a_stdio_transport_declaration_round_trips_inside_a_wasm_manifest() {
-        let config: McpServerConfig = serde_json::from_str(
-            r#"{"type":"stdio","command":"python","args":["server.py"],
-                "cwd":".","env":{"PYTHONUTF8":"1"},"startupTimeoutSec":20}"#,
-        )
-        .expect("the provider transport declaration is valid");
-
-        assert!(!config.is_http(), "a command-backed declaration is stdio");
-        assert_eq!(config.command.as_deref(), Some("python"));
-        assert_eq!(config.args, vec!["server.py"]);
-        assert_eq!(config.startup_timeout_sec, Some(20));
-        assert_eq!(
-            serde_json::to_value(config).expect("the declaration serializes")
-                ["startup_timeout_sec"],
-            20
-        );
-    }
-
-    #[test]
-    fn an_http_transport_declaration_round_trips_without_host_protocol_logic() {
-        let config: McpServerConfig = serde_json::from_str(
-            r#"{"type":"http","url":"https://mcp.example.test/mcp",
-                "oauth_resource":"https://mcp.example.test/mcp"}"#,
-        )
-        .expect("the provider transport declaration is valid");
-
-        assert!(config.is_http(), "a URL-backed declaration is HTTP");
-        assert_eq!(config.url.as_deref(), Some("https://mcp.example.test/mcp"));
-        assert_eq!(
-            config.oauth_resource.as_deref(),
-            Some("https://mcp.example.test/mcp")
-        );
     }
 }

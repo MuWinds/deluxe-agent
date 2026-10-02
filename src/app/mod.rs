@@ -418,11 +418,13 @@ impl App {
                 }
             }
 
-            // A host-authored notice — a background job that finished mid-run,
-            // for instance. Shown as a notice step, since no tool produced it.
+            // A host-authored message — a background job that finished mid-run,
+            // for instance. It reached the model as a user turn, so it is
+            // recorded as one the replay will reproduce; the transcript shows it
+            // the same way it shows a notice.
             Event::Notice { text, .. } => {
                 if let Some(session) = self.session_mut(session_id) {
-                    session.steps.push(Step::Notice { text });
+                    session.steps.push(Step::HostMessage { text });
                 }
             }
 
@@ -430,10 +432,11 @@ impl App {
                 call_id,
                 name,
                 arguments,
+                raw_arguments,
                 ..
             } => {
                 if let Some(session) = self.session_mut(session_id) {
-                    session.push_tool(call_id, name, arguments);
+                    session.push_tool(call_id, name, arguments, Some(raw_arguments));
                 }
             }
 
@@ -465,7 +468,10 @@ impl App {
             } => {
                 if let Some(session) = self.session_mut(session_id) {
                     session.state = RunState::Finished;
-                    session.usage = usage;
+                    session.record_cache_usage(usage.as_ref());
+                    if usage.is_some() {
+                        session.usage = usage;
+                    }
                     // Carried into the next run of this conversation, so a long
                     // session's first request is already guarded.
                     session.context_measurement = measurement;
@@ -478,11 +484,12 @@ impl App {
             // about why the older turns stopped appearing.
             Event::CompactionStarted { .. } => {}
 
-            Event::Compacted { summary, .. } => {
+            Event::Compacted { summary, keep, .. } => {
                 if let Some(session) = self.session_mut(session_id) {
-                    session.steps.push(Step::Compaction {
-                        summary: summary.clone(),
-                    });
+                    // The marker goes in at the tail boundary, not at the end:
+                    // everything before it is folded, everything after it is
+                    // the tail the compacting run kept verbatim.
+                    session.record_compaction(summary.clone(), keep);
                 }
                 self.mark_dirty();
             }
@@ -491,9 +498,21 @@ impl App {
             // the gauge tracks the run instead of jumping once at the end. The
             // value is the same one the agent's own compaction check reads, so
             // the indicator can never run ahead of the mechanism.
-            Event::UsageSampled { measurement, .. } => {
+            Event::UsageSampled {
+                measurement, usage, ..
+            } => {
                 if let Some(session) = self.session_mut(session_id) {
                     session.context_measurement = measurement;
+                    // The cache counters ride the same live sample: the turn's
+                    // figures fold into the conversation totals, and the most
+                    // recent request's usage replaces the last one — so the
+                    // tooltip tracks a multi-turn run instead of jumping at the
+                    // end. A `None` sample (the post-compaction reset) carries
+                    // no figures and leaves both untouched.
+                    session.record_cache_usage(usage.as_ref());
+                    if usage.is_some() {
+                        session.usage = usage;
+                    }
                 }
             }
 
@@ -558,13 +577,20 @@ impl App {
             Event::AssistantTurnReset { .. } => session::reset_turn(&mut run.steps),
             Event::ReasoningDelta { text, .. } => session::push_reasoning(&mut run.steps, &text),
             Event::AssistantDone { content, .. } => session::push_answer(&mut run.steps, &content),
-            Event::Notice { text, .. } => run.steps.push(Step::Notice { text }),
+            Event::Notice { text, .. } => run.steps.push(Step::HostMessage { text }),
             Event::ToolStarted {
                 call_id,
                 name,
                 arguments,
+                raw_arguments,
                 ..
-            } => session::push_tool(&mut run.steps, call_id, name, arguments),
+            } => session::push_tool(
+                &mut run.steps,
+                call_id,
+                name,
+                arguments,
+                Some(raw_arguments),
+            ),
             Event::ToolFinished {
                 call_id,
                 outcome,
@@ -1986,6 +2012,7 @@ mod tests {
                 call_id: String::new(),
                 name: String::new(),
                 arguments: Value::Null,
+                raw_arguments: String::new(),
             },
             Event::ToolFinished {
                 run_id: 7,
@@ -1999,6 +2026,7 @@ mod tests {
             Event::UsageSampled {
                 run_id: 7,
                 measurement: None,
+                usage: None,
             },
             Event::RunFinished {
                 run_id: 7,
@@ -2149,6 +2177,7 @@ mod tests {
             .send(Event::UsageSampled {
                 run_id,
                 measurement: Some((131_072, 9)),
+                usage: None,
             })
             .expect("the app is still listening");
         app.poll();
@@ -2170,6 +2199,7 @@ mod tests {
             .send(Event::UsageSampled {
                 run_id,
                 measurement: None,
+                usage: None,
             })
             .expect("the app is still listening");
         app.poll();
@@ -2179,6 +2209,54 @@ mod tests {
                 .context_measurement,
             None,
             "a compaction's reset must clear the stale figure"
+        );
+    }
+
+    #[test]
+    fn a_usage_sample_folds_cache_counters_into_the_session() {
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            cmd_tx,
+            event_rx,
+            crate::config::Config::default(),
+            "key".into(),
+            Vec::new(),
+            no_plugins(),
+            test_paths(),
+        );
+
+        app.prompt = "第一条".into();
+        app.start_run();
+        let session_id = app.selected.expect("the run opened a session");
+        let run_id = app.run_for(session_id).expect("the run is registered");
+
+        event_tx
+            .send(Event::UsageSampled {
+                run_id,
+                measurement: Some((200, 4)),
+                usage: Some(crate::llm::Usage {
+                    prompt_tokens: Some(200),
+                    prompt_cache_hit_tokens: Some(150),
+                    ..Default::default()
+                }),
+            })
+            .expect("the app is still listening");
+        app.poll();
+
+        let session = app.session(session_id).expect("the session is still there");
+        assert_eq!(
+            session.cache_hit_rate(),
+            Some(0.75),
+            "the sample's cache figures must fold into the session totals"
+        );
+        assert_eq!(
+            session
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.cache_hit_rate()),
+            Some(0.75),
+            "the most recent request's usage is kept for the last-request rate"
         );
     }
 
@@ -2671,13 +2749,12 @@ mod tests {
 
         // `source.path` resolves against the directory *containing* `.agents`.
         let plugin = scope_root.join("plugins").join("thing");
-        std::fs::create_dir_all(plugin.join(".codex-plugin")).unwrap();
         std::fs::create_dir_all(plugin.join("commands")).unwrap();
         std::fs::write(
-            plugin.join(".codex-plugin").join("plugin.json"),
+            plugin.join("plugin.json"),
             r#"{"name":"thing","version":"1.0.0","runtime":{
                 "type":"wasm","module":"plugin.wasm",
-                "apiVersion":"deluxe.harness/plugin@0.1","provider":"general"}}"#,
+                "apiVersion":"deluxe.harness/plugin@0.1"}}"#,
         )
         .unwrap();
         std::fs::write(
@@ -2831,12 +2908,12 @@ mod tests {
         .unwrap();
 
         let plugin = home.path().join("plugins").join("thing");
-        std::fs::create_dir_all(plugin.join(".codex-plugin")).unwrap();
+        std::fs::create_dir_all(&plugin).unwrap();
         std::fs::write(
-            plugin.join(".codex-plugin").join("plugin.json"),
+            plugin.join("plugin.json"),
             r#"{"name":"thing","version":"1.0.0","description":"The thing.",
                 "runtime":{"type":"wasm","module":"plugin.wasm",
-                "apiVersion":"deluxe.harness/plugin@0.1","provider":"general"}}"#,
+                "apiVersion":"deluxe.harness/plugin@0.1"}}"#,
         )
         .unwrap();
 
@@ -2928,12 +3005,12 @@ mod tests {
         // The cache is the one copy this agent may remove: Codex populated it.
         let home = tempfile::tempdir().unwrap();
         let cached = home.path().join(".codex/plugins/cache/test/thing/1.0.0");
-        std::fs::create_dir_all(cached.join(".codex-plugin")).unwrap();
+        std::fs::create_dir_all(&cached).unwrap();
         std::fs::write(
-            cached.join(".codex-plugin").join("plugin.json"),
+            cached.join("plugin.json"),
             r#"{"name":"thing","version":"1.0.0","runtime":{
                 "type":"wasm","module":"plugin.wasm",
-                "apiVersion":"deluxe.harness/plugin@0.1","provider":"general"}}"#,
+                "apiVersion":"deluxe.harness/plugin@0.1"}}"#,
         )
         .unwrap();
 

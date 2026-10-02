@@ -1,13 +1,14 @@
-//! Plugin discovery and project-scoped Wasmtime provider metadata.
+//! Plugin discovery and project-scoped Wasmtime Component metadata.
 //!
 //! Wasmtime plugin discovery, scope resolution, and lifecycle metadata.
 //!
-//! Every loaded plugin must declare a Wasmtime component. The hooks and MCP
-//! providers are ordinary entries in the same catalogue with a distinct
-//! provider role; no non-Wasm plugin path is retained.
+//! Every loaded plugin must declare a Wasmtime component. Hooks and MCP are
+//! implemented by Components using the same generic ABI; no non-Wasm plugin
+//! path is retained.
 pub mod agents;
 pub mod capabilities;
 pub mod commands;
+pub mod defaults;
 pub mod frontmatter;
 pub mod manifest;
 pub mod providers;
@@ -25,11 +26,9 @@ use std::path::{Path, PathBuf};
 pub use agents::AgentRole;
 pub use commands::Command;
 pub use manifest::PluginManifest;
+use settings::project_key;
 pub use settings::PluginSettings;
 pub use skills::Skill;
-pub use wasm_manifest::ProviderKind;
-
-use settings::project_key;
 
 /// A one-line summary is capped at this many characters.
 ///
@@ -81,6 +80,19 @@ impl Scope {
     }
 }
 
+/// The directory a [`Scope::Global`] Component's generic file capability is
+/// bound to, resolved from the user's home directory.
+///
+/// Deliberately a plugin configuration directory rather than the home itself:
+/// a `read-plugin-file` capability rooted at `~` would hand any global plugin
+/// `~/.ssh/id_rsa`, `~/.aws/credentials`, or a stray key file — none of which
+/// is plugin configuration. `.agents` is the same layer the personal
+/// marketplace already lives in (`~/.agents/plugins/marketplace.json`), so a
+/// global `.mcp.json` or `.hooks.json` sits beside it.
+pub fn global_configuration_root(home: &Path) -> PathBuf {
+    home.join(".agents")
+}
+
 /// One plugin that loaded successfully.
 #[derive(Debug, Clone)]
 pub struct LoadedPlugin {
@@ -97,18 +109,6 @@ pub struct LoadedPlugin {
     /// Unlike a skill, a command is invoked by the user rather than chosen by
     /// the model, so this reaches the composer and never the system prompt.
     pub commands: Vec<Command>,
-    /// The raw `hooks.json` contents for the hooks provider root.
-    ///
-    /// The host preserves the file format but does not interpret hook
-    /// matchers or execute commands.
-    pub hooks_json: Option<String>,
-    /// The raw `.mcp.json` contents for the MCP provider root.
-    ///
-    /// The parsed server map below is only for host raw-transport
-    /// authorization; MCP protocol behavior remains in Wasm.
-    pub mcp_json: Option<String>,
-    /// The MCP declarations read from this plugin's `.mcp.json`.
-    pub mcp_servers: BTreeMap<String, manifest::McpServerConfig>,
     /// The sub-agent roles this plugin contributes, sorted by name.
     ///
     /// Offered to the model through the `task` tool; see [`agents`].
@@ -488,11 +488,7 @@ fn scope_for(project: Option<&Path>) -> Scope {
 
 /// Reads a plugin from `root`, or `None` if it is not one.
 fn load_from(root: &Path, id: &str, scope: Scope) -> Option<LoadedPlugin> {
-    if !root
-        .join(manifest::MANIFEST_DIR)
-        .join(manifest::MANIFEST_FILE)
-        .is_file()
-    {
+    if !root.join(manifest::MANIFEST_FILE).is_file() {
         return None;
     }
 
@@ -503,7 +499,7 @@ fn load_from(root: &Path, id: &str, scope: Scope) -> Option<LoadedPlugin> {
             return None;
         }
     };
-    let Some(wasm_manifest) = manifest.wasm_runtime() else {
+    let Some(_wasm_manifest) = manifest.wasm_runtime() else {
         tracing::warn!(
             id,
             root = %root.display(),
@@ -524,37 +520,6 @@ fn load_from(root: &Path, id: &str, scope: Scope) -> Option<LoadedPlugin> {
     // marketplaces installed the short name alone is ambiguous.
     let agents = agents::load(id, root);
 
-    let hooks_json = if wasm_manifest.provider == ProviderKind::Hooks {
-        match manifest::read_optional_file(root, manifest::HOOKS_FILE) {
-            Ok(contents) => contents,
-            Err(error) => {
-                tracing::warn!(id, %error, "skipping the hooks provider's unreadable hooks.json");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let (mcp_json, mcp_servers) = if wasm_manifest.provider == ProviderKind::Mcp {
-        let mcp_json = match manifest::read_optional_file(root, manifest::MCP_FILE) {
-            Ok(contents) => contents,
-            Err(error) => {
-                tracing::warn!(id, %error, "skipping the MCP provider's unreadable .mcp.json");
-                None
-            }
-        };
-        let mcp_servers = match manifest::read_mcp_servers(root) {
-            Ok(servers) => servers,
-            Err(error) => {
-                tracing::warn!(id, %error, "skipping the MCP provider's unreadable declarations");
-                BTreeMap::new()
-            }
-        };
-        (mcp_json, mcp_servers)
-    } else {
-        (None, BTreeMap::new())
-    };
-
     Some(LoadedPlugin {
         id: id.to_string(),
         scope,
@@ -562,9 +527,6 @@ fn load_from(root: &Path, id: &str, scope: Scope) -> Option<LoadedPlugin> {
         manifest,
         skills,
         commands,
-        hooks_json,
-        mcp_json,
-        mcp_servers,
         agents,
     })
 }
@@ -591,12 +553,10 @@ fn cached_root(home: &Path, marketplace: &str, plugin: &str) -> Option<PathBuf> 
         .collect();
     versions.sort();
 
-    versions.into_iter().rev().find(|version| {
-        version
-            .join(manifest::MANIFEST_DIR)
-            .join(manifest::MANIFEST_FILE)
-            .is_file()
-    })
+    versions
+        .into_iter()
+        .rev()
+        .find(|version| version.join(manifest::MANIFEST_FILE).is_file())
 }
 
 /// Every marketplace file this agent knows how to find.
@@ -728,14 +688,13 @@ mod tests {
 
     /// Scaffolds a plugin directory: a manifest plus one skill.
     fn write_plugin(root: &Path, name: &str, skill: Option<&str>) {
-        let manifest_dir = root.join(manifest::MANIFEST_DIR);
-        fs::create_dir_all(&manifest_dir).unwrap();
+        fs::create_dir_all(root).unwrap();
         fs::write(
-            manifest_dir.join(manifest::MANIFEST_FILE),
+            root.join(manifest::MANIFEST_FILE),
             format!(
                 r#"{{"name":"{name}","version":"1.0.0","description":"The {name} plugin.",
                      "runtime":{{"type":"wasm","module":"plugin.wasm",
-                     "apiVersion":"deluxe.harness/plugin@0.1","provider":"general"}},
+                     "apiVersion":"deluxe.harness/plugin@0.1"}},
                      "interface":{{"displayName":"{name}","shortDescription":"Does {name} things"}}}}"#
             ),
         )
@@ -926,192 +885,49 @@ mod tests {
     }
 
     #[test]
-    fn provider_companion_configuration_follows_global_and_project_scope() {
+    fn discovery_only_loads_wasm_metadata_and_does_not_read_scope_configuration() {
         let fixture = fixture();
-        let global_hooks_root = fixture.home.path().join("plugins/figma");
-        let global_hooks = r#"{"hooks":{"PostToolUse":[]}}"#;
-        let global_mcp = r#"{"mcpServers":{"global":{"command":"global-server"}}}"#;
+        let global_root = fixture.home.path().join("plugins/figma");
+        let project_root = fixture.project.path().join("plugins/repo-triage");
+
         fs::write(
-            global_hooks_root
-                .join(manifest::MANIFEST_DIR)
-                .join(manifest::MANIFEST_FILE),
-            r#"{"name":"figma","version":"1.0.0","runtime":{
-                "type":"wasm","module":"plugin.wasm",
-                "apiVersion":"deluxe.harness/plugin@0.1","provider":"hooks"}}"#,
+            global_root.join(".mcp.json"),
+            r#"{"mcpServers":{"global":{"command":"global-server"}}}"#,
         )
         .unwrap();
-        fs::write(global_hooks_root.join(manifest::HOOKS_FILE), global_hooks).unwrap();
-
-        let global_mcp_root = fixture.home.path().join("plugins/global-mcp");
-        write_plugin(&global_mcp_root, "global-mcp", None);
         fs::write(
-            global_mcp_root
-                .join(manifest::MANIFEST_DIR)
-                .join(manifest::MANIFEST_FILE),
-            r#"{"name":"global-mcp","version":"1.0.0","runtime":{
-                "type":"wasm","module":"plugin.wasm",
-                "apiVersion":"deluxe.harness/plugin@0.1","provider":"mcp"}}"#,
+            project_root.join(".hooks.json"),
+            r#"{"hooks":{"PostToolUse":[{"hooks":[]}]}}"#,
         )
         .unwrap();
-        fs::write(global_mcp_root.join(manifest::MCP_FILE), global_mcp).unwrap();
-
-        let general_root = fixture
-            .home
-            .path()
-            .join(".codex/bundled-marketplaces/openai-bundled/plugins/computer-use");
-        fs::write(general_root.join(manifest::HOOKS_FILE), global_hooks).unwrap();
-        fs::write(general_root.join(manifest::MCP_FILE), global_mcp).unwrap();
-
-        write_marketplace(
-            fixture.home.path(),
-            "personal",
-            &[
-                ("figma", "./plugins/figma"),
-                ("global-mcp", "./plugins/global-mcp"),
-            ],
-        );
-
-        let project_mcp_root = fixture.project.path().join("plugins/repo-triage");
-        let project_hooks = r#"{"hooks":{"PostToolUse":[{"hooks":[]}]}}"#;
-        let project_mcp = r#"{"mcpServers":{"project":{"command":"project-server"}}}"#;
-        fs::write(
-            project_mcp_root
-                .join(manifest::MANIFEST_DIR)
-                .join(manifest::MANIFEST_FILE),
-            r#"{"name":"repo-triage","version":"1.0.0","runtime":{
-                "type":"wasm","module":"plugin.wasm",
-                "apiVersion":"deluxe.harness/plugin@0.1","provider":"mcp"}}"#,
-        )
-        .unwrap();
-        fs::write(project_mcp_root.join(manifest::MCP_FILE), project_mcp).unwrap();
-
-        let project_hooks_root = fixture.project.path().join("plugins/project-hooks");
-        write_plugin(&project_hooks_root, "project-hooks", None);
-        fs::write(
-            project_hooks_root
-                .join(manifest::MANIFEST_DIR)
-                .join(manifest::MANIFEST_FILE),
-            r#"{"name":"project-hooks","version":"1.0.0","runtime":{
-                "type":"wasm","module":"plugin.wasm",
-                "apiVersion":"deluxe.harness/plugin@0.1","provider":"hooks"}}"#,
-        )
-        .unwrap();
-        fs::write(project_hooks_root.join(manifest::HOOKS_FILE), project_hooks).unwrap();
-        write_marketplace(
-            fixture.project.path(),
-            "my-team",
-            &[
-                ("repo-triage", "./plugins/repo-triage"),
-                ("project-hooks", "./plugins/project-hooks"),
-            ],
-        );
 
         let settings = PluginSettings {
-            plugins: settings::entries(&[
-                "figma@personal",
-                "global-mcp@personal",
-                "computer-use@openai-bundled",
-            ]),
+            plugins: settings::entries(&["figma@personal"]),
             projects: BTreeMap::from([(
                 project_key(fixture.project.path()),
-                vec!["repo-triage@my-team".into(), "project-hooks@my-team".into()],
+                vec!["repo-triage@my-team".into()],
             )]),
             disabled_projects: BTreeMap::new(),
         };
         let catalogue = discover(
             fixture.home.path(),
-            &[
-                fixture.project.path().to_path_buf(),
-                fixture.other.path().to_path_buf(),
-            ],
+            &[fixture.project.path().to_path_buf()],
             &settings,
         );
 
-        let project_plugins = catalogue.for_project(fixture.project.path());
-        let global = project_plugins
-            .iter()
-            .find(|plugin| plugin.id == "figma@personal")
-            .expect("the global plugin applies to the project");
+        let plugins = catalogue.for_project(fixture.project.path());
         assert_eq!(
-            global.hooks_json.as_deref(),
-            Some(global_hooks),
-            "only the global Hooks provider receives its hooks.json"
+            ids(&plugins),
+            vec!["figma@personal", "repo-triage@my-team"],
+            "scope configuration files must not affect Wasmtime discovery"
         );
         assert_eq!(
-            global.mcp_json.as_deref(),
-            None,
-            "the Hooks provider must not receive MCP input"
-        );
-
-        let global_mcp_plugin = project_plugins
-            .iter()
-            .find(|plugin| plugin.id == "global-mcp@personal")
-            .expect("the global MCP provider applies to the project");
-        assert_eq!(
-            global_mcp_plugin.hooks_json.as_deref(),
-            None,
-            "the MCP provider must not receive Hooks input"
+            plugins[0].root, global_root,
+            "global discovery keeps the plugin root only for component lookup"
         );
         assert_eq!(
-            global_mcp_plugin.mcp_json.as_deref(),
-            Some(global_mcp),
-            "the global MCP provider receives its raw .mcp.json"
-        );
-        assert_eq!(
-            global_mcp_plugin.mcp_servers["global"].command.as_deref(),
-            Some("global-server"),
-            "the MCP provider receives the parsed transport declarations"
-        );
-
-        let general = project_plugins
-            .iter()
-            .find(|plugin| plugin.id == "computer-use@openai-bundled")
-            .expect("the General Wasmtime provider applies to the project");
-        assert_eq!(
-            general.hooks_json.as_deref(),
-            None,
-            "a General Wasmtime plugin must not read hooks.json"
-        );
-        assert_eq!(
-            general.mcp_json.as_deref(),
-            None,
-            "a General Wasmtime plugin must not read .mcp.json"
-        );
-
-        let project_mcp_plugin = project_plugins
-            .iter()
-            .find(|plugin| plugin.id == "repo-triage@my-team")
-            .expect("the project MCP provider applies to its own project");
-        assert_eq!(project_mcp_plugin.hooks_json.as_deref(), None);
-        assert_eq!(
-            project_mcp_plugin.mcp_json.as_deref(),
-            Some(project_mcp),
-            "the project MCP provider receives the project-scoped .mcp.json"
-        );
-
-        let project_hooks_plugin = project_plugins
-            .iter()
-            .find(|plugin| plugin.id == "project-hooks@my-team")
-            .expect("the project Hooks provider applies to its own project");
-        assert_eq!(
-            project_hooks_plugin.hooks_json.as_deref(),
-            Some(project_hooks),
-            "the project Hooks provider receives the project-scoped hooks.json"
-        );
-        assert_eq!(project_hooks_plugin.mcp_json.as_deref(), None);
-
-        let other_plugins = catalogue.for_project(fixture.other.path());
-        let global_elsewhere = other_plugins
-            .iter()
-            .find(|plugin| plugin.id == "figma@personal")
-            .expect("the global Hooks provider applies to another project");
-        assert_eq!(global_elsewhere.hooks_json.as_deref(), Some(global_hooks));
-        assert_eq!(global_elsewhere.mcp_json.as_deref(), None);
-        assert!(
-            other_plugins.iter().all(|plugin| {
-                plugin.id != "repo-triage@my-team" && plugin.id != "project-hooks@my-team"
-            }),
-            "project provider inputs must not leak into another project"
+            plugins[1].root, project_root,
+            "project discovery keeps the project plugin root only for component lookup"
         );
     }
 
@@ -1119,10 +935,9 @@ mod tests {
     fn a_project_scoped_wasm_manifest_is_visible_only_to_its_project() {
         let fixture = fixture();
         let root = fixture.project.path().join("plugins/wasm-echo");
-        let manifest_dir = root.join(manifest::MANIFEST_DIR);
-        fs::create_dir_all(&manifest_dir).expect("the Wasm plugin manifest directory is writable");
+        fs::create_dir_all(&root).unwrap();
         fs::write(
-            manifest_dir.join(manifest::MANIFEST_FILE),
+            root.join(manifest::MANIFEST_FILE),
             r#"{
               "name": "wasm-echo",
               "runtime": {
@@ -1475,14 +1290,8 @@ mod tests {
     fn a_broken_manifest_is_skipped_rather_than_fatal() {
         let fixture = fixture();
         let broken = fixture.home.path().join("plugins/broken");
-        fs::create_dir_all(broken.join(manifest::MANIFEST_DIR)).unwrap();
-        fs::write(
-            broken
-                .join(manifest::MANIFEST_DIR)
-                .join(manifest::MANIFEST_FILE),
-            "{ not json",
-        )
-        .unwrap();
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join(manifest::MANIFEST_FILE), "{ not json").unwrap();
         write_marketplace(
             fixture.home.path(),
             "personal",
@@ -1669,10 +1478,9 @@ mod tests {
         // never run Codex.
         let fixture = fixture();
         let root = fixture.home.path().join("plugins/no-runtime");
-        let manifest_dir = root.join(manifest::MANIFEST_DIR);
-        fs::create_dir_all(&manifest_dir).unwrap();
+        fs::create_dir_all(&root).unwrap();
         fs::write(
-            manifest_dir.join(manifest::MANIFEST_FILE),
+            root.join(manifest::MANIFEST_FILE),
             r#"{"name":"no-runtime","version":"1.0.0"}"#,
         )
         .unwrap();
@@ -1693,5 +1501,19 @@ mod tests {
                 .is_empty(),
             "only Wasmtime component plugins belong in the catalogue"
         );
+    }
+
+    #[test]
+    fn the_global_configuration_root_is_the_agents_directory_not_the_home() {
+        // The whole point of the indirection: a global Component's generic file
+        // capability must not be bound to `~`, where it could read `~/.ssh` or a
+        // key file. `~/.agents` is plugin configuration, the same layer the
+        // personal marketplace lives in.
+        let home = Path::new("/home/someone");
+        assert_eq!(
+            global_configuration_root(home),
+            PathBuf::from("/home/someone/.agents")
+        );
+        assert_ne!(global_configuration_root(home), home.to_path_buf());
     }
 }

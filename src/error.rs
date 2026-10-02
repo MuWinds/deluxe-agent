@@ -17,6 +17,7 @@ pub mod code {
     pub const PLUGIN_RESOURCE_LIMIT: &str = "plugin_resource_limit";
     pub const PLUGIN_INVALID_OUTPUT: &str = "plugin_invalid_output";
     pub const PLUGIN_PERMISSION_DENIED: &str = "plugin_permission_denied";
+    pub const PLUGIN_FILE_NOT_FOUND: &str = "plugin_file_not_found";
 }
 
 /// The one error type the tool layer and the loop pass around.

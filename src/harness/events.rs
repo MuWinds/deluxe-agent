@@ -33,6 +33,10 @@ pub enum AgentEvent {
         call_id: CallId,
         name: ToolName,
         arguments: Value,
+        /// The model's own JSON text for the call, kept so the transcript can
+        /// replay the exact bytes the run sent instead of re-serialising the
+        /// parsed `arguments` and shifting the provider's prompt prefix.
+        raw_arguments: String,
     },
     ToolFinished {
         run_id: RunId,
@@ -46,6 +50,10 @@ pub enum AgentEvent {
     UsageSampled {
         run_id: RunId,
         measurement: Option<(u64, usize)>,
+        /// The turn's provider usage, when it reported one. Carried so the
+        /// cache counters can track a multi-turn run instead of jumping once
+        /// at the end; the final turn's figure arrives via [`AgentEvent::RunFinished`].
+        usage: Option<Usage>,
     },
     RunFinished {
         run_id: RunId,
@@ -59,6 +67,10 @@ pub enum AgentEvent {
     Compacted {
         run_id: RunId,
         summary: String,
+        /// How many trailing messages the summary kept verbatim. The app folds
+        /// the marker in at that boundary so a later run replays the same
+        /// `[summary, ...tail]` the compacting run continued from.
+        keep: usize,
     },
     RunFailed {
         run_id: RunId,

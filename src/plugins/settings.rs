@@ -32,7 +32,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 /// The `[plugins]` section of this agent's config.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PluginSettings {
     /// Every plugin this agent knows about, keyed by `name@marketplace`.

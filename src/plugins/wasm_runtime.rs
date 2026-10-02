@@ -1,11 +1,10 @@
 //! Component actors own their stores and service bounded calls on worker threads.
 
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use wasmtime::component::{Accessor, Component, HasData, Instance as ComponentInstance, Linker};
@@ -27,7 +26,7 @@ mod bindings {
 }
 
 const CALL_FUEL: u64 = 10_000_000;
-pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_COMPONENT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Compiles a component file without instantiating it or granting capabilities.
@@ -46,6 +45,12 @@ pub fn validate_component_file(path: &Path) -> Result<()> {
     let bytes = std::fs::read(path)
         .map_err(|error| AgentError::from_io("Read Wasmtime component", error))?;
     compile_component(&bytes).map(|_| ())
+}
+
+/// Compiles embedded Component bytes without instantiating or granting them
+/// capabilities.
+pub fn validate_component_bytes(bytes: &[u8]) -> Result<()> {
+    compile_component(bytes).map(|_| ())
 }
 
 fn compile_component(bytes: &[u8]) -> Result<(Engine, Component)> {
@@ -67,28 +72,6 @@ fn compile_component(bytes: &[u8]) -> Result<(Engine, Component)> {
     Ok((engine, component))
 }
 
-/// Raw companion configuration supplied to a Wasm provider.
-///
-/// The host preserves the original file contents. The provider parses
-/// `hooks.json` and `.mcp.json` and owns their matching, protocol, and
-/// transport semantics.
-#[derive(Debug, Clone, Default)]
-pub struct ProviderInputs {
-    pub hooks_json: Option<String>,
-    pub mcp_json: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ProviderConfig<'a> {
-    manifest: &'a WasmManifest,
-    plugin_root: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hooks_json: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mcp_json: Option<&'a str>,
-}
-
 struct StoreState {
     limits: StoreLimits,
     capabilities: CapabilityHub,
@@ -104,6 +87,45 @@ impl HasData for HostState {
 }
 
 impl bindings::deluxe::harness::host::HostWithStore for HostState {
+    fn read_plugin_file<T>(
+        accessor: &Accessor<T, Self>,
+        path: String,
+    ) -> impl Future<Output = std::result::Result<Vec<u8>, String>> + Send {
+        let (capabilities, cancel) = accessor.with(|mut access| {
+            let state: &mut StoreState = access.get();
+            (state.capabilities.clone(), state.cancel.clone())
+        });
+        async move {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err("capability call cancelled".into()),
+                result = capabilities.read_plugin_file(&path) => {
+                    result.map_err(|error| format!("{}: {}", error.code, error.message))
+                }
+            }
+        }
+    }
+
+    fn write_plugin_file<T>(
+        accessor: &Accessor<T, Self>,
+        path: String,
+        contents: Vec<u8>,
+    ) -> impl Future<Output = std::result::Result<(), String>> + Send {
+        let (capabilities, cancel) = accessor.with(|mut access| {
+            let state: &mut StoreState = access.get();
+            (state.capabilities.clone(), state.cancel.clone())
+        });
+        async move {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err("capability call cancelled".into()),
+                result = capabilities.write_plugin_file(&path, &contents) => {
+                    result.map_err(|error| format!("{}: {}", error.code, error.message))
+                }
+            }
+        }
+    }
+
     fn list_tools<T>(accessor: &Accessor<T, Self>) -> impl Future<Output = String> + Send {
         let capabilities = accessor.with(|mut access| {
             let state: &mut StoreState = access.get();
@@ -266,24 +288,9 @@ impl bindings::deluxe::harness::host::HostWithStore for HostState {
 
 pub enum Operation {
     ListTools,
-    Execute {
-        name: String,
-        arguments: String,
-    },
+    Execute { name: String, arguments: String },
     ListHooks,
-    InvokeHook {
-        id: String,
-        event: String,
-    },
-    ListMcpServers,
-    ListMcpTools {
-        server: String,
-    },
-    InvokeMcp {
-        server: String,
-        name: String,
-        arguments: String,
-    },
+    InvokeHook { id: String, event: String },
     Open(String),
     Action(String),
     Close(String),
@@ -313,46 +320,25 @@ impl ComponentActor {
     pub async fn load(
         root: std::path::PathBuf,
         manifest: WasmManifest,
-        inputs: ProviderInputs,
         capabilities: CapabilityHub,
     ) -> Result<Arc<Self>> {
         let entry = manifest.resolve_entry(&root)?;
         let bytes = tokio::fs::read(&entry)
             .await
             .map_err(|error| AgentError::from_io("Read component", error))?;
-        Self::load_bytes(&bytes, root, manifest, inputs, capabilities).await
+        Self::load_bytes(&bytes, capabilities).await
     }
 
     /// Compiles and starts an embedded component, used for trusted bundled
-    /// providers that are shipped inside the host executable.
-    pub async fn load_bytes(
-        bytes: &[u8],
-        plugin_root: PathBuf,
-        manifest: WasmManifest,
-        inputs: ProviderInputs,
-        capabilities: CapabilityHub,
-    ) -> Result<Arc<Self>> {
+    /// plugins that are shipped inside the host executable.
+    pub async fn load_bytes(bytes: &[u8], capabilities: CapabilityHub) -> Result<Arc<Self>> {
         let bytes = bytes.to_vec();
-        let config = ProviderConfig {
-            manifest: &manifest,
-            plugin_root: plugin_root.to_string_lossy().into_owned(),
-            hooks_json: inputs.hooks_json.as_deref(),
-            mcp_json: inputs.mcp_json.as_deref(),
-        };
-        let config_json = serde_json::to_string(&config).map_err(|error| {
-            AgentError::internal(format!("Encode plugin configuration: {error}"))
-        })?;
         let (engine, component) = tokio::task::spawn_blocking(move || compile_component(&bytes))
             .await
             .map_err(|error| AgentError::internal(format!("Component loader failed: {error}")))??;
         let mut instance = tokio::time::timeout(
             CALL_TIMEOUT,
-            instantiate(
-                &engine,
-                &component,
-                capabilities.clone(),
-                config_json.clone(),
-            ),
+            instantiate(&engine, &component, capabilities.clone()),
         )
         .await
         .map_err(|_| timeout_error())??;
@@ -391,12 +377,7 @@ impl ComponentActor {
                     capabilities.shutdown().await;
                     match tokio::time::timeout(
                         CALL_TIMEOUT,
-                        instantiate(
-                            &engine,
-                            &component,
-                            capabilities.clone(),
-                            config_json.clone(),
-                        ),
+                        instantiate(&engine, &component, capabilities.clone()),
                     )
                     .await
                     {
@@ -449,7 +430,6 @@ async fn instantiate(
     engine: &Engine,
     component: &Component,
     capabilities: CapabilityHub,
-    config_json: String,
 ) -> Result<Instance> {
     let mut linker = Linker::new(engine);
     bindings::HarnessPlugin::add_to_linker::<_, HostState>(&mut linker, |state| state)
@@ -481,17 +461,17 @@ async fn instantiate(
         .map_err(load_error)?;
     let bindings = bindings::HarnessPlugin::new(&mut store, &instance).map_err(load_error)?;
     let mut instance = (store, bindings, instance);
-    configure(&mut instance, config_json).await?;
+    configure(&mut instance).await?;
     Ok(instance)
 }
 
-async fn configure(instance: &mut Instance, config_json: String) -> Result<()> {
+async fn configure(instance: &mut Instance) -> Result<()> {
     let (store, bindings, component_instance) = instance;
     store.set_fuel(CALL_FUEL).map_err(runtime_error)?;
     let plugin = bindings.deluxe_harness_plugin();
     component_instance
         .run_concurrent(&mut *store, async move |accessor| {
-            plugin.call_configure(accessor, config_json).await
+            plugin.call_configure(accessor).await
         })
         .await
         .map_err(runtime_error)?
@@ -517,23 +497,6 @@ async fn call((store, bindings, instance): &mut Instance, operation: Operation) 
                 .map(Ok::<String, String>),
             Operation::InvokeHook { id, event } => {
                 plugin.call_invoke_hook(accessor, id, event).await
-            }
-            Operation::ListMcpServers => plugin
-                .call_list_mcp_servers(accessor)
-                .await
-                .map(Ok::<String, String>),
-            Operation::ListMcpTools { server } => plugin
-                .call_list_mcp_tools(accessor, server)
-                .await
-                .map(Ok::<String, String>),
-            Operation::InvokeMcp {
-                server,
-                name,
-                arguments,
-            } => {
-                plugin
-                    .call_invoke_mcp_tool(accessor, server, name, arguments)
-                    .await
             }
             Operation::Open(request) => plugin.call_open_surface(accessor, request).await,
             Operation::Action(action) => plugin.call_handle_action(accessor, action).await,

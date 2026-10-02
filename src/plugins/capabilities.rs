@@ -42,6 +42,165 @@ struct RawHost {
 }
 
 const MAX_TRANSPORT_HANDLES: usize = 64;
+const MAX_PLUGIN_FILE_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone)]
+pub struct PluginFileHost {
+    configuration_root: PathBuf,
+}
+
+impl PluginFileHost {
+    /// Binds generic file reads to one global or project configuration root.
+    pub fn new(configuration_root: PathBuf) -> Self {
+        Self { configuration_root }
+    }
+
+    /// Reads raw bytes from a relative file below the bound configuration root.
+    ///
+    /// Returns `Err` for absolute paths, parent traversal, symlinks that leave
+    /// the root, missing files, directories, or oversized files. The host does
+    /// not interpret the file name or its contents.
+    pub async fn read(&self, path: &str) -> Result<Vec<u8>> {
+        let relative = relative_plugin_path(path)?;
+        let root = self.canonical_root().await?;
+        let path = tokio::fs::canonicalize(root.join(relative))
+            .await
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    AgentError::new(
+                        code::PLUGIN_FILE_NOT_FOUND,
+                        "Plugin file does not exist under the configuration root",
+                    )
+                } else {
+                    AgentError::from_io("Resolve plugin file", error)
+                }
+            })?;
+        if !path.starts_with(&root) {
+            return Err(AgentError::new(
+                code::PLUGIN_PERMISSION_DENIED,
+                "Plugin file access must stay inside the configuration root",
+            ));
+        }
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .map_err(|error| AgentError::from_io("Read plugin file metadata", error))?;
+        if !metadata.is_file() {
+            return Err(AgentError::invalid_params("Plugin file path is not a file"));
+        }
+        if metadata.len() > MAX_PLUGIN_FILE_BYTES as u64 {
+            return Err(AgentError::new(
+                code::PLUGIN_RESOURCE_LIMIT,
+                "Plugin file exceeds its byte limit",
+            ));
+        }
+        tokio::fs::read(path)
+            .await
+            .map_err(|error| AgentError::from_io("Read plugin file", error))
+    }
+
+    /// Replaces a relative file below the bound configuration root.
+    ///
+    /// Returns `Err` for absolute paths, parent traversal, a missing root, an
+    /// oversized payload, or a target that leaves the root through a symlinked
+    /// parent. The file is created when absent and committed with a same-directory
+    /// rename, so a reader never observes a half-written config. The root must
+    /// already exist: a write is not what should create a scope directory.
+    pub async fn write(&self, path: &str, contents: &[u8]) -> Result<()> {
+        let relative = relative_plugin_path(path)?;
+        if contents.len() > MAX_PLUGIN_FILE_BYTES {
+            return Err(AgentError::new(
+                code::PLUGIN_RESOURCE_LIMIT,
+                "Plugin file exceeds its byte limit",
+            ));
+        }
+        let root = self.canonical_root().await?;
+        let target = root.join(&relative);
+        // The file itself need not exist yet, so the *parent* is what gets
+        // canonicalised — which is what refuses a symlinked directory that
+        // leaves the scope, since the symlink is followed before the check.
+        let name = target
+            .file_name()
+            .ok_or_else(|| AgentError::invalid_params("Plugin file needs a file name"))?;
+        let parent = target
+            .parent()
+            .ok_or_else(|| AgentError::invalid_params("Plugin file needs a parent directory"))?;
+        let parent = tokio::fs::canonicalize(parent)
+            .await
+            .map_err(|error| AgentError::from_io("Resolve plugin file parent", error))?;
+        if !parent.starts_with(&root) {
+            return Err(AgentError::new(
+                code::PLUGIN_PERMISSION_DENIED,
+                "Plugin file access must stay inside the configuration root",
+            ));
+        }
+        let target = parent.join(name);
+        match tokio::fs::symlink_metadata(&target).await {
+            Ok(metadata) if metadata.is_file() => {}
+            // A symlink or a directory is never overwritten: following it would
+            // make the write land outside the check above.
+            Ok(_) => {
+                return Err(AgentError::new(
+                    code::PLUGIN_PERMISSION_DENIED,
+                    "Plugin file target is not a regular file",
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(AgentError::from_io("Inspect plugin file", error)),
+        }
+        let temp = parent.join(format!(".plugin-write-{}.tmp", uuid::Uuid::new_v4()));
+        if let Err(error) = tokio::fs::write(&temp, contents).await {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(AgentError::from_io("Write plugin file", error));
+        }
+        if let Err(error) = tokio::fs::rename(&temp, &target).await {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(AgentError::from_io("Commit plugin file", error));
+        }
+        Ok(())
+    }
+
+    async fn canonical_root(&self) -> Result<PathBuf> {
+        match tokio::fs::canonicalize(&self.configuration_root).await {
+            Ok(root) => Ok(root),
+            // The scope root itself is allowed to be absent — a fresh install
+            // has no `~/.agents` yet — and a Component asking for its optional
+            // config wants a not-found, not an opaque resolve failure.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(AgentError::new(
+                code::PLUGIN_FILE_NOT_FOUND,
+                "Plugin configuration root does not exist",
+            )),
+            Err(error) => Err(AgentError::from_io(
+                "Resolve plugin configuration root",
+                error,
+            )),
+        }
+    }
+}
+
+/// Accepts a relative path that names a file below a plugin configuration root.
+///
+/// Returns `Err` for a blank path or any absolute or parent component, which is
+/// the check both the read and the write capability share.
+fn relative_plugin_path(path: &str) -> Result<PathBuf> {
+    let relative = PathBuf::from(path);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(AgentError::new(
+            code::PLUGIN_PERMISSION_DENIED,
+            "Plugin file access requires a relative path inside the configuration root",
+        ));
+    }
+    Ok(relative)
+}
 
 impl RawHost {
     fn new() -> Result<Self> {
@@ -63,10 +222,10 @@ impl RawHost {
 #[derive(Clone)]
 pub struct CapabilityHub {
     pub project: PathBuf,
-    pub plugin_root: PathBuf,
+    pub configuration_root: PathBuf,
     pub permissions: Permissions,
-    pub mcp_servers: BTreeMap<String, super::manifest::McpServerConfig>,
     pub tools: Arc<dyn ToolRuntime>,
+    files: PluginFileHost,
     raw: RawHost,
 }
 
@@ -74,19 +233,39 @@ impl CapabilityHub {
     /// Creates the capabilities available to one project-scoped component.
     pub fn new(
         project: PathBuf,
-        plugin_root: PathBuf,
+        configuration_root: PathBuf,
         permissions: Permissions,
-        mcp_servers: BTreeMap<String, super::manifest::McpServerConfig>,
         tools: Arc<dyn ToolRuntime>,
     ) -> Result<Self> {
         Ok(Self {
             project,
-            plugin_root,
+            files: PluginFileHost::new(configuration_root.clone()),
+            configuration_root,
             permissions,
-            mcp_servers,
             tools,
             raw: RawHost::new()?,
         })
+    }
+
+    /// Reads raw bytes from the current global/project configuration root.
+    pub async fn read_plugin_file(&self, path: &str) -> Result<Vec<u8>> {
+        self.files.read(path).await
+    }
+
+    /// Replaces a file in the current configuration root, when the plugin
+    /// declared the `writePluginFiles` permission.
+    ///
+    /// Returns `Err` when the permission was not granted, in addition to every
+    /// reason [`PluginFileHost::write`] reports. The host still parses nothing:
+    /// what a Component stores in its own scope config is its business.
+    pub async fn write_plugin_file(&self, path: &str, contents: &[u8]) -> Result<()> {
+        if !self.permissions.write_plugin_files {
+            return Err(AgentError::new(
+                code::PLUGIN_PERMISSION_DENIED,
+                "This plugin file write capability was not granted",
+            ));
+        }
+        self.files.write(path, contents).await
     }
 
     /// Stops every process and releases every HTTP response owned by this component.
@@ -204,38 +383,21 @@ impl CapabilityHub {
         if command.is_empty() || arguments.len() > 128 || environment.len() > 128 {
             return Err(AgentError::invalid_params("Invalid process declaration"));
         }
-        let Some(config) = self.permissions.mcp_servers.iter().find_map(|id| {
-            self.mcp_servers
-                .get(id)
-                .filter(|config| !config.is_http())
-                .filter(|config| config.command.as_deref() == Some(command))
-        }) else {
+        if !self
+            .permissions
+            .process_commands
+            .iter()
+            .any(|allowed| allowed == "*" || allowed == command)
+        {
             return Err(AgentError::new(
                 code::PLUGIN_PERMISSION_DENIED,
-                "Process transport was not declared by this provider",
-            ));
-        };
-        if config.args != arguments || config.env != environment {
-            return Err(AgentError::new(
-                code::PLUGIN_PERMISSION_DENIED,
-                "Process transport arguments or environment were not declared by this provider",
+                "This process capability was not granted",
             ));
         }
-        let declared_cwd = config.cwd.as_deref().unwrap_or("");
         let cwd = if cwd.is_empty() {
-            if declared_cwd.is_empty() {
-                self.plugin_root.clone()
-            } else {
-                self.resolve_plugin_path(declared_cwd).await?
-            }
+            self.configuration_root.clone()
         } else {
-            if cwd != declared_cwd {
-                return Err(AgentError::new(
-                    code::PLUGIN_PERMISSION_DENIED,
-                    "Process transport working directory was not declared by this provider",
-                ));
-            }
-            self.resolve_plugin_path(cwd).await?
+            self.resolve_scope_path(cwd).await?
         };
         if self.raw.processes.lock().await.len() >= MAX_TRANSPORT_HANDLES {
             return Err(AgentError::new(
@@ -358,23 +520,11 @@ impl CapabilityHub {
             .permissions
             .network_hosts
             .iter()
-            .any(|allowed| allowed == host)
+            .any(|allowed| allowed == "*" || allowed == host)
         {
             return Err(AgentError::new(
                 code::PLUGIN_PERMISSION_DENIED,
                 "HTTP transport host was not granted",
-            ));
-        }
-        if !self.permissions.mcp_servers.iter().any(|id| {
-            self.mcp_servers
-                .get(id)
-                .filter(|config| config.is_http())
-                .and_then(|config| config.url.as_deref())
-                == Some(url)
-        }) {
-            return Err(AgentError::new(
-                code::PLUGIN_PERMISSION_DENIED,
-                "HTTP transport URL was not declared by this provider",
             ));
         }
         if headers_json.len() > MAX_PAYLOAD_BYTES || body.len() > MAX_PAYLOAD_BYTES {
@@ -479,17 +629,33 @@ impl CapabilityHub {
         self.raw.responses.lock().await.remove(&handle);
     }
 
-    async fn resolve_plugin_path(&self, relative: &str) -> Result<PathBuf> {
-        let root = tokio::fs::canonicalize(&self.plugin_root)
+    async fn resolve_scope_path(&self, relative: &str) -> Result<PathBuf> {
+        let relative = PathBuf::from(relative);
+        if relative.is_absolute()
+            || relative.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(AgentError::new(
+                code::PLUGIN_PERMISSION_DENIED,
+                "Process working directory must be a relative scope path",
+            ));
+        }
+        let root = tokio::fs::canonicalize(&self.configuration_root)
             .await
-            .map_err(|error| AgentError::from_io("Resolve plugin transport root", error))?;
+            .map_err(|error| AgentError::from_io("Resolve process configuration root", error))?;
         let path = tokio::fs::canonicalize(root.join(relative))
             .await
             .map_err(|error| AgentError::from_io("Resolve plugin transport directory", error))?;
         if !path.starts_with(&root) {
             return Err(AgentError::new(
                 code::PLUGIN_PERMISSION_DENIED,
-                "Process working directory must stay inside the plugin",
+                "Process working directory must stay inside the configuration root",
             ));
         }
         Ok(path)
@@ -575,7 +741,6 @@ mod tests {
             project.path().to_path_buf(),
             project.path().to_path_buf(),
             permissions(&["read_file"]),
-            Default::default(),
             runtime.clone(),
         )
         .expect("raw host");
@@ -624,7 +789,6 @@ mod tests {
             project.path().to_path_buf(),
             project.path().to_path_buf(),
             permissions(&["read_file"]),
-            Default::default(),
             runtime,
         )
         .expect("raw host");
@@ -707,28 +871,13 @@ mod tests {
                 .expect("the response body is written");
         });
         let project = tempfile::tempdir().expect("a temporary project is available");
-        let mcp_servers = BTreeMap::from([(
-            "fixture".to_string(),
-            super::super::manifest::McpServerConfig {
-                transport: Some("http".into()),
-                url: Some(url.clone()),
-                oauth_resource: None,
-                command: None,
-                args: Vec::new(),
-                cwd: None,
-                env: BTreeMap::new(),
-                startup_timeout_sec: None,
-            },
-        )]);
         let hub = CapabilityHub::new(
             project.path().to_path_buf(),
             project.path().to_path_buf(),
             Permissions {
-                mcp_servers: vec!["fixture".into()],
                 network_hosts: vec!["127.0.0.1".into()],
                 ..Default::default()
             },
-            mcp_servers,
             Arc::new(FakeRuntime {
                 calls: AtomicUsize::new(0),
                 output: ToolOutput::text("unused"),
@@ -776,7 +925,6 @@ mod tests {
             project.path().to_path_buf(),
             project.path().to_path_buf(),
             permissions(&["read_file"]),
-            Default::default(),
             runtime.clone(),
         )
         .expect("raw host");
@@ -800,6 +948,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_file_reads_return_raw_bytes_from_the_bound_scope_root() {
+        let global = tempfile::tempdir().expect("a temporary global root is available");
+        let project = tempfile::tempdir().expect("a temporary project root is available");
+        let raw = [0xff, 0x00, b'x'];
+        std::fs::write(global.path().join(".mcp.json"), raw)
+            .expect("the global config fixture is writable");
+        std::fs::write(project.path().join(".hooks.json"), b"project hooks")
+            .expect("the project config fixture is writable");
+        let runtime = Arc::new(FakeRuntime {
+            calls: AtomicUsize::new(0),
+            output: ToolOutput::text("unused"),
+        });
+        let global_hub = CapabilityHub::new(
+            project.path().to_path_buf(),
+            global.path().to_path_buf(),
+            Permissions::default(),
+            runtime.clone(),
+        )
+        .expect("global scope host");
+        let project_hub = CapabilityHub::new(
+            project.path().to_path_buf(),
+            project.path().to_path_buf(),
+            Permissions::default(),
+            runtime,
+        )
+        .expect("project scope host");
+
+        assert_eq!(
+            global_hub
+                .read_plugin_file(".mcp.json")
+                .await
+                .expect("the global file is readable"),
+            raw,
+            "file reads preserve arbitrary bytes without decoding"
+        );
+        assert_eq!(
+            project_hub
+                .read_plugin_file(".hooks.json")
+                .await
+                .expect("the project file is readable"),
+            b"project hooks",
+            "project-scoped components read from the project root"
+        );
+        let missing = project_hub
+            .read_plugin_file(".mcp.json")
+            .await
+            .expect_err("a missing scoped config is distinguishable");
+        assert_eq!(missing.code, code::PLUGIN_FILE_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn plugin_file_reads_reject_absolute_and_parent_paths() {
+        let project = tempfile::tempdir().expect("a temporary project root is available");
+        let hub = CapabilityHub::new(
+            project.path().to_path_buf(),
+            project.path().to_path_buf(),
+            Permissions::default(),
+            Arc::new(FakeRuntime {
+                calls: AtomicUsize::new(0),
+                output: ToolOutput::text("unused"),
+            }),
+        )
+        .expect("scope host");
+
+        for path in ["../outside", project.path().to_string_lossy().as_ref()] {
+            let error = hub
+                .read_plugin_file(path)
+                .await
+                .expect_err("plugin file access must stay relative to its scope root");
+            assert_eq!(
+                error.code,
+                code::PLUGIN_PERMISSION_DENIED,
+                "expected `{path}` to be denied"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_file_writes_round_trip_and_stay_inside_the_scope_root() {
+        let global = tempfile::tempdir().expect("a temporary global root is available");
+        let project = tempfile::tempdir().expect("a temporary project root is available");
+        let hub = CapabilityHub::new(
+            project.path().to_path_buf(),
+            global.path().to_path_buf(),
+            Permissions {
+                write_plugin_files: true,
+                ..Default::default()
+            },
+            Arc::new(FakeRuntime {
+                calls: AtomicUsize::new(0),
+                output: ToolOutput::text("unused"),
+            }),
+        )
+        .expect("scope host");
+
+        hub.write_plugin_file(".mcp.json", br#"{"mcpServers":{}}"#)
+            .await
+            .expect("a declared write reaches the bound scope root");
+        assert_eq!(
+            hub.read_plugin_file(".mcp.json")
+                .await
+                .expect("the written file is readable"),
+            br#"{"mcpServers":{}}"#,
+            "a write is committed to the configuration root the hub was bound to"
+        );
+        assert!(
+            global.path().join(".mcp.json").is_file(),
+            "the file lands in the scope root, not in the plugin's own directory"
+        );
+
+        // A second write replaces the file rather than appending to it.
+        hub.write_plugin_file(".mcp.json", b"{}")
+            .await
+            .expect("an existing file is replaced");
+        assert_eq!(
+            std::fs::read(global.path().join(".mcp.json")).expect("the file is readable"),
+            b"{}"
+        );
+        assert!(
+            std::fs::read_dir(global.path())
+                .expect("the scope root is readable")
+                .all(|entry| !entry
+                    .expect("the entry is readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".plugin-write-")),
+            "the temporary file used to commit the write is not left behind"
+        );
+
+        for path in ["../outside.json", "/etc/passwd"] {
+            let error = hub
+                .write_plugin_file(path, b"nope")
+                .await
+                .expect_err("a write must stay inside the configuration root");
+            assert_eq!(error.code, code::PLUGIN_PERMISSION_DENIED);
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_file_writes_need_an_explicit_permission_and_are_bounded() {
+        let project = tempfile::tempdir().expect("a temporary project root is available");
+        let hub = CapabilityHub::new(
+            project.path().to_path_buf(),
+            project.path().to_path_buf(),
+            Permissions::default(),
+            Arc::new(FakeRuntime {
+                calls: AtomicUsize::new(0),
+                output: ToolOutput::text("unused"),
+            }),
+        )
+        .expect("scope host");
+
+        let error = hub
+            .write_plugin_file(".mcp.json", b"{}")
+            .await
+            .expect_err("a component that did not declare the permission cannot write");
+        assert_eq!(error.code, code::PLUGIN_PERMISSION_DENIED);
+        assert!(
+            !project.path().join(".mcp.json").exists(),
+            "a denied write leaves no file behind"
+        );
+
+        let permitted = CapabilityHub::new(
+            project.path().to_path_buf(),
+            project.path().to_path_buf(),
+            Permissions {
+                write_plugin_files: true,
+                ..Default::default()
+            },
+            Arc::new(FakeRuntime {
+                calls: AtomicUsize::new(0),
+                output: ToolOutput::text("unused"),
+            }),
+        )
+        .expect("scope host");
+        let error = permitted
+            .write_plugin_file(".mcp.json", &vec![b'x'; MAX_PLUGIN_FILE_BYTES + 1])
+            .await
+            .expect_err("an oversized write is refused");
+        assert_eq!(error.code, code::PLUGIN_RESOURCE_LIMIT);
+    }
+
+    #[tokio::test]
     async fn host_output_limit_applies_after_normal_dispatch() {
         let runtime = Arc::new(FakeRuntime {
             calls: AtomicUsize::new(0),
@@ -812,7 +1143,6 @@ mod tests {
             project.path().to_path_buf(),
             project.path().to_path_buf(),
             permissions(&["read_file"]),
-            Default::default(),
             runtime.clone(),
         )
         .expect("raw host");

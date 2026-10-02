@@ -1,0 +1,22 @@
+{
+  "name": "mcp",
+  "version": "0.1.0",
+  "interface": {
+    "displayName": "MCP",
+    "shortDescription": "MCP Wasmtime plugin"
+  },
+  "runtime": {
+    "type": "wasm",
+    "module": "plugin.wasm",
+    "apiVersion": "deluxe.harness/plugin@0.1",
+    "ui": {
+      "surfaces": ["mcp"],
+      "actions": ["toggle_server", "remove_server"]
+    },
+    "permissions": {
+      "processCommands": ["*"],
+      "networkHosts": ["*"],
+      "writePluginFiles": true
+    }
+  }
+}

@@ -50,6 +50,7 @@ mod markdown;
 mod plugins;
 mod process;
 mod runtime;
+mod runtime_context;
 mod session;
 mod theme;
 mod tools;
@@ -79,7 +80,7 @@ fn main() -> eframe::Result<()> {
         }
     };
 
-    let config = config::load();
+    let mut config = config::load();
     // Resolved before the window exists and handed to it, so a save writes the
     // same file the load read rather than re-deriving it from the environment.
     let config_path = config::config_path();
@@ -102,8 +103,21 @@ fn main() -> eframe::Result<()> {
     let home = directories::UserDirs::new()
         .map(|dirs| dirs.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    let projects: Vec<PathBuf> = config.projects.iter().map(PathBuf::from).collect();
     let plugin_manager: Arc<dyn PluginManager> = Arc::new(NativePluginManager::new(home.clone()));
+    let config_store: Arc<dyn ConfigStore> = Arc::new(NativeConfigStore::new(config_path.clone()));
+    let previous_plugins = config.plugins.clone();
+    match runtime.block_on(plugin_manager.ensure_bundled_defaults(config.plugins.clone())) {
+        Ok(plugins) => {
+            config.plugins = plugins;
+            if config.plugins != previous_plugins {
+                if let Err(error) = runtime.block_on(config_store.save(&config)) {
+                    tracing::warn!(%error, "failed to persist bundled plugin defaults");
+                }
+            }
+        }
+        Err(error) => tracing::warn!(%error, "failed to install bundled plugin defaults"),
+    }
+    let projects: Vec<PathBuf> = config.projects.iter().map(PathBuf::from).collect();
     let plugins = match runtime.block_on(plugin_manager.discover(projects, config.plugins.clone()))
     {
         Ok(plugins) => plugins,
@@ -112,7 +126,6 @@ fn main() -> eframe::Result<()> {
             Arc::new(PluginCatalogue::default())
         }
     };
-    let config_store: Arc<dyn ConfigStore> = Arc::new(NativeConfigStore::new(config_path.clone()));
     let secret_store: Arc<dyn SecretStore> = Arc::new(NativeSecretStore::new());
 
     let settings = Arc::new(RwLock::new(config.tools.clone()));
@@ -123,6 +136,7 @@ fn main() -> eframe::Result<()> {
     let worker = Worker {
         settings,
         plugins,
+        home: home.clone(),
         session_store,
         config_store,
         secret_store,
@@ -193,6 +207,7 @@ fn main() -> eframe::Result<()> {
 /// frame never shows a half-initialised state.
 struct Worker {
     settings: Arc<RwLock<ToolSettings>>,
+    home: PathBuf,
     /// Every plugin that loaded, in both scopes. The worker resolves the ones
     /// that apply to a run's project rather than receiving a flat list, because
     /// a project-scoped plugin must not reach another project's agent.
@@ -225,7 +240,15 @@ fn spawn_worker(
         // directory.
         let mut runtimes: HashMap<PathBuf, Arc<ProjectRuntime>> = HashMap::new();
         let mut surfaces: HashMap<SurfaceRequest, SurfaceHandle> = HashMap::new();
-        let factory = ProjectRuntimeFactory::new(worker.settings.clone(), Arc::new(sink.clone()));
+        let factory = ProjectRuntimeFactory::new(
+            worker.settings.clone(),
+            Arc::new(sink.clone()),
+            // A global Component's generic file capability is bound here, not to
+            // the whole home directory: `~/.agents` holds plugin configuration
+            // (`.mcp.json`, `.hooks.json`, the personal marketplace) and nothing
+            // a plugin has no business reading.
+            plugins::global_configuration_root(&worker.home),
+        );
         // The model settings the GUI wants. Pushed before the first run and on
         // every settings save; `None` only until then.
         let mut llm_settings: Option<LlmSettings> = None;
@@ -240,22 +263,12 @@ fn spawn_worker(
                         .find(|plugin| plugin.id == request.plugin_id)
                         .and_then(|plugin| {
                             plugin.manifest.wasm_runtime().map(|manifest| {
-                                (
-                                    plugin.root.clone(),
-                                    manifest,
-                                    plugins::wasm_runtime::ProviderInputs {
-                                        hooks_json: plugin.hooks_json.clone(),
-                                        mcp_json: plugin.mcp_json.clone(),
-                                    },
-                                    plugin.mcp_servers.clone(),
-                                )
+                                (plugin.root.clone(), plugin.scope.clone(), manifest)
                             })
                         });
-                    let Some((root, manifest, inputs, mcp_servers)) =
-                        declaration.filter(|(_, manifest, _, _)| {
-                            manifest.ui.surfaces.contains(&request.surface_id)
-                        })
-                    else {
+                    let Some((root, scope, manifest)) = declaration.filter(|(_, _, manifest)| {
+                        manifest.ui.surfaces.contains(&request.surface_id)
+                    }) else {
                         sink.emit_ui(Event::PluginUiFailed {
                             request,
                             message: "Plugin surface is disabled, out of scope, or undeclared"
@@ -288,9 +301,8 @@ fn spawn_worker(
                         });
                     let hub = match plugins::capabilities::CapabilityHub::new(
                         request.project.clone(),
-                        root.clone(),
+                        factory.configuration_root(&scope, &request.project),
                         manifest.permissions.clone(),
-                        mcp_servers,
                         host_tools,
                     ) {
                         Ok(hub) => hub,
@@ -307,10 +319,8 @@ fn spawn_worker(
                         let actor = match cached {
                             Some(actor) => actor,
                             None => {
-                                plugins::wasm_runtime::ComponentActor::load(
-                                    root, manifest, inputs, hub,
-                                )
-                                .await?
+                                plugins::wasm_runtime::ComponentActor::load(root, manifest, hub)
+                                    .await?
                             }
                         };
                         Ok(Box::new(plugins::wasm::WasmUiExecutor::new(actor))

@@ -1,8 +1,8 @@
-//! Wasmtime-backed provider adapters for tools, hooks, and MCP.
+//! Wasmtime-backed adapters for generic tools and hooks.
 //!
-//! The component owns provider semantics. These adapters only validate the
-//! provider's JSON metadata and translate it into the harness ports used by the
-//! agent loop.
+//! Components own their hook semantics. This adapter only validates the
+//! Component's JSON metadata and translates it into the harness port used by
+//! the agent loop.
 
 use std::sync::Arc;
 
@@ -13,10 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{code, AgentError, Result};
 use crate::harness::{HookContext, HookRuntime};
-use crate::tools::{Tool, ToolDescriptor, ToolOutput, ToolSettings};
 
 use super::ui_protocol::MAX_PAYLOAD_BYTES;
-use super::wasm::{decode_tool_output, tools};
 use super::wasm_runtime::{ComponentActor, Operation};
 
 const MAX_PROVIDER_ITEMS: usize = 128;
@@ -46,20 +44,20 @@ fn default_hook_matched() -> bool {
     true
 }
 
-/// A hook exported by a Wasm provider.
+/// A hook exported by a Wasmtime Component.
 struct WasmHook {
     plugin_id: String,
     descriptor: HookDescriptor,
     actor: Arc<ComponentActor>,
 }
 
-/// Runs provider hooks in stable plugin and declaration order.
+/// Runs Component hooks in stable plugin and declaration order.
 pub struct WasmHookRuntime {
     hooks: Vec<WasmHook>,
 }
 
 impl WasmHookRuntime {
-    /// Loads and validates hook declarations from the supplied providers.
+    /// Loads and validates hook declarations from the supplied Components.
     pub async fn load(
         providers: impl IntoIterator<Item = (String, Arc<ComponentActor>)>,
     ) -> Result<Self> {
@@ -88,7 +86,7 @@ impl WasmHookRuntime {
                 if descriptor.id.len() > MAX_PROVIDER_ID_BYTES
                     || descriptor.tools.len() > MAX_PROVIDER_ITEMS
                     || descriptor.tools.iter().any(|tool| tool.is_empty())
-                    || validate_identifier(&descriptor.id).is_err()
+                    || !valid_identifier(&descriptor.id)
                 {
                     tracing::warn!(
                         plugin = %plugin_id,
@@ -208,128 +206,12 @@ impl HookDescriptor {
     }
 }
 
-/// Loads all MCP tools exported by one provider.
-pub async fn mcp_tools(
-    actor: Arc<ComponentActor>,
-    provider_id: &str,
-) -> Result<Vec<Arc<dyn Tool>>> {
-    let servers_json = actor.call(Operation::ListMcpServers).await?;
-    let servers: Vec<String> = decode_list(&servers_json, "MCP server")?;
-    if servers.len() > MAX_PROVIDER_ITEMS {
-        return Err(invalid_provider("Too many MCP servers"));
-    }
-
-    let mut result = Vec::new();
-    for server in servers {
-        validate_identifier(&server)?;
-        let tools_json = actor
-            .call(Operation::ListMcpTools {
-                server: server.clone(),
-            })
-            .await?;
-        let listed: Vec<ToolDescriptor> = decode_list(&tools_json, "MCP tool")?;
-        if listed.len() > MAX_PROVIDER_ITEMS {
-            return Err(invalid_provider("Too many MCP tools"));
-        }
-        for descriptor in listed {
-            validate_tool_descriptor(&descriptor)?;
-            result.push(Arc::new(WasmMcpTool {
-                provider_id: provider_id.to_string(),
-                server: server.clone(),
-                remote_name: descriptor.name.clone(),
-                descriptor: exposed_descriptor(&server, descriptor),
-                actor: actor.clone(),
-            }) as Arc<dyn Tool>);
-        }
-    }
-    Ok(result)
-}
-
-/// Loads regular tools and provider-owned MCP tools from one component.
-pub async fn all_tools(
-    actor: Arc<ComponentActor>,
-    provider_id: &str,
-) -> Result<Vec<Arc<dyn Tool>>> {
-    let mut result = tools(actor.clone()).await?;
-    match mcp_tools(actor, provider_id).await {
-        Ok(mcp) => result.extend(mcp),
-        Err(error) => {
-            tracing::warn!(plugin = %provider_id, %error, "skipping Wasm MCP tools");
-        }
-    }
-    Ok(result)
-}
-
-struct WasmMcpTool {
-    provider_id: String,
-    server: String,
-    remote_name: String,
-    descriptor: ToolDescriptor,
-    actor: Arc<ComponentActor>,
-}
-
-#[async_trait]
-impl Tool for WasmMcpTool {
-    fn descriptor(&self) -> ToolDescriptor {
-        self.descriptor.clone()
-    }
-
-    async fn execute(&self, arguments: Value, _settings: &ToolSettings) -> Result<ToolOutput> {
-        let arguments = arguments.to_string();
-        if arguments.len() > MAX_PAYLOAD_BYTES {
-            return Err(AgentError::invalid_params(
-                "MCP arguments exceed the provider payload limit",
-            ));
-        }
-        let result = self
-            .actor
-            .call(Operation::InvokeMcp {
-                server: self.server.clone(),
-                name: self.remote_name.clone(),
-                arguments,
-            })
-            .await?;
-        decode_tool_output(&result).map_err(|error| {
-            tracing::warn!(plugin = %self.provider_id, server = %self.server, %error, "invalid provider MCP output");
-            error
-        })
-    }
-}
-
-fn validate_tool_descriptor(descriptor: &ToolDescriptor) -> Result<()> {
-    if descriptor.name.is_empty()
-        || descriptor.name.len() > MAX_PROVIDER_ID_BYTES
-        || !descriptor
-            .name
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PROVIDER_ID_BYTES
+        && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
-        || descriptor.input_schema.schema_type != "object"
-    {
-        return Err(invalid_provider("Invalid provider MCP tool descriptor"));
-    }
-    if descriptor
-        .input_schema
-        .required
-        .iter()
-        .any(|key| !descriptor.input_schema.properties.contains_key(key))
-    {
-        return Err(invalid_provider(
-            "Provider MCP schema has an unknown required field",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_identifier(value: &str) -> Result<()> {
-    if value.is_empty()
-        || value.len() > MAX_PROVIDER_ID_BYTES
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
-    {
-        return Err(invalid_provider("Provider identifier is invalid"));
-    }
-    Ok(())
 }
 
 fn decode_list<T: for<'de> Deserialize<'de>>(json: &str, kind: &str) -> Result<T> {
@@ -356,9 +238,4 @@ fn decode_json<T: for<'de> Deserialize<'de>>(json: &str, kind: &str) -> Result<T
 
 fn invalid_provider(message: impl Into<String>) -> AgentError {
     AgentError::new(code::PLUGIN_INVALID_OUTPUT, message)
-}
-
-fn exposed_descriptor(server: &str, mut descriptor: ToolDescriptor) -> ToolDescriptor {
-    descriptor.name = format!("mcp__{server}__{}", descriptor.name);
-    descriptor
 }

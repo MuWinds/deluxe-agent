@@ -11,15 +11,6 @@ use super::ui_protocol::valid_identifier;
 
 pub const API_VERSION: &str = "deluxe.harness/plugin@0.1";
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ProviderKind {
-    #[default]
-    General,
-    Hooks,
-    Mcp,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WasmManifest {
@@ -27,8 +18,6 @@ pub struct WasmManifest {
     pub runtime_type: String,
     pub module: String,
     pub api_version: String,
-    #[serde(default)]
-    pub provider: ProviderKind,
     #[serde(default)]
     pub ui: UiManifest,
     #[serde(default)]
@@ -50,9 +39,17 @@ pub struct Permissions {
     #[serde(default)]
     pub invoke_tools: Vec<String>,
     #[serde(default)]
-    pub mcp_servers: Vec<String>,
+    pub process_commands: Vec<String>,
     #[serde(default)]
     pub network_hosts: Vec<String>,
+    /// Whether the Component may replace files inside its configuration root.
+    ///
+    /// Off unless declared: a Component that only *reads* `.mcp.json` or
+    /// `.hooks.json` must not be able to rewrite the user's scope config. A
+    /// plain switch rather than a path allowlist because the root is the unit
+    /// of trust — a Component already reads every file under it.
+    #[serde(default)]
+    pub write_plugin_files: bool,
 }
 
 impl WasmManifest {
@@ -71,8 +68,6 @@ impl WasmManifest {
             &self.ui.surfaces,
             &self.ui.actions,
             &self.permissions.invoke_tools,
-            &self.permissions.mcp_servers,
-            &self.permissions.network_hosts,
         ] {
             let mut seen = HashSet::new();
             if ids.len() > 128
@@ -83,6 +78,24 @@ impl WasmManifest {
                 return Err(AgentError::new(
                     code::PLUGIN_LOAD_FAILED,
                     "Invalid or duplicate UI declarations",
+                ));
+            }
+        }
+        for ids in [
+            &self.permissions.process_commands,
+            &self.permissions.network_hosts,
+        ] {
+            let mut seen = HashSet::new();
+            if ids.len() > 128
+                || ids.iter().any(|id| {
+                    (id != "*"
+                        && (id.is_empty() || id.len() > 256 || id.bytes().any(|byte| byte == 0)))
+                        || !seen.insert(id)
+                })
+            {
+                return Err(AgentError::new(
+                    code::PLUGIN_LOAD_FAILED,
+                    "Invalid or duplicate process or network declarations",
                 ));
             }
         }

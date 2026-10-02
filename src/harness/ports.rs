@@ -46,9 +46,13 @@ pub trait LlmProvider: Send + Sync {
     ) -> Result<AssistantTurn>;
 
     /// Completes one non-streaming assistant turn.
+    ///
+    /// `tools` is the conversation's own schema, sent so a summarisation
+    /// request keeps the cached prefix it shares with the turns around it.
     async fn complete_turn(
         &self,
         messages: &[Message],
+        tools: &Value,
         cancel: &CancellationToken,
     ) -> Result<AssistantTurn>;
 }
@@ -87,9 +91,13 @@ pub trait ToolRuntime: Send + Sync {
 #[async_trait]
 pub trait ContextCompactor: Send + Sync {
     /// Summarises history, returning `None` when it contains no useful text.
+    ///
+    /// `tools` is passed through to the completion so the summarisation request
+    /// reuses the conversation's cached prefix.
     async fn summarize(
         &self,
         history: &[Message],
+        tools: &Value,
         cancel: &CancellationToken,
     ) -> Result<Option<String>>;
 }
@@ -189,6 +197,9 @@ pub trait PluginManager: Send + Sync {
         projects: Vec<PathBuf>,
         settings: PluginSettings,
     ) -> Result<Arc<PluginCatalogue>>;
+
+    /// Installs embedded defaults and returns the resulting plugin settings.
+    async fn ensure_bundled_defaults(&self, settings: PluginSettings) -> Result<PluginSettings>;
 
     /// Imports a Wasmtime component or its plugin root into the managed cache.
     async fn install_local(&self, component_path: PathBuf) -> Result<InstalledPlugin>;

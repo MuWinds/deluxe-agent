@@ -83,6 +83,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 wat = "1"
 
+[build-dependencies]
+serde_json = "1"
+
 # Secret storage is per-platform. Declaring it per target keeps the Linux
 # secret-service stack out of the Windows build, where it would be dead weight.
 [target.'cfg(target_os = "windows")'.dependencies]

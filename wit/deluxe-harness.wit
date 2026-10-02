@@ -1,6 +1,8 @@
 package deluxe:harness@0.1.0;
 
 interface host {
+    read-plugin-file: async func(path: string) -> result<list<u8>, string>;
+    write-plugin-file: async func(path: string, contents: list<u8>) -> result<_, string>;
     list-tools: async func() -> string;
     invoke-tool: async func(name: string, arguments-json: string) -> result<string, string>;
     spawn-process: async func(
@@ -23,18 +25,11 @@ interface host {
 }
 
 interface plugin {
-    configure: async func(config-json: string) -> result<_, string>;
+    configure: async func() -> result<_, string>;
     list-tools: async func() -> string;
     execute-tool: async func(name: string, arguments-json: string) -> result<string, string>;
     list-hooks: async func() -> string;
     invoke-hook: async func(hook-id: string, event-json: string) -> result<string, string>;
-    list-mcp-servers: async func() -> string;
-    list-mcp-tools: async func(server: string) -> string;
-    invoke-mcp-tool: async func(
-        server: string,
-        name: string,
-        arguments-json: string
-    ) -> result<string, string>;
     open-surface: async func(request-json: string) -> result<string, string>;
     handle-action: async func(action-json: string) -> result<string, string>;
     close-surface: async func(surface-id: string);

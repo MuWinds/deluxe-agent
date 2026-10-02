@@ -15,7 +15,7 @@ use exports::deluxe::harness::plugin::Guest;
 struct BuiltinTools;
 
 impl Guest for BuiltinTools {
-    async fn configure(_config_json: String) -> Result<(), String> {
+    async fn configure() -> Result<(), String> {
         Ok(())
     }
 
@@ -33,22 +33,6 @@ impl Guest for BuiltinTools {
 
     async fn invoke_hook(_hook_id: String, _event_json: String) -> Result<String, String> {
         Err("bundled tools provider has no hooks".into())
-    }
-
-    async fn list_mcp_servers() -> String {
-        "[]".into()
-    }
-
-    async fn list_mcp_tools(_server: String) -> String {
-        "[]".into()
-    }
-
-    async fn invoke_mcp_tool(
-        _server: String,
-        _name: String,
-        _arguments_json: String,
-    ) -> Result<String, String> {
-        Err("bundled tools provider has no MCP servers".into())
     }
 
     async fn open_surface(_request_json: String) -> Result<String, String> {

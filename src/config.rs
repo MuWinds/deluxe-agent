@@ -366,6 +366,7 @@ mod tests {
         config.llm.retry_forever = true;
         config.context.context_limit = 131_072;
         config.context.threshold_percent = 45;
+        config.context.keep_recent_turns = 3;
 
         let text = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
@@ -380,6 +381,7 @@ mod tests {
         assert!(parsed.llm.retry_forever);
         assert_eq!(parsed.context.context_limit, 131_072);
         assert_eq!(parsed.context.threshold_percent, 45);
+        assert_eq!(parsed.context.keep_recent_turns, 3);
     }
 
     #[test]
@@ -392,6 +394,8 @@ mod tests {
         );
         // No context section: compaction stays off until the user turns it on.
         assert_eq!(parsed.context.context_limit, 0);
+        // A file without the field keeps a tail rather than folding everything.
+        assert_eq!(parsed.context.keep_recent_turns, 2);
         assert_eq!(parsed.llm.retry_count, 3);
         assert!(!parsed.llm.retry_forever);
     }

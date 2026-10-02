@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::error::{code, AgentError, Result};
-use crate::tools::{ContentBlock, Tool, ToolDescriptor, ToolOutput, ToolSettings};
+use crate::tools::{Tool, ToolDescriptor, ToolOutput, ToolSettings};
 
 use super::runtime::PluginUiExecutor;
 use super::ui_protocol::{
@@ -116,10 +116,11 @@ pub async fn tools(actor: Arc<ComponentActor>) -> Result<Vec<Arc<dyn Tool>>> {
         .collect())
 }
 
-/// Decodes a tool result without accepting fabricated host image references.
+/// Decodes a component tool result.
 ///
-/// Returns `Err` for malformed data or unsupported output blocks. Images must
-/// originate from a future explicit host attachment capability, not guest JSON.
+/// Returns `Err` for malformed data or payloads over the component limit. The
+/// component protocol leaves output ownership to the user, so plugins may
+/// return images and patch hunk metadata for their own workflows.
 pub fn decode_tool_output(json: &str) -> Result<ToolOutput> {
     if json.len() > MAX_PAYLOAD_BYTES {
         return Err(AgentError::new(
@@ -130,17 +131,6 @@ pub fn decode_tool_output(json: &str) -> Result<ToolOutput> {
     let output: ToolOutput = serde_json::from_str(json).map_err(|_| {
         AgentError::new(code::PLUGIN_INVALID_OUTPUT, "Invalid component tool output")
     })?;
-    if output
-        .content
-        .iter()
-        .any(|block| !matches!(block, ContentBlock::Text { .. }))
-        || !output.hunks.is_empty()
-    {
-        return Err(AgentError::new(
-            code::PLUGIN_INVALID_OUTPUT,
-            "Component returned unowned host resources",
-        ));
-    }
     Ok(output)
 }
 
@@ -157,18 +147,15 @@ mod tests {
     use tokio::sync::RwLock;
 
     use crate::plugins::capabilities::CapabilityHub;
-    use crate::plugins::providers::mcp_tools;
     use crate::plugins::runtime::PluginUiExecutor;
     use crate::plugins::ui_protocol::{PluginUiAction, SurfaceRequest, UiNode};
-    use crate::plugins::wasm_manifest::WasmManifest;
-    use crate::plugins::wasm_runtime::ProviderInputs;
+    use crate::plugins::wasm_manifest::{Permissions, WasmManifest};
     use crate::tools::{ToolRegistry, ToolSettings};
 
     fn fixture_manifest() -> WasmManifest {
-        let manifest: crate::plugins::PluginManifest = serde_json::from_str(include_str!(
-            "../../plugin-fixtures/echo-tool/.codex-plugin/plugin.json"
-        ))
-        .expect("the checked-in fixture manifest is valid");
+        let manifest: crate::plugins::PluginManifest =
+            serde_json::from_str(include_str!("../../plugin-fixtures/echo-tool/plugin.json"))
+                .expect("the checked-in fixture manifest is valid");
         manifest
             .wasm_runtime()
             .expect("the checked-in fixture declares a Wasm runtime")
@@ -178,7 +165,6 @@ mod tests {
         CapabilityHub::new(
             project.clone(),
             project,
-            Default::default(),
             Default::default(),
             Arc::new(crate::harness::services::RegistryToolRuntime::new(
                 Arc::new(ToolRegistry::with_builtins()),
@@ -244,7 +230,6 @@ mod tests {
         let actor = ComponentActor::load(
             root.path().to_path_buf(),
             fixture_manifest(),
-            ProviderInputs::default(),
             fixture_hub(root.path().to_path_buf()),
         )
         .await
@@ -297,28 +282,56 @@ mod tests {
 
     #[tokio::test]
     async fn checked_in_hooks_provider_loads_its_hooks_input() {
-        let root = tempfile::tempdir().expect("a temporary plugin root is available");
+        let plugin_root = tempfile::tempdir().expect("a temporary plugin root is available");
+        let project_root = tempfile::tempdir().expect("a temporary project root is available");
         let manifest = serde_json::from_str::<crate::plugins::PluginManifest>(include_str!(
-            "../../plugin-fixtures/hooks-provider/.codex-plugin/plugin.json"
+            "../../plugin-fixtures/hooks-provider/plugin.json"
         ))
         .expect("the checked-in Hooks manifest is valid")
         .wasm_runtime()
         .expect("the checked-in Hooks manifest declares a Wasmtime runtime");
-        let hooks_json =
-            include_str!("../../plugin-fixtures/hooks-provider/hooks.json").to_string();
-        let hub = fixture_hub(root.path().to_path_buf());
-        let actor = ComponentActor::load_bytes(
-            include_bytes!("../../plugin-fixtures/hooks-provider/plugin.wasm"),
-            root.path().to_path_buf(),
-            manifest,
-            ProviderInputs {
-                hooks_json: Some(hooks_json),
-                ..Default::default()
-            },
-            hub,
+        std::fs::write(
+            plugin_root.path().join(".hooks.json"),
+            br#"{"hooks":{"PostToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"echo wrong-plugin-root"}]}]}}"#,
         )
-        .await
-        .expect("the Hooks provider implements the harness world");
+        .expect("the plugin-root decoy configuration is writable");
+        std::fs::write(
+            plugin_root.path().join("plugin.wasm"),
+            include_bytes!("../../plugin-fixtures/hooks-provider/plugin.wasm"),
+        )
+        .expect("the Hooks component is copied into its plugin root");
+        std::fs::write(
+            project_root.path().join(".hooks.json"),
+            r#"{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo hooks-provider-ran"
+          }
+        ]
+      }
+    ]
+  }
+}"#,
+        )
+        .expect("the scoped Hooks configuration is writable");
+        let hub = CapabilityHub::new(
+            project_root.path().to_path_buf(),
+            project_root.path().to_path_buf(),
+            Default::default(),
+            Arc::new(crate::harness::services::RegistryToolRuntime::new(
+                Arc::new(ToolRegistry::with_builtins()),
+                Arc::new(RwLock::new(ToolSettings::default())),
+            )),
+        )
+        .expect("the project configuration host is valid");
+        let actor = ComponentActor::load(plugin_root.path().to_path_buf(), manifest, hub)
+            .await
+            .expect("the Hooks provider implements the harness world");
 
         let hooks = actor
             .call(Operation::ListHooks)
@@ -327,9 +340,156 @@ mod tests {
         let hooks: serde_json::Value = serde_json::from_str(&hooks).expect("the hook list is JSON");
         assert_eq!(
             hooks[0]["label"], "echo hooks-provider-ran",
-            "the provider reads hooks.json instead of receiving manifest metadata"
+            "the Hooks Component reads the project configuration, not the plugin directory"
         );
         actor.shutdown();
+    }
+
+    #[tokio::test]
+    async fn bundled_mcp_component_loads_with_an_empty_default_configuration() {
+        let root = tempfile::tempdir().expect("a temporary plugin root is available");
+        let package = crate::plugins::defaults::PLUGINS
+            .iter()
+            .find(|package| package.name == "mcp")
+            .expect("the application ships a bundled MCP Component");
+        let _manifest = serde_json::from_str::<crate::plugins::PluginManifest>(package.manifest)
+            .expect("the bundled MCP manifest is valid")
+            .wasm_runtime()
+            .expect("the bundled MCP manifest declares Wasmtime");
+        let actor =
+            ComponentActor::load_bytes(package.component, fixture_hub(root.path().to_path_buf()))
+                .await
+                .expect("the bundled MCP Component starts with no configured servers");
+
+        assert_eq!(
+            actor
+                .call(Operation::ListTools)
+                .await
+                .expect("the bundled provider lists its configured tools"),
+            "[]"
+        );
+        let request = SurfaceRequest {
+            plugin_id: "mcp@deluxe-defaults".into(),
+            project: root.path().to_path_buf(),
+            surface_id: "mcp".into(),
+            request_id: 1,
+        };
+        let mut ui = WasmUiExecutor::new(actor);
+        let document = ui
+            .open_surface(&request)
+            .await
+            .expect("the bundled MCP provider exposes its Wasmtime UI");
+        assert_eq!(document.title, "MCP");
+        ui.close_surface(&request)
+            .await
+            .expect("the bundled MCP Component closes its UI");
+    }
+
+    #[tokio::test]
+    async fn mcp_surface_stops_and_uninstalls_a_configured_server() {
+        let project = tempfile::tempdir().expect("a temporary project root is available");
+        let package = crate::plugins::defaults::PLUGINS
+            .iter()
+            .find(|package| package.name == "mcp")
+            .expect("the application ships a bundled MCP Component");
+        // Two servers, so removing one proves the other survives the rewrite.
+        std::fs::write(
+            project.path().join(".mcp.json"),
+            r#"{"mcpServers":{"alpha":{"url":"http://127.0.0.1:1/a"},"beta":{"url":"http://127.0.0.1:1/b"}}}"#,
+        )
+        .expect("the scoped MCP configuration is writable");
+        let hub = CapabilityHub::new(
+            project.path().to_path_buf(),
+            project.path().to_path_buf(),
+            Permissions {
+                write_plugin_files: true,
+                ..Default::default()
+            },
+            Arc::new(crate::harness::services::RegistryToolRuntime::new(
+                Arc::new(ToolRegistry::with_builtins()),
+                Arc::new(RwLock::new(ToolSettings::default())),
+            )),
+        )
+        .expect("scope host");
+        let actor = ComponentActor::load_bytes(package.component, hub)
+            .await
+            .expect("the bundled MCP Component reads its scoped configuration");
+        let request = SurfaceRequest {
+            plugin_id: "mcp@deluxe-defaults".into(),
+            project: project.path().to_path_buf(),
+            surface_id: "mcp".into(),
+            request_id: 1,
+        };
+        let mut ui = WasmUiExecutor::new(actor);
+        let document = ui
+            .open_surface(&request)
+            .await
+            .expect("the MCP surface opens with both servers listed");
+
+        let has_toggle = |document: &crate::plugins::ui_protocol::PluginUiDocument, id: &str| {
+            fn walk(node: &UiNode, id: &str) -> bool {
+                match node {
+                    UiNode::Button { id: button, .. } if button == id => true,
+                    UiNode::Column { children }
+                    | UiNode::Row { children }
+                    | UiNode::Section { children, .. } => {
+                        children.iter().any(|child| walk(child, id))
+                    }
+                    _ => false,
+                }
+            }
+            walk(&document.root, id)
+        };
+        assert!(
+            has_toggle(&document, "toggle.alpha") && has_toggle(&document, "toggle.beta"),
+            "each configured server gets its own stop control"
+        );
+
+        let action = |revision: u64, control_id: &str, name: &str| PluginUiAction {
+            surface: request.clone(),
+            revision,
+            control_id: control_id.into(),
+            action: name.into(),
+            value: None,
+        };
+        let stopped = ui
+            .handle_action(&action(document.revision, "toggle.alpha", "toggle_server"))
+            .await
+            .expect("stopping a server returns a newer snapshot");
+        let text = format!("{:?}", stopped.root);
+        assert!(
+            text.contains("已停止"),
+            "the stopped server is reported as stopped: {text}"
+        );
+
+        let after_stop =
+            std::fs::read_to_string(project.path().join(".mcp.json")).expect("the config remains");
+        assert!(
+            after_stop.contains("\"alpha\""),
+            "stopping keeps the declaration so the server can be started again"
+        );
+
+        let removed = ui
+            .handle_action(&action(stopped.revision, "remove.alpha", "remove_server"))
+            .await
+            .expect("uninstalling a server returns a newer snapshot");
+        let text = format!("{:?}", removed.root);
+        assert!(
+            !text.contains("alpha"),
+            "the removed server is gone from the refreshed snapshot: {text}"
+        );
+        assert!(text.contains("beta"), "the other server is untouched");
+        let rewritten =
+            std::fs::read_to_string(project.path().join(".mcp.json")).expect("the config remains");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rewritten).expect("the rewritten config is JSON");
+        assert!(
+            parsed["mcpServers"].get("alpha").is_none() && parsed["mcpServers"]["beta"].is_object(),
+            "the uninstalled server is deleted from `.mcp.json` and the rest is preserved: {rewritten}"
+        );
+        ui.close_surface(&request)
+            .await
+            .expect("the MCP surface closes");
     }
 
     #[tokio::test]
@@ -343,30 +503,34 @@ mod tests {
         );
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for _ in 0..6 {
+            for _ in 0..4 {
                 let (mut socket, _) = listener
                     .accept()
                     .await
                     .expect("the provider can connect to the fixture server");
                 let body = read_http_request(&mut socket).await;
+                let request_id = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|request| request.get("id").and_then(serde_json::Value::as_u64))
+                    .unwrap_or_default();
                 let response_body = if body.contains(r#""method":"initialize""#) {
-                    concat!(
-                        "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":",
-                        "{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},",
-                        "\"serverInfo\":{\"name\":\"fixture\",\"version\":\"0.1\"}}}\n\n"
+                    format!(
+                        "data: {{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":\
+                         {{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\
+                         \"serverInfo\":{{\"name\":\"fixture\",\"version\":\"0.1\"}}}}}}\n\n"
                     )
                 } else if body.contains(r#""method":"tools/list""#) {
-                    concat!(
-                        "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":",
-                        "[{\"name\":\"remote_echo\",\"description\":\"fixture\"}]}}\n\n"
+                    format!(
+                        "data: {{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":\
+                         {{\"tools\":[{{\"name\":\"remote_echo\",\"description\":\"fixture\"}}]}}}}\n\n"
                     )
                 } else if body.contains(r#""method":"tools/call""#) {
-                    concat!(
-                        "data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":",
-                        "[{\"type\":\"text\",\"text\":\"server-response\"}]}}\n\n"
+                    format!(
+                        "data: {{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":\
+                         {{\"content\":[{{\"type\":\"text\",\"text\":\"server-response\"}}]}}}}\n\n"
                     )
                 } else {
-                    ""
+                    String::new()
                 };
                 let status = if body.contains(r#""method":"notifications/initialized""#) {
                     "202 Accepted"
@@ -374,7 +538,7 @@ mod tests {
                     "200 OK"
                 };
                 socket
-                    .write_all(http_response(status, response_body).as_bytes())
+                    .write_all(http_response(status, &response_body).as_bytes())
                     .await
                     .expect("the fixture response head can be written");
                 requests.push(body);
@@ -382,13 +546,14 @@ mod tests {
             requests
         });
 
-        let root = tempfile::tempdir().expect("a temporary plugin root is available");
+        let plugin_root = tempfile::tempdir().expect("a temporary plugin root is available");
+        let project_root = tempfile::tempdir().expect("a temporary project root is available");
         let manifest: WasmManifest = serde_json::from_value(json!({
             "type": "wasm",
             "module": "plugin.wasm",
             "apiVersion": crate::plugins::wasm_manifest::API_VERSION,
             "permissions": {
-                "mcpServers": ["fixture"],
+                "processCommands": ["*"],
                 "networkHosts": ["127.0.0.1"],
             }
         }))
@@ -402,40 +567,33 @@ mod tests {
             }
         })
         .to_string();
-        let mcp_servers = serde_json::from_value::<
-            std::collections::BTreeMap<String, crate::plugins::manifest::McpServerConfig>,
-        >(json!({
-            "fixture": {
-                "type": "http",
-                "url": url,
-            }
-        }))
-        .expect("the dynamic MCP declarations are valid");
+        std::fs::write(
+            plugin_root.path().join(".mcp.json"),
+            r#"{"mcpServers":{"wrong":{"url":"http://127.0.0.1:1/wrong"}}}"#,
+        )
+        .expect("the plugin-root decoy configuration is writable");
+        std::fs::write(
+            plugin_root.path().join("plugin.wasm"),
+            include_bytes!("../../plugin-fixtures/mcp-client/plugin.wasm"),
+        )
+        .expect("the MCP component is copied into its plugin root");
+        std::fs::write(project_root.path().join(".mcp.json"), &mcp_json)
+            .expect("the scoped MCP configuration is writable");
         let hub = CapabilityHub::new(
-            root.path().to_path_buf(),
-            root.path().to_path_buf(),
+            project_root.path().to_path_buf(),
+            project_root.path().to_path_buf(),
             manifest.permissions.clone(),
-            mcp_servers,
             Arc::new(crate::harness::services::RegistryToolRuntime::new(
                 Arc::new(ToolRegistry::with_builtins()),
                 Arc::new(RwLock::new(ToolSettings::default())),
             )),
         )
         .expect("raw host");
-        let actor = ComponentActor::load_bytes(
-            include_bytes!("../../plugin-fixtures/mcp-http/plugin.wasm"),
-            root.path().to_path_buf(),
-            manifest,
-            ProviderInputs {
-                mcp_json: Some(mcp_json),
-                ..Default::default()
-            },
-            hub,
-        )
-        .await
-        .expect("the MCP HTTP component implements the harness world");
+        let actor = ComponentActor::load(plugin_root.path().to_path_buf(), manifest, hub)
+            .await
+            .expect("the MCP HTTP component implements the harness world");
 
-        let tools = mcp_tools(actor, "mcp-http-fixture")
+        let tools = tools(actor)
             .await
             .expect("the provider can discover its remote MCP tools");
         assert_eq!(tools.len(), 1, "the fixture exposes one remote MCP tool");
@@ -444,7 +602,7 @@ mod tests {
             .execute(json!({"text":"hello"}), &ToolSettings::default())
             .await
             .expect("the provider can call the remote MCP tool");
-        assert_eq!(output.as_text(), "mcp-wasm-transport");
+        assert_eq!(output.as_text(), "server-response");
 
         let requests = tokio::time::timeout(Duration::from_secs(5), server)
             .await
@@ -452,16 +610,16 @@ mod tests {
             .expect("the fixture server task exits successfully");
         assert_eq!(
             requests.len(),
-            6,
-            "discovery and invocation use six MCP requests"
+            4,
+            "discovery and invocation use one handshake and one request each"
         );
         assert!(
             requests
                 .iter()
                 .filter(|body| body.contains(r#""method":"initialize""#))
                 .count()
-                == 2,
-            "the provider performs an MCP initialize handshake for each operation"
+                == 1,
+            "the provider performs one MCP initialize handshake per server"
         );
         assert!(
             requests
@@ -506,13 +664,14 @@ mod tests {
             "-Command".to_string(),
             script.to_string(),
         ];
-        let root = tempfile::tempdir().expect("a temporary plugin root is available");
+        let plugin_root = tempfile::tempdir().expect("a temporary plugin root is available");
+        let project_root = tempfile::tempdir().expect("a temporary project root is available");
         let manifest: WasmManifest = serde_json::from_value(json!({
             "type": "wasm",
             "module": "plugin.wasm",
             "apiVersion": crate::plugins::wasm_manifest::API_VERSION,
             "permissions": {
-                "mcpServers": ["fixture"],
+                "processCommands": ["powershell.exe"],
             }
         }))
         .expect("the dynamic MCP stdio manifest is valid");
@@ -527,22 +686,22 @@ mod tests {
             }
         })
         .to_string();
-        let mcp_servers = serde_json::from_value::<
-            std::collections::BTreeMap<String, crate::plugins::manifest::McpServerConfig>,
-        >(json!({
-            "fixture": {
-                "type": "stdio",
-                "command": "powershell.exe",
-                "args": args,
-                "env": {},
-            }
-        }))
-        .expect("the dynamic MCP declarations are valid");
+        std::fs::write(
+            plugin_root.path().join(".mcp.json"),
+            r#"{"mcpServers":{"wrong":{"command":"not-the-fixture"}}}"#,
+        )
+        .expect("the plugin-root decoy configuration is writable");
+        std::fs::write(
+            plugin_root.path().join("plugin.wasm"),
+            include_bytes!("../../plugin-fixtures/mcp-client/plugin.wasm"),
+        )
+        .expect("the MCP component is copied into its plugin root");
+        std::fs::write(project_root.path().join(".mcp.json"), &mcp_json)
+            .expect("the scoped MCP configuration is writable");
         let hub = CapabilityHub::new(
-            root.path().to_path_buf(),
-            root.path().to_path_buf(),
+            project_root.path().to_path_buf(),
+            project_root.path().to_path_buf(),
             manifest.permissions.clone(),
-            mcp_servers,
             Arc::new(crate::harness::services::RegistryToolRuntime::new(
                 Arc::new(ToolRegistry::with_builtins()),
                 Arc::new(RwLock::new(ToolSettings::default())),
@@ -579,20 +738,11 @@ mod tests {
             "the declared process must answer the raw JSON-RPC line"
         );
         raw_process_hub.process_close(raw_handle).await;
-        let actor = ComponentActor::load_bytes(
-            include_bytes!("../../plugin-fixtures/mcp-http/plugin.wasm"),
-            root.path().to_path_buf(),
-            manifest,
-            ProviderInputs {
-                mcp_json: Some(mcp_json),
-                ..Default::default()
-            },
-            hub,
-        )
-        .await
-        .expect("the MCP stdio component implements the harness world");
+        let actor = ComponentActor::load(plugin_root.path().to_path_buf(), manifest, hub)
+            .await
+            .expect("the MCP stdio component implements the harness world");
 
-        let tools = mcp_tools(actor.clone(), "mcp-stdio-fixture")
+        let tools = tools(actor.clone())
             .await
             .expect("the provider can discover its stdio MCP tools");
         assert_eq!(tools.len(), 1, "the stdio fixture exposes one remote tool");
@@ -601,22 +751,75 @@ mod tests {
             .execute(json!({"text":"hello"}), &ToolSettings::default())
             .await
             .expect("the provider can call the stdio MCP tool");
-        assert_eq!(output.as_text(), "mcp-wasm-transport");
+        assert_eq!(output.as_text(), "server-response");
 
         actor.shutdown();
     }
 
     #[test]
-    fn component_outputs_cannot_fabricate_host_owned_resources() {
+    fn component_outputs_can_return_images() {
         let output = serde_json::json!({
             "content": [{
                 "type": "image",
-                "image": {"id": "forged", "path": "outside"}
+                "image": {
+                    "id": "plugin-owned",
+                    "mediaType": "image/png",
+                    "bytes": 12,
+                    "width": 2,
+                    "height": 2
+                }
             }],
             "isError": false
         });
-        let error = decode_tool_output(&output.to_string()).expect_err("guest images are denied");
-        assert_eq!(error.code, code::PLUGIN_INVALID_OUTPUT);
+        let decoded = decode_tool_output(&output.to_string())
+            .expect("plugin image output is allowed by the component protocol");
+        assert_eq!(decoded.images()[0].id, "plugin-owned");
+    }
+
+    #[test]
+    fn component_outputs_preserve_host_patch_hunks() {
+        let output = serde_json::json!({
+            "content": [{"type": "text", "text": "Applied 1 patch operation"}],
+            "isError": false,
+            "hunks": [{"path": "src/main.rs", "lines": [7, null, 8]}]
+        });
+        let decoded = decode_tool_output(&output.to_string())
+            .expect("host apply_patch metadata is valid component output");
+        assert_eq!(decoded.hunks.len(), 1);
+        assert_eq!(decoded.hunks[0].path, "src/main.rs");
+        assert_eq!(decoded.hunks[0].lines, vec![Some(7), None, Some(8)]);
+    }
+
+    #[test]
+    fn component_outputs_can_return_patch_hunks() {
+        let output = serde_json::json!({
+            "content": [{"type": "text", "text": "done"}],
+            "isError": false,
+            "hunks": [{"path": "src/main.rs", "lines": [7]}]
+        });
+        let decoded = decode_tool_output(&output.to_string())
+            .expect("plugin patch metadata is allowed by the component protocol");
+        assert_eq!(decoded.hunks[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn bundled_provider_outputs_can_preserve_host_images() {
+        let output = serde_json::json!({
+            "content": [{
+                "type": "image",
+                "image": {
+                    "id": "host-owned",
+                    "mediaType": "image/png",
+                    "bytes": 12,
+                    "width": 2,
+                    "height": 2
+                }
+            }],
+            "isError": false
+        });
+        let decoded = decode_tool_output(&output.to_string())
+            .expect("a component can return an image reference");
+        assert_eq!(decoded.images()[0].id, "host-owned");
     }
 
     #[test]
