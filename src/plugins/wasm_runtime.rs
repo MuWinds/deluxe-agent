@@ -289,8 +289,8 @@ impl bindings::deluxe::harness::host::HostWithStore for HostState {
 pub enum Operation {
     ListTools,
     Execute { name: String, arguments: String },
-    ListHooks,
-    InvokeHook { id: String, event: String },
+    ListEventHandlers,
+    HandleEvent { id: String, event: String },
     Open(String),
     Action(String),
     Close(String),
@@ -499,12 +499,12 @@ async fn call((store, bindings, instance): &mut Instance, operation: Operation) 
             Operation::Execute { name, arguments } => {
                 plugin.call_execute_tool(accessor, name, arguments).await
             }
-            Operation::ListHooks => plugin
-                .call_list_hooks(accessor)
+            Operation::ListEventHandlers => plugin
+                .call_list_event_handlers(accessor)
                 .await
                 .map(Ok::<String, String>),
-            Operation::InvokeHook { id, event } => {
-                plugin.call_invoke_hook(accessor, id, event).await
+            Operation::HandleEvent { id, event } => {
+                plugin.call_handle_event(accessor, id, event).await
             }
             Operation::Open(request) => plugin.call_open_surface(accessor, request).await,
             Operation::Action(action) => plugin.call_handle_action(accessor, action).await,

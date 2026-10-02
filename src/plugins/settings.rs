@@ -21,7 +21,7 @@
 //!
 //! This file is the *only* place the load decision is made. In particular the
 //! decision is never read from a repository: a cloned repo can ship plugin
-//! *definitions* in `<repo>/.agents/plugins/`. Executable behavior is still
+//! *definitions* in `<repo>/.deluxe-agents/plugins/`. Executable behavior is still
 //! isolated behind the Wasm manifest and explicit capability permissions, so
 //! listing an id here is the act of trust and can only be performed by the
 //! person who owns this config.

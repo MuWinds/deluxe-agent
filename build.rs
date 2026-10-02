@@ -60,9 +60,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .get("runtime")
             .and_then(Value::as_object)
             .ok_or_else(|| format!("bundled plugin `{name}` has no runtime object"))?;
-        if runtime.get("type").and_then(Value::as_str) != Some("wasm")
-            || runtime.get("module").and_then(Value::as_str) != Some("plugin.wasm")
-        {
+        if runtime.get("module").and_then(Value::as_str) != Some("plugin.wasm") {
             return Err(format!(
                 "bundled plugin `{name}` must declare a Wasmtime runtime using `plugin.wasm`"
             )

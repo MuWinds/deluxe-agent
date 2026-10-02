@@ -23,7 +23,7 @@
 需要配置时，通过通用 `read-plugin-file` 请求宿主读取当前 global/project
 configuration root 下的 `.hooks.json` 或 `.mcp.json`；宿主不在 discovery 阶段
 读取或解析这些文件。project configuration root 是当前 project root；global
-configuration root 是插件配置目录 `~/.agents`，**不是整个 home 目录**——把全局
+configuration root 是插件配置目录 `~/.deluxe-agents`，**不是整个 home 目录**——把全局
 root 绑到 home 会把 `.ssh`、`.aws`、API key 等与插件无关的文件一并暴露给通用
 读取能力。configuration root 也不是 `plugin.wasm` 所在的插件包目录。
 
@@ -189,7 +189,7 @@ ports
   ├── LlmProvider
   ├── ToolRuntime
   ├── PromptProvider
-  ├── HookRuntime
+  ├── PluginEventRuntime
   ├── JobRuntime
   ├── SubagentRunner
   ├── SessionStore
@@ -486,33 +486,32 @@ project context
 
 拆出 PromptProvider 后，排序和 prompt 文本要有快照测试。
 
-### 5.4 `HookRuntime`
+### 5.4 `PluginEventRuntime`
 
 ```rust
 #[async_trait::async_trait]
-pub trait HookRuntime: Send + Sync {
-    async fn after_tool(
+pub trait PluginEventRuntime: Send + Sync {
+    async fn dispatch(
         &self,
-        event: &ToolFinished,
-        context: &HookContext,
+        event: &PluginEvent,
         cancel: &CancellationToken,
-    ) -> Result<HookResult>;
+    ) -> Result<String>;
 }
 ```
 
-`HookRuntime` 不能依赖 GUI `Event`。hook 声明、匹配语义和 hook 执行全部由
-Hooks Component export；宿主只负责调用 Component、传递 tool event、限制输出并处理
-取消。
+`PluginEventRuntime` 不能依赖 GUI `Event`。事件订阅、匹配语义和执行全部由
+Component export（`list-event-handlers`/`handle-event`）；宿主只负责调用
+Component、传递事件、限制输出并处理取消。
 
-hook 行为不变：
+行为不变：
 
 - refused call 不触发；
 - 顺序执行；
 - 输出追加到 tool result；
-- hook 失败作为 tool result 的可见错误；
-- hook 如需执行命令，必须调用 provider 被授予的 `invoke-tool` 或 raw process
+- 处理器失败作为 tool result 的可见错误；
+- 处理器如需执行命令，必须调用 provider 被授予的 `invoke-tool` 或 raw process
   capability；
-- hook 继承 host timeout 和 destructive command guard。
+- 继承 host timeout 和 destructive command guard。
 
 ### 5.5 `JobRuntime`
 
@@ -561,7 +560,7 @@ pub struct AgentServices {
     pub llm: Arc<dyn LlmProvider>,
     pub tools: Arc<dyn ToolRuntime>,
     pub prompts: Arc<dyn PromptProvider>,
-    pub hooks: Arc<dyn HookRuntime>,
+    pub events: Arc<dyn PluginEventRuntime>,
     pub jobs: Arc<dyn JobRuntime>,
     pub context: Arc<dyn ContextPolicy>,
 }
@@ -1189,8 +1188,8 @@ section id
 
 ```text
 WasmComponent
-  -> generic tool/hook exports
-  -> ToolRuntime / HookRuntime adapters
+  -> generic tool/event exports
+  -> ToolRuntime / PluginEventRuntime adapters
   -> Agent
 ```
 
@@ -1308,9 +1307,9 @@ Move prompt and hook assembly into runtime services
 内容：
 
 - PromptPipeline；
-- HookRuntime；
+- PluginEventRuntime；
 - prompt snapshot；
-- hook integration tests。
+- event handler integration tests。
 
 ### Commit 7
 

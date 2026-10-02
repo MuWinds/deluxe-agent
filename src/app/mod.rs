@@ -2700,9 +2700,10 @@ mod tests {
     /// A catalogue holding one plugin that ships one slash command.
     ///
     /// The plugin tree is written under `scope_root` — the directory that
-    /// *contains* `.agents` — because that is what decides the plugin's scope: a
-    /// fake home makes it global, a project makes it project-scoped. Which
-    /// enable list names it is what actually loads it, so `project` picks both.
+    /// *contains* `.deluxe-agents` — because that is what decides the plugin's
+    /// scope: a fake home makes it global, a project makes it project-scoped.
+    /// Which enable list names it is what actually loads it, so `project` picks
+    /// both.
     ///
     /// Built by running discovery rather than assembling a `PluginCatalogue` by
     /// hand, so the test takes the path the app takes, including the
@@ -2712,7 +2713,7 @@ mod tests {
         home: &Path,
         project: Option<&Path>,
     ) -> Arc<PluginCatalogue> {
-        let marketplace = scope_root.join(".agents").join("plugins");
+        let marketplace = scope_root.join(crate::plugins::HOME_DIR).join("plugins");
         std::fs::create_dir_all(&marketplace).unwrap();
         std::fs::write(
             marketplace.join("marketplace.json"),
@@ -2721,13 +2722,13 @@ mod tests {
         )
         .unwrap();
 
-        // `source.path` resolves against the directory *containing* `.agents`.
+        // `source.path` resolves against the directory *containing* `.deluxe-agents`.
         let plugin = scope_root.join("plugins").join("thing");
         std::fs::create_dir_all(plugin.join("commands")).unwrap();
         std::fs::write(
             plugin.join("plugin.json"),
             r#"{"name":"thing","version":"1.0.0","runtime":{
-                "type":"wasm","module":"plugin.wasm",
+                "module":"plugin.wasm",
                 "apiVersion":"deluxe.harness/plugin@0.1"}}"#,
         )
         .unwrap();
@@ -2872,7 +2873,7 @@ mod tests {
     /// want the deletable case put a copy in the cache instead.
     fn plugin_fixture() -> (tempfile::TempDir, crate::config::Config) {
         let home = tempfile::tempdir().unwrap();
-        let marketplace = home.path().join(".agents").join("plugins");
+        let marketplace = home.path().join(crate::plugins::HOME_DIR).join("plugins");
         std::fs::create_dir_all(&marketplace).unwrap();
         std::fs::write(
             marketplace.join("marketplace.json"),
@@ -2886,7 +2887,7 @@ mod tests {
         std::fs::write(
             plugin.join("plugin.json"),
             r#"{"name":"thing","version":"1.0.0","description":"The thing.",
-                "runtime":{"type":"wasm","module":"plugin.wasm",
+                "runtime":{"module":"plugin.wasm",
                 "apiVersion":"deluxe.harness/plugin@0.1"}}"#,
         )
         .unwrap();
@@ -2976,14 +2977,14 @@ mod tests {
 
     #[test]
     fn uninstalling_a_cached_plugin_deletes_its_files_and_switches_it_off() {
-        // The cache is the one copy this agent may remove: Codex populated it.
+        // The cache is the one copy this agent may remove: an install populated it.
         let home = tempfile::tempdir().unwrap();
-        let cached = home.path().join(".codex/plugins/cache/test/thing/1.0.0");
+        let cached = crate::plugins::plugin_cache_root(home.path()).join("test/thing/1.0.0");
         std::fs::create_dir_all(&cached).unwrap();
         std::fs::write(
             cached.join("plugin.json"),
             r#"{"name":"thing","version":"1.0.0","runtime":{
-                "type":"wasm","module":"plugin.wasm",
+                "module":"plugin.wasm",
                 "apiVersion":"deluxe.harness/plugin@0.1"}}"#,
         )
         .unwrap();

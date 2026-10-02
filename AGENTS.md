@@ -61,7 +61,7 @@ cargo clippy --all-targets -- -D warnings
   std::env::set_var(crate::config::CONFIG_DIR_ENV, config_dir.path());
   ```
 
-  同理，不要读写真实的 `~/.agents`、`~/.codex` 或系统 keyring。
+  同理，不要读写真实的 `~/.deluxe-agents` 或系统 keyring。
 - **不依赖网络**。`agent_loop_tests.rs` 用 `FakeServer` 绑定 `127.0.0.1:0` 并返回
   预设的 SSE 片段；新写这类测试照抄该模式，不要打真实模型接口。
 - 需要文件系统时用 `tempfile`（已在 `[dev-dependencies]`），不要往仓库里落临时文件。
@@ -282,7 +282,7 @@ mod tests {
 - 行为变更要在同一提交里补上或更新对应测试。
 - `main` 始终可构建；功能分支用 `feat/`、`fix/`、`chore/`、`docs/` 前缀。
 - 推送前本地跑：`cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`。
-- 不提交密钥、keyring 内容或用户配置（`~/.agents`、本机 config 目录）。
+- 不提交密钥、keyring 内容或用户配置（`~/.deluxe-agents`、本机 config 目录）。
 
 ---
 

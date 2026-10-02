@@ -154,7 +154,7 @@ mod tests {
 
     fn fixture_manifest() -> WasmManifest {
         let manifest: crate::plugins::PluginManifest =
-            serde_json::from_str(include_str!("../../plugin-fixtures/echo-tool/plugin.json"))
+            serde_json::from_str(include_str!("../../plugin-src/echo-tool/plugin.json"))
                 .expect("the checked-in fixture manifest is valid");
         manifest
             .wasm_runtime()
@@ -223,7 +223,7 @@ mod tests {
         let root = tempfile::tempdir().expect("a temporary plugin root is available");
         std::fs::write(
             root.path().join("plugin.wasm"),
-            include_bytes!("../../plugin-fixtures/echo-tool/plugin.wasm"),
+            include_bytes!("../../plugin-src/echo-tool/plugin.wasm"),
         )
         .expect("the fixture component is copied");
 
@@ -285,7 +285,7 @@ mod tests {
         let plugin_root = tempfile::tempdir().expect("a temporary plugin root is available");
         let project_root = tempfile::tempdir().expect("a temporary project root is available");
         let manifest = serde_json::from_str::<crate::plugins::PluginManifest>(include_str!(
-            "../../plugin-fixtures/hooks-provider/plugin.json"
+            "../../plugin-src/hooks-provider/plugin.json"
         ))
         .expect("the checked-in Hooks manifest is valid")
         .wasm_runtime()
@@ -297,7 +297,7 @@ mod tests {
         .expect("the plugin-root decoy configuration is writable");
         std::fs::write(
             plugin_root.path().join("plugin.wasm"),
-            include_bytes!("../../plugin-fixtures/hooks-provider/plugin.wasm"),
+            include_bytes!("../../plugin-src/hooks-provider/plugin.wasm"),
         )
         .expect("the Hooks component is copied into its plugin root");
         std::fs::write(
@@ -333,14 +333,19 @@ mod tests {
             .await
             .expect("the Hooks provider implements the harness world");
 
-        let hooks = actor
-            .call(Operation::ListHooks)
+        let handlers = actor
+            .call(Operation::ListEventHandlers)
             .await
-            .expect("the Hooks provider lists its configured hooks");
-        let hooks: serde_json::Value = serde_json::from_str(&hooks).expect("the hook list is JSON");
+            .expect("the Hooks provider lists its configured handlers");
+        let handlers: serde_json::Value =
+            serde_json::from_str(&handlers).expect("the handler list is JSON");
         assert_eq!(
-            hooks[0]["label"], "echo hooks-provider-ran",
+            handlers[0]["label"], "echo hooks-provider-ran",
             "the Hooks Component reads the project configuration, not the plugin directory"
+        );
+        assert_eq!(
+            handlers[0]["events"][0], "tool.finished",
+            "the handler subscribes to the generic tool-finished event"
         );
         actor.shutdown();
     }
@@ -711,7 +716,6 @@ mod tests {
         let plugin_root = tempfile::tempdir().expect("a temporary plugin root is available");
         let project_root = tempfile::tempdir().expect("a temporary project root is available");
         let manifest: WasmManifest = serde_json::from_value(json!({
-            "type": "wasm",
             "module": "plugin.wasm",
             "apiVersion": crate::plugins::wasm_manifest::API_VERSION,
             "permissions": {
@@ -736,7 +740,7 @@ mod tests {
         .expect("the plugin-root decoy configuration is writable");
         std::fs::write(
             plugin_root.path().join("plugin.wasm"),
-            include_bytes!("../../plugin-fixtures/mcp-client/plugin.wasm"),
+            include_bytes!("../../plugin-src/mcp-client/plugin.wasm"),
         )
         .expect("the MCP component is copied into its plugin root");
         std::fs::write(project_root.path().join(".mcp.json"), &mcp_json)
@@ -829,7 +833,6 @@ mod tests {
         let plugin_root = tempfile::tempdir().expect("a temporary plugin root is available");
         let project_root = tempfile::tempdir().expect("a temporary project root is available");
         let manifest: WasmManifest = serde_json::from_value(json!({
-            "type": "wasm",
             "module": "plugin.wasm",
             "apiVersion": crate::plugins::wasm_manifest::API_VERSION,
             "permissions": {
@@ -855,7 +858,7 @@ mod tests {
         .expect("the plugin-root decoy configuration is writable");
         std::fs::write(
             plugin_root.path().join("plugin.wasm"),
-            include_bytes!("../../plugin-fixtures/mcp-client/plugin.wasm"),
+            include_bytes!("../../plugin-src/mcp-client/plugin.wasm"),
         )
         .expect("the MCP component is copied into its plugin root");
         std::fs::write(project_root.path().join(".mcp.json"), &mcp_json)

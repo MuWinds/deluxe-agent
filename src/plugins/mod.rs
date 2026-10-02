@@ -2,9 +2,9 @@
 //!
 //! Wasmtime plugin discovery, scope resolution, and lifecycle metadata.
 //!
-//! Every loaded plugin must declare a Wasmtime component. Hooks and MCP are
-//! implemented by Components using the same generic ABI; no non-Wasm plugin
-//! path is retained.
+//! Every loaded plugin must declare a Wasmtime component. Tools, plugin events,
+//! and UI surfaces are implemented by Components using the same generic ABI; no
+//! non-Wasm plugin path is retained.
 pub mod agents;
 pub mod capabilities;
 pub mod commands;
@@ -80,17 +80,45 @@ impl Scope {
     }
 }
 
+/// The directory under the user's home that holds this agent's plugin
+/// configuration, marketplaces, and plugin cache.
+///
+/// Named for this agent rather than Codex: the build does not read Codex's
+/// `~/.agents` or `~/.codex` trees.
+pub const HOME_DIR: &str = ".deluxe-agents";
+
+/// `home`'s [`HOME_DIR`], the root the plugin layout is anchored at.
+pub fn home_root(home: &Path) -> PathBuf {
+    home.join(HOME_DIR)
+}
+
 /// The directory a [`Scope::Global`] Component's generic file capability is
 /// bound to, resolved from the user's home directory.
 ///
 /// Deliberately a plugin configuration directory rather than the home itself:
 /// a `read-plugin-file` capability rooted at `~` would hand any global plugin
 /// `~/.ssh/id_rsa`, `~/.aws/credentials`, or a stray key file — none of which
-/// is plugin configuration. `.agents` is the same layer the personal
-/// marketplace already lives in (`~/.agents/plugins/marketplace.json`), so a
-/// global `.mcp.json` or `.hooks.json` sits beside it.
+/// is plugin configuration. The personal marketplace and the plugin cache live
+/// under it too, so a global `.mcp.json` or `.hooks.json` sits beside them.
 pub fn global_configuration_root(home: &Path) -> PathBuf {
-    home.join(".agents")
+    home_root(home)
+}
+
+/// The managed plugin cache: `<home>/.deluxe-agents/plugins/cache`.
+pub fn plugin_cache_root(home: &Path) -> PathBuf {
+    home_root(home).join("plugins").join("cache")
+}
+
+/// The root scanned for marketplaces bundled with this build:
+/// `<home>/.deluxe-agents/bundled-marketplaces`.
+pub fn bundled_marketplaces_root(home: &Path) -> PathBuf {
+    home_root(home).join("bundled-marketplaces")
+}
+
+/// The `marketplace.json` under `root`, at the layout [`manifest::marketplace_root`]
+/// understands: `<root>/.deluxe-agents/plugins/marketplace.json`.
+pub fn marketplace_path(root: &Path) -> PathBuf {
+    root.join(HOME_DIR).join("plugins").join("marketplace.json")
 }
 
 /// One plugin that loaded successfully.
@@ -209,7 +237,7 @@ impl PluginCatalogue {
     }
 
     /// The global plugins alone: the personal marketplace's, and the ones
-    /// bundled with Codex.
+    /// bundled with this build.
     ///
     /// Distinct from [`all`](Self::all) because the two answer different
     /// questions. "What is installed for every project" is what the plugins
@@ -281,7 +309,7 @@ struct Marketplace {
 ///
 /// `home` is passed in rather than looked up so tests can point it at a temp
 /// directory. It cannot come from `DELUXE_AGENT_CONFIG_DIR`, which redirects
-/// this agent's own config but not `~/.agents` or `~/.codex` — using it here
+/// this agent's own config but not the plugin home directory — using it here
 /// would let a test read, and a stray write destroy, the real installation.
 ///
 /// Never fails: see the module docs.
@@ -455,9 +483,8 @@ fn resolve(
             }
         }
 
-        // Otherwise fall back to what Codex installed. This is the only arm that
-        // can satisfy `openai-curated`, whose marketplace file is built into
-        // Codex and exists nowhere on disk.
+        // Otherwise fall back to the managed cache, which holds the copy an
+        // install placed there when the marketplace's local source is absent.
         if let Some(root) = cached_root(home, marketplace_name, plugin_name) {
             return load_from(&root, id, scope_for(project));
         }
@@ -531,19 +558,14 @@ fn load_from(root: &Path, id: &str, scope: Scope) -> Option<LoadedPlugin> {
     })
 }
 
-/// The installed copy Codex keeps, if there is one.
+/// The installed copy the managed cache holds, if there is one.
 ///
 /// A plugin can have several versions cached side by side. The last one in
 /// sorted order wins: version strings like `26.616.51431` sort correctly, and
 /// the hash-shaped ones a vendored plugin uses have only one entry, so the rule
 /// is at worst arbitrary rather than wrong.
 fn cached_root(home: &Path, marketplace: &str, plugin: &str) -> Option<PathBuf> {
-    let dir = home
-        .join(".codex")
-        .join("plugins")
-        .join("cache")
-        .join(marketplace)
-        .join(plugin);
+    let dir = plugin_cache_root(home).join(marketplace).join(plugin);
 
     let mut versions: Vec<PathBuf> = std::fs::read_dir(&dir)
         .ok()?
@@ -563,17 +585,11 @@ fn cached_root(home: &Path, marketplace: &str, plugin: &str) -> Option<PathBuf> 
 fn read_marketplaces(home: &Path, projects: &[PathBuf]) -> Vec<Marketplace> {
     let mut found = Vec::new();
 
-    // The personal marketplace, and the ones shipped with Codex: both global.
-    push_marketplace(
-        &mut found,
-        &home
-            .join(".agents")
-            .join("plugins")
-            .join("marketplace.json"),
-        Scope::Global,
-    );
+    // The personal marketplace, and the ones shipped with this build: both
+    // global.
+    push_marketplace(&mut found, &marketplace_path(home), Scope::Global);
 
-    let bundled = home.join(".codex").join("bundled-marketplaces");
+    let bundled = bundled_marketplaces_root(home);
     let mut bundles: Vec<PathBuf> = std::fs::read_dir(&bundled)
         .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
         .unwrap_or_default();
@@ -581,14 +597,7 @@ fn read_marketplaces(home: &Path, projects: &[PathBuf]) -> Vec<Marketplace> {
     // the system prompt does not churn between runs.
     bundles.sort();
     for bundle in bundles {
-        push_marketplace(
-            &mut found,
-            &bundle
-                .join(".agents")
-                .join("plugins")
-                .join("marketplace.json"),
-            Scope::Global,
-        );
+        push_marketplace(&mut found, &marketplace_path(&bundle), Scope::Global);
     }
 
     // Each project's own marketplace, scoped to that project.
@@ -599,10 +608,7 @@ fn read_marketplaces(home: &Path, projects: &[PathBuf]) -> Vec<Marketplace> {
         }
         push_marketplace(
             &mut found,
-            &project
-                .join(".agents")
-                .join("plugins")
-                .join("marketplace.json"),
+            &marketplace_path(project),
             Scope::Project(project.clone()),
         );
     }
@@ -631,7 +637,7 @@ fn push_marketplace(found: &mut Vec<Marketplace>, path: &Path, scope: Scope) {
     let Some(root) = manifest::marketplace_root(path) else {
         tracing::warn!(
             path = %path.display(),
-            "a marketplace must live at <root>/.agents/plugins/marketplace.json; skipping"
+            "a marketplace must live at <root>/.deluxe-agents/plugins/marketplace.json; skipping"
         );
         return;
     };
@@ -693,7 +699,7 @@ mod tests {
             root.join(manifest::MANIFEST_FILE),
             format!(
                 r#"{{"name":"{name}","version":"1.0.0","description":"The {name} plugin.",
-                     "runtime":{{"type":"wasm","module":"plugin.wasm",
+                     "runtime":{{"module":"plugin.wasm",
                      "apiVersion":"deluxe.harness/plugin@0.1"}},
                      "interface":{{"displayName":"{name}","shortDescription":"Does {name} things"}}}}"#
             ),
@@ -713,7 +719,7 @@ mod tests {
 
     /// Writes a marketplace file at the standard location under `root`.
     fn write_marketplace(root: &Path, name: &str, entries: &[(&str, &str)]) {
-        let dir = root.join(".agents").join("plugins");
+        let dir = root.join(HOME_DIR).join("plugins");
         fs::create_dir_all(&dir).unwrap();
         let plugins: Vec<String> = entries
             .iter()
@@ -756,9 +762,7 @@ mod tests {
         );
 
         // Bundled (global): `computer-use`.
-        let bundle = home
-            .path()
-            .join(".codex/bundled-marketplaces/openai-bundled");
+        let bundle = bundled_marketplaces_root(home.path()).join("openai-bundled");
         write_marketplace(
             &bundle,
             "openai-bundled",
@@ -941,7 +945,6 @@ mod tests {
             r#"{
               "name": "wasm-echo",
               "runtime": {
-                "type": "wasm",
                 "module": "plugin.wasm",
                 "apiVersion": "deluxe.harness/plugin@0.1"
               }
@@ -1143,13 +1146,11 @@ mod tests {
 
     #[test]
     fn a_plugin_is_read_from_the_cache_when_no_marketplace_offers_it() {
-        // `openai-curated` is built into Codex: its marketplace file exists
-        // nowhere on disk, so the cache is the only source.
+        // The cache can hold a plugin whose marketplace this agent cannot see,
+        // so the cache is the only source that can satisfy the id.
         let home = tempfile::tempdir().unwrap();
         write_plugin(
-            &home
-                .path()
-                .join(".codex/plugins/cache/openai-curated/figma/1dc19589"),
+            &plugin_cache_root(home.path()).join("openai-curated/figma/1dc19589"),
             "figma",
             Some("figma-use"),
         );
@@ -1170,9 +1171,7 @@ mod tests {
     #[test]
     fn the_newest_cached_version_wins() {
         let home = tempfile::tempdir().unwrap();
-        let cache = home
-            .path()
-            .join(".codex/plugins/cache/openai-bundled/computer-use");
+        let cache = plugin_cache_root(home.path()).join("openai-bundled/computer-use");
         write_plugin(&cache.join("26.616.51431"), "computer-use", None);
         write_plugin(&cache.join("27.1.1"), "computer-use", None);
 
@@ -1194,10 +1193,7 @@ mod tests {
         let fixture = fixture();
         // A cached copy of the same plugin, which the working copy must beat.
         write_plugin(
-            &fixture
-                .home
-                .path()
-                .join(".codex/plugins/cache/personal/figma/9.9.9"),
+            &plugin_cache_root(fixture.home.path()).join("personal/figma/9.9.9"),
             "figma",
             None,
         );
@@ -1219,7 +1215,7 @@ mod tests {
     #[test]
     fn an_entry_the_marketplace_withholds_does_not_load_even_if_cached() {
         let home = tempfile::tempdir().unwrap();
-        let dir = home.path().join(".agents/plugins");
+        let dir = home.path().join(HOME_DIR).join("plugins");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("marketplace.json"),
@@ -1229,9 +1225,7 @@ mod tests {
         )
         .unwrap();
         write_plugin(
-            &home
-                .path()
-                .join(".codex/plugins/cache/personal/withdrawn/1.0.0"),
+            &plugin_cache_root(home.path()).join("personal/withdrawn/1.0.0"),
             "withdrawn",
             None,
         );
@@ -1471,11 +1465,9 @@ mod tests {
 
     #[test]
     fn a_plugin_without_a_wasmtime_runtime_is_not_loaded() {
-        // Not a fixture: the plugin Codex actually cached, so the shapes the
-        // unit tests encode are the shapes that ship, and the wiring from a
-        // plugin root to `LoadedPlugin` is exercised end to end. Skipped where
-        // figma is absent, so the suite still passes on a machine that has
-        // never run Codex.
+        // A plugin root with no Wasmtime runtime exercises the wiring from a
+        // root to `LoadedPlugin` end to end; only Component plugins belong in
+        // the catalogue.
         let fixture = fixture();
         let root = fixture.home.path().join("plugins/no-runtime");
         fs::create_dir_all(&root).unwrap();
@@ -1504,15 +1496,15 @@ mod tests {
     }
 
     #[test]
-    fn the_global_configuration_root_is_the_agents_directory_not_the_home() {
+    fn the_global_configuration_root_is_the_deluxe_agents_directory_not_the_home() {
         // The whole point of the indirection: a global Component's generic file
         // capability must not be bound to `~`, where it could read `~/.ssh` or a
-        // key file. `~/.agents` is plugin configuration, the same layer the
-        // personal marketplace lives in.
+        // key file. `~/.deluxe-agents` is plugin configuration, the same layer
+        // the personal marketplace lives in.
         let home = Path::new("/home/someone");
         assert_eq!(
             global_configuration_root(home),
-            PathBuf::from("/home/someone/.agents")
+            PathBuf::from("/home/someone/.deluxe-agents")
         );
         assert_ne!(global_configuration_root(home), home.to_path_buf());
     }

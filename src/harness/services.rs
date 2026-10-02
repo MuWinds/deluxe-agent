@@ -18,8 +18,8 @@ use crate::tools::jobs::{JobRegistry, JobSnapshot};
 use crate::tools::{validate_arguments, ToolDescriptor, ToolRegistry, ToolSettings};
 
 use super::ports::{
-    ConfigStore, ContextCompactor, HookContext, HookRuntime, InstalledPlugin, JobFactory,
-    JobRuntime, LlmProvider, LlmStreamEvent, LlmStreamSink, PluginManager, PromptProvider,
+    ConfigStore, ContextCompactor, InstalledPlugin, JobFactory, JobRuntime, LlmProvider,
+    LlmStreamEvent, LlmStreamSink, PluginEvent, PluginEventRuntime, PluginManager, PromptProvider,
     SecretStore, ToolContext, ToolExecution, ToolRuntime,
 };
 use super::types::AuditOutcome;
@@ -254,7 +254,7 @@ impl PluginManager for NativePluginManager {
 
 impl NativePluginManager {
     fn cache_root(&self) -> PathBuf {
-        self.home.join(".codex").join("plugins").join("cache")
+        plugins::plugin_cache_root(&self.home)
     }
 }
 
@@ -271,10 +271,7 @@ fn ensure_bundled_defaults(home: &Path, mut settings: PluginSettings) -> Result<
             continue;
         }
 
-        let target = home
-            .join(".codex")
-            .join("plugins")
-            .join("cache")
+        let target = plugins::plugin_cache_root(home)
             .join(plugins::defaults::MARKETPLACE)
             .join(package.name)
             .join(package.version);
@@ -390,7 +387,7 @@ fn install_local_plugin(home: &Path, selected_component: &Path) -> Result<Instal
         ));
     }
 
-    let cache = home.join(".codex").join("plugins").join("cache");
+    let cache = plugins::plugin_cache_root(home);
     let target = cache
         .join(LOCAL_MARKETPLACE)
         .join(&manifest.name)
@@ -606,18 +603,12 @@ impl ToolRuntime for RegistryToolRuntime {
     }
 }
 
-struct EmptyHookRuntime;
+struct EmptyPluginEventRuntime;
 
 #[async_trait]
-impl HookRuntime for EmptyHookRuntime {
-    async fn after_tool(
-        &self,
-        _tool: &str,
-        _output: &mut String,
-        _context: &HookContext,
-        _cancel: &CancellationToken,
-    ) -> Result<()> {
-        Ok(())
+impl PluginEventRuntime for EmptyPluginEventRuntime {
+    async fn dispatch(&self, _event: &PluginEvent, _cancel: &CancellationToken) -> Result<String> {
+        Ok(String::new())
     }
 }
 
@@ -633,13 +624,13 @@ pub fn native_services(
     let tools: Arc<dyn ToolRuntime> = native_tools.clone();
     let jobs: Arc<dyn JobRuntime> = Arc::new(NativeJobRuntime::new(registry.jobs().clone()));
     let context: Arc<dyn ContextCompactor> = Arc::new(NativeContextCompactor::new(llm.clone()));
-    let hooks: Arc<dyn HookRuntime> = Arc::new(EmptyHookRuntime);
+    let events: Arc<dyn PluginEventRuntime> = Arc::new(EmptyPluginEventRuntime);
     super::ports::AgentServices {
         llm,
         tools,
         context,
         prompts,
-        hooks,
+        events,
         jobs,
     }
 }
@@ -678,12 +669,12 @@ mod tests {
     #[tokio::test]
     async fn native_plugin_manager_only_deletes_cached_plugin_copies() {
         let home = tempfile::tempdir().expect("a temp directory is available");
-        let cached = home.path().join(".codex/plugins/cache/test/thing/1.0.0");
+        let cached = plugins::plugin_cache_root(home.path()).join("test/thing/1.0.0");
         fs::create_dir_all(&cached).expect("the cached plugin directory is writable");
         fs::write(
             cached.join("plugin.json"),
             r#"{"name":"thing","version":"1.0.0","runtime":{
-                "type":"wasm","module":"plugin.wasm",
+                "module":"plugin.wasm",
                 "apiVersion":"deluxe.harness/plugin@0.1"}}"#,
         )
         .expect("the manifest is written");
@@ -697,7 +688,7 @@ mod tests {
             .await
             .expect("the cached plugin is removed");
 
-        assert!(!cached.exists(), "the Codex cache copy is deleted");
+        assert!(!cached.exists(), "the cache copy is deleted");
     }
 
     #[tokio::test]
@@ -711,9 +702,8 @@ mod tests {
             .expect("bundled defaults are installed");
         for name in ["hooks", "mcp"] {
             let id = format!("{name}@deluxe-defaults");
-            let root = home
-                .path()
-                .join(".codex/plugins/cache/deluxe-defaults")
+            let root = plugins::plugin_cache_root(home.path())
+                .join("deluxe-defaults")
                 .join(name)
                 .join("0.1.0");
 
@@ -752,9 +742,7 @@ mod tests {
             .ensure_bundled_defaults(PluginSettings::default())
             .await
             .expect("the bundled provider is installed");
-        let root = home
-            .path()
-            .join(".codex/plugins/cache/deluxe-defaults/mcp/0.1.0");
+        let root = plugins::plugin_cache_root(home.path()).join("deluxe-defaults/mcp/0.1.0");
         let component = fs::read(root.join("plugin.wasm")).expect("the component is readable");
         fs::write(root.join("user-note.txt"), b"keep this file")
             .expect("an unrelated cache file is writable");
@@ -792,9 +780,7 @@ mod tests {
             .ensure_bundled_defaults(PluginSettings::default())
             .await
             .expect("the bundled defaults are installed");
-        let root = home
-            .path()
-            .join(".codex/plugins/cache/deluxe-defaults/mcp/0.1.0");
+        let root = plugins::plugin_cache_root(home.path()).join("deluxe-defaults/mcp/0.1.0");
         fs::write(
             root.join("plugin.wasm"),
             b"a stale component from an old build",
@@ -847,9 +833,8 @@ mod tests {
             "the startup default does not force-enable the MCP Component the user disabled"
         );
         assert!(
-            !home
-                .path()
-                .join(".codex/plugins/cache/deluxe-defaults/mcp/0.1.0")
+            !plugins::plugin_cache_root(home.path())
+                .join("deluxe-defaults/mcp/0.1.0")
                 .exists(),
             "a disabled bundled MCP Component is not installed"
         );
@@ -870,13 +855,13 @@ mod tests {
         std::fs::write(
             source.path().join("plugin.json"),
             r#"{"name":"echo-tool","version":"1.0.0","runtime":{
-                "type":"wasm","module":"plugin.wasm",
+                "module":"plugin.wasm",
                 "apiVersion":"deluxe.harness/plugin@0.1"}}"#,
         )
         .expect("the source manifest is written");
         std::fs::write(
             source.path().join("plugin.wasm"),
-            include_bytes!("../../plugin-fixtures/echo-tool/plugin.wasm"),
+            include_bytes!("../../plugin-src/echo-tool/plugin.wasm"),
         )
         .expect("the source component is written");
 
@@ -907,13 +892,13 @@ mod tests {
         fs::write(
             source.path().join("plugin.json"),
             r#"{"name":"echo-tool","version":"1.0.0","runtime":{
-                "type":"wasm","module":"different.wasm",
+                "module":"different.wasm",
                 "apiVersion":"deluxe.harness/plugin@0.1"}}"#,
         )
         .expect("the manifest is written");
         fs::write(
             source.path().join("plugin.wasm"),
-            include_bytes!("../../plugin-fixtures/echo-tool/plugin.wasm"),
+            include_bytes!("../../plugin-src/echo-tool/plugin.wasm"),
         )
         .expect("the component is written");
 
@@ -933,7 +918,7 @@ mod tests {
     #[tokio::test]
     async fn native_plugin_manager_preserves_local_working_copies() {
         let home = tempfile::tempdir().expect("a temp directory is available");
-        let marketplace = home.path().join(".agents/plugins");
+        let marketplace = home.path().join(plugins::HOME_DIR).join("plugins");
         fs::create_dir_all(&marketplace).expect("the marketplace directory is created");
         fs::write(
             marketplace.join("marketplace.json"),
@@ -946,7 +931,7 @@ mod tests {
         fs::write(
             working_copy.join("plugin.json"),
             r#"{"name":"thing","version":"1.0.0","runtime":{
-                "type":"wasm","module":"plugin.wasm",
+                "module":"plugin.wasm",
                 "apiVersion":"deluxe.harness/plugin@0.1"}}"#,
         )
         .expect("the manifest is written");

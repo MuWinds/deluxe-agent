@@ -157,7 +157,7 @@ impl Guest for HooksProvider {
         Err("hooks provider has no regular tools".into())
     }
 
-    async fn list_hooks() -> String {
+    async fn list_event_handlers() -> String {
         serde_json::to_string(
             &configured_hooks()
                 .into_iter()
@@ -165,7 +165,7 @@ impl Guest for HooksProvider {
                     serde_json::json!({
                         "id": hook.id,
                         "label": hook.label,
-                        "tools": ["*"]
+                        "events": ["tool.finished"]
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -173,14 +173,19 @@ impl Guest for HooksProvider {
         .unwrap_or_else(|_| "[]".into())
     }
 
-    async fn invoke_hook(hook_id: String, event_json: String) -> Result<String, String> {
+    async fn handle_event(handler_id: String, event_json: String) -> Result<String, String> {
         let hook = configured_hooks()
             .into_iter()
-            .find(|hook| hook.id == hook_id)
-            .ok_or_else(|| "unknown hook".to_string())?;
+            .find(|hook| hook.id == handler_id)
+            .ok_or_else(|| "unknown event handler".to_string())?;
         let event: serde_json::Value =
-            serde_json::from_str(&event_json).map_err(|_| "hook event is invalid")?;
-        if !matches_tool(&hook, event_field(&event, "tool")) {
+            serde_json::from_str(&event_json).map_err(|_| "event is invalid")?;
+        let tool = event
+            .get("payload")
+            .and_then(|payload| payload.get("tool"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if !matches_tool(&hook, tool) {
             return Ok(r#"{"output":"","failed":false,"matched":false}"#.into());
         }
         let arguments = serde_json::json!({

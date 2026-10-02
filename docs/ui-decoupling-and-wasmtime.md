@@ -735,7 +735,6 @@ GUI 层不应该出现 `wasmtime::Store`、`wasmtime::Instance` 或任何 Wasm �
     "shortDescription": "..."
   },
   "runtime": {
-    "type": "wasm",
     "module": "./runtime/plugin.wasm",
     "ui": {
       "surfaces": ["main", "settings"]

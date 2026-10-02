@@ -21,7 +21,7 @@ use crate::harness::{
 };
 use crate::llm::LlmClient;
 use crate::plugins::capabilities::CapabilityHub;
-use crate::plugins::providers::WasmHookRuntime;
+use crate::plugins::providers::WasmEventRuntime;
 use crate::plugins::wasm::tools;
 use crate::plugins::wasm_runtime::ComponentActor;
 use crate::plugins::PluginCatalogue;
@@ -214,7 +214,7 @@ impl ProjectRuntimeFactory {
             capabilities.clone(),
         )?;
         match ComponentActor::load_bytes(
-            include_bytes!("../../plugin-fixtures/builtin-tools/plugin.wasm"),
+            include_bytes!("../../plugin-src/builtin-tools/plugin.wasm"),
             builtin_hub,
         )
         .await
@@ -324,14 +324,14 @@ impl ProjectRuntimeFactory {
             self.settings.clone(),
             Arc::new(super::prompt::NativePromptProvider::new()),
         );
-        let hooks = match WasmHookRuntime::load(provider_actors).await {
-            Ok(hooks) => hooks,
+        let events = match WasmEventRuntime::load(provider_actors).await {
+            Ok(events) => events,
             Err(error) => {
-                tracing::warn!(%error, "Wasm hook providers failed to load");
-                WasmHookRuntime::empty()
+                tracing::warn!(%error, "Wasm event handler providers failed to load");
+                WasmEventRuntime::empty()
             }
         };
-        native.hooks = Arc::new(hooks);
+        native.events = Arc::new(events);
         let services = Arc::new(native);
         let host_tools = capabilities;
         let project_path = project.to_path_buf();
@@ -406,7 +406,6 @@ fn builtin_manifest(supports_images: bool) -> Result<crate::plugins::wasm_manife
         invoke_tools.push("read_image".to_string());
     }
     serde_json::from_value(serde_json::json!({
-        "type": "wasm",
         "module": "builtin-tools.wasm",
         "apiVersion": crate::plugins::wasm_manifest::API_VERSION,
         "permissions": { "invokeTools": invoke_tools }

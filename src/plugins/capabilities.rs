@@ -163,8 +163,8 @@ impl PluginFileHost {
         match tokio::fs::canonicalize(&self.configuration_root).await {
             Ok(root) => Ok(root),
             // The scope root itself is allowed to be absent — a fresh install
-            // has no `~/.agents` yet — and a Component asking for its optional
-            // config wants a not-found, not an opaque resolve failure.
+            // has no `~/.deluxe-agents` yet — and a Component asking for its
+            // optional config wants a not-found, not an opaque resolve failure.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(AgentError::new(
                 code::PLUGIN_FILE_NOT_FOUND,
                 "Plugin configuration root does not exist",

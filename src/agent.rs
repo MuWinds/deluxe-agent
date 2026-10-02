@@ -25,8 +25,8 @@ use crate::attachments::ImageRef;
 use crate::context::{compaction_split, summary_turn, ContextSettings, ContextWindow};
 use crate::error::{AgentError, Result};
 use crate::harness::{
-    AgentEvent, AgentEventSink, AgentServices, AuditOutcome, HookContext, LlmStreamEvent,
-    LlmStreamSink, RunId,
+    AgentEvent, AgentEventSink, AgentServices, AuditOutcome, LlmStreamEvent, LlmStreamSink,
+    PluginEvent, RunId, EVENT_TOOL_FINISHED,
 };
 use crate::llm::{AssistantTurn, Message, ThinkingLevel, ToolCall, UserTurn};
 use crate::runtime_context;
@@ -546,27 +546,31 @@ impl Agent {
             }
         };
 
-        // Hooks run after the call, and their output joins the result: that is
-        // what makes a `PostToolUse` hook a *nudge* rather than a side note, as
-        // the model reads the very text this becomes.
+        // Plugins subscribed to the tool-finished event run after the call, and
+        // the text they contribute joins the result: that is what makes a
+        // `PostToolUse` handler a *nudge* rather than a side note, as the model
+        // reads the very text this becomes.
         //
         // A *refused* call is the one case they are skipped. The denylist
-        // stopped the tool before it did anything, so a hook that exists to
+        // stopped the tool before it did anything, so a handler that exists to
         // react to what a tool did — "you just wrote a file, re-check parity" —
         // would be describing something that never happened.
         if dispatched.outcome != AuditOutcome::Denied {
             let tool_context = self.services.tools.context(&self.working_directory).await;
-            let context = HookContext {
+            let event = PluginEvent {
+                kind: EVENT_TOOL_FINISHED,
                 project: self.working_directory.clone(),
                 max_output_chars: tool_context.max_output_chars,
+                payload: serde_json::json!({
+                    "tool": call.function.name.clone(),
+                    "output": text.clone(),
+                }),
             };
-            if let Err(error) = self
-                .services
-                .hooks
-                .after_tool(&call.function.name, &mut text, &context, cancel)
-                .await
-            {
-                text.push_str(&format!("\n\nPostToolUse hook failed: {error}"));
+            match self.services.events.dispatch(&event, cancel).await {
+                Ok(contributed) => text.push_str(&contributed),
+                Err(error) => {
+                    text.push_str(&format!("\n\nPlugin event dispatch failed: {error}"));
+                }
             }
         }
 

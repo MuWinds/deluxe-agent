@@ -919,12 +919,12 @@ impl Guest for McpProvider {
         Ok(tool_output(&result))
     }
 
-    async fn list_hooks() -> String {
+    async fn list_event_handlers() -> String {
         "[]".into()
     }
 
-    async fn invoke_hook(_hook_id: String, _event_json: String) -> Result<String, String> {
-        Err("MCP provider has no hooks".into())
+    async fn handle_event(_handler_id: String, _event_json: String) -> Result<String, String> {
+        Err("MCP provider has no event handlers".into())
     }
 
     async fn open_surface(request_json: String) -> Result<String, String> {

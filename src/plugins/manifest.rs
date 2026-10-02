@@ -38,12 +38,9 @@ pub struct PluginManifest {
 impl PluginManifest {
     /// Projects the Wasmtime component declaration, if one is present.
     ///
-    /// Unknown runtime kinds and malformed declarations are logged and skipped.
+    /// Malformed declarations are logged and skipped.
     pub fn wasm_runtime(&self) -> Option<super::wasm_manifest::WasmManifest> {
         let runtime = self.runtime.as_ref()?;
-        if runtime.get("type").and_then(serde_json::Value::as_str) != Some("wasm") {
-            return None;
-        }
         match serde_json::from_value(runtime.clone()) {
             Ok(manifest) => Some(manifest),
             Err(error) => {
@@ -191,20 +188,21 @@ pub fn read_marketplace(path: &Path) -> Result<MarketplaceManifest> {
 
 /// The relative path a marketplace's `source.path` is resolved against.
 ///
-/// The format puts `marketplace.json` at `<root>/.agents/plugins/marketplace.json`
-/// and resolves `./plugins/foo` against `<root>` — the directory that *contains*
-/// `.agents/`, not the directory the file sits in and not `.agents/plugins/`.
-/// Verified against a real install: `~/.agents/plugins/marketplace.json` naming
-/// `./plugins/computer-use-local` resolves to `~/plugins/computer-use-local`.
+/// The format puts `marketplace.json` at
+/// `<root>/.deluxe-agents/plugins/marketplace.json` and resolves `./plugins/foo`
+/// against `<root>` — the directory that *contains* `.deluxe-agents/`, not the
+/// directory the file sits in and not `.deluxe-agents/plugins/`. For example,
+/// `~/.deluxe-agents/plugins/marketplace.json` naming `./plugins/computer-use-local`
+/// resolves to `~/plugins/computer-use-local`.
 ///
 /// Returns `None` when `path` is not shaped like a marketplace file, which the
 /// caller reports rather than guessing at.
 pub fn marketplace_root(path: &Path) -> Option<PathBuf> {
-    // <root>/.agents/plugins/marketplace.json
+    // <root>/.deluxe-agents/plugins/marketplace.json
     let plugins = path.parent()?; // …/plugins
-    let agents = plugins.parent()?; // …/.agents
-    let root = agents.parent()?; // <root>
-    if agents.file_name()? != ".agents" || plugins.file_name()? != "plugins" {
+    let home_dir = plugins.parent()?; // …/.deluxe-agents
+    let root = home_dir.parent()?; // <root>
+    if home_dir.file_name()? != super::HOME_DIR || plugins.file_name()? != "plugins" {
         return None;
     }
     Some(root.to_path_buf())
@@ -359,11 +357,11 @@ mod tests {
     }
 
     #[test]
-    fn the_marketplace_root_is_the_directory_containing_agents() {
-        // The real layout, and the trap the format sets: `./plugins/foo` is
-        // resolved against the directory that *contains* `.agents/`.
+    fn the_marketplace_root_is_the_directory_containing_deluxe_agents() {
+        // The layout, and the trap the format sets: `./plugins/foo` is
+        // resolved against the directory that *contains* `.deluxe-agents/`.
         let root = marketplace_root(std::path::Path::new(
-            "/home/u/.agents/plugins/marketplace.json",
+            "/home/u/.deluxe-agents/plugins/marketplace.json",
         ))
         .unwrap();
         assert_eq!(root, std::path::PathBuf::from("/home/u"));
@@ -378,7 +376,7 @@ mod tests {
     #[test]
     fn a_repo_marketplace_resolves_against_the_repo_root() {
         let root = marketplace_root(std::path::Path::new(
-            "/work/repo/.agents/plugins/marketplace.json",
+            "/work/repo/.deluxe-agents/plugins/marketplace.json",
         ))
         .unwrap();
         assert_eq!(root, std::path::PathBuf::from("/work/repo"));
@@ -387,8 +385,12 @@ mod tests {
     #[test]
     fn a_file_that_is_not_a_marketplace_has_no_root() {
         // Guessing here would silently point at the wrong directory, so the
-        // caller is told instead.
+        // caller is told instead. Codex's old `.agents` name is not accepted.
         assert!(marketplace_root(std::path::Path::new("/tmp/marketplace.json")).is_none());
         assert!(marketplace_root(std::path::Path::new("/tmp/.agents/marketplace.json")).is_none());
+        assert!(marketplace_root(std::path::Path::new(
+            "/tmp/.agents/plugins/marketplace.json"
+        ))
+        .is_none());
     }
 }

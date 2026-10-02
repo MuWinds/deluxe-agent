@@ -113,22 +113,25 @@ pub trait PromptProvider: Send + Sync {
     fn tool_schema(&self, tools: &[ToolDescriptor]) -> Value;
 }
 
+/// The only event kind the agent loop emits today.
+pub const EVENT_TOOL_FINISHED: &str = "tool.finished";
+
+/// A host event delivered to every subscribed plugin.
 #[derive(Debug, Clone)]
-pub struct HookContext {
+pub struct PluginEvent {
+    pub kind: &'static str,
     pub project: PathBuf,
     pub max_output_chars: usize,
+    /// Kind-specific fields, serialised to the plugin as-is.
+    pub payload: Value,
 }
 
 #[async_trait]
-pub trait HookRuntime: Send + Sync {
-    /// Runs matching post-tool hooks and appends their visible output.
-    async fn after_tool(
-        &self,
-        tool: &str,
-        output: &mut String,
-        context: &HookContext,
-        cancel: &CancellationToken,
-    ) -> Result<()>;
+pub trait PluginEventRuntime: Send + Sync {
+    /// Delivers `event` to every subscribed handler and returns the text they
+    /// contribute, in stable plugin and handler order. An empty string means no
+    /// handler contributed.
+    async fn dispatch(&self, event: &PluginEvent, cancel: &CancellationToken) -> Result<String>;
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +236,6 @@ pub struct AgentServices {
     pub tools: Arc<dyn ToolRuntime>,
     pub context: Arc<dyn ContextCompactor>,
     pub prompts: Arc<dyn PromptProvider>,
-    pub hooks: Arc<dyn HookRuntime>,
+    pub events: Arc<dyn PluginEventRuntime>,
     pub jobs: Arc<dyn JobRuntime>,
 }

@@ -22,11 +22,11 @@ use crate::attachments::ImageRef;
 use crate::context::ContextSettings;
 use crate::error::AgentError;
 use crate::harness::services::native_services;
-use crate::harness::{AgentEvent, AgentEventSink, HookRuntime, PromptContext};
+use crate::harness::{AgentEvent, AgentEventSink, PluginEventRuntime, PromptContext};
 use crate::ipc::{AuditOutcome, Event};
 use crate::llm::{LlmClient, Message};
 use crate::plugins::capabilities::CapabilityHub;
-use crate::plugins::providers::WasmHookRuntime;
+use crate::plugins::providers::WasmEventRuntime;
 use crate::plugins::wasm_runtime::ComponentActor;
 use crate::tools::{to_openai_tools_from_descriptors, ToolRegistry, ToolSettings};
 
@@ -332,23 +332,23 @@ fn agent_with_settings(
     context: ContextSettings,
     settings: ToolSettings,
 ) -> Agent {
-    agent_with_settings_and_hooks(
+    agent_with_settings_and_events(
         registry,
         server,
         directory,
         context,
         settings,
-        Arc::new(WasmHookRuntime::empty()),
+        Arc::new(WasmEventRuntime::empty()),
     )
 }
 
-fn agent_with_settings_and_hooks(
+fn agent_with_settings_and_events(
     registry: ToolRegistry,
     server: &FakeServer,
     directory: &std::path::Path,
     context: ContextSettings,
     settings: ToolSettings,
-    hooks: Arc<dyn HookRuntime>,
+    events: Arc<dyn PluginEventRuntime>,
 ) -> Agent {
     let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, Some(0))
         .expect("the client builds");
@@ -358,7 +358,7 @@ fn agent_with_settings_and_hooks(
         Arc::new(tokio::sync::RwLock::new(settings)),
         Arc::new(crate::runtime::prompt::NativePromptProvider::new()),
     );
-    native.hooks = hooks;
+    native.events = events;
     let services = Arc::new(native);
     let prompt_context = PromptContext {
         tools: services.tools.descriptors(),
@@ -377,12 +377,12 @@ fn agent_for(server: &FakeServer, directory: &std::path::Path) -> Agent {
     agent_for_with_context(server, directory, ContextSettings::default())
 }
 
-async fn fixture_hook_runtime(
+async fn fixture_event_runtime(
     project: &std::path::Path,
     settings: &ToolSettings,
-) -> Arc<dyn HookRuntime> {
+) -> Arc<dyn PluginEventRuntime> {
     let manifest = serde_json::from_str::<crate::plugins::PluginManifest>(include_str!(
-        "../plugin-fixtures/hooks-provider/plugin.json"
+        "../plugin-src/hooks-provider/plugin.json"
     ))
     .expect("the checked-in fixture manifest is valid")
     .wasm_runtime()
@@ -418,32 +418,32 @@ async fn fixture_hook_runtime(
     )
     .expect("the fixture host capabilities are valid");
     let actor = ComponentActor::load_bytes(
-        include_bytes!("../plugin-fixtures/hooks-provider/plugin.wasm"),
+        include_bytes!("../plugin-src/hooks-provider/plugin.wasm"),
         hub,
     )
     .await
-    .expect("the checked-in hook component loads");
+    .expect("the checked-in event handler component loads");
     Arc::new(
-        WasmHookRuntime::load([("hooky@test".to_string(), actor)])
+        WasmEventRuntime::load([("hooky@test".to_string(), actor)])
             .await
-            .expect("the fixture hook declaration is valid"),
+            .expect("the fixture event handler declaration is valid"),
     )
 }
 
-async fn agent_with_fixture_hooks(
+async fn agent_with_fixture_events(
     registry: ToolRegistry,
     server: &FakeServer,
     directory: &std::path::Path,
     settings: ToolSettings,
 ) -> Agent {
-    let hooks = fixture_hook_runtime(directory, &settings).await;
-    agent_with_settings_and_hooks(
+    let events = fixture_event_runtime(directory, &settings).await;
+    agent_with_settings_and_events(
         registry,
         server,
         directory,
         ContextSettings::default(),
         settings,
-        hooks,
+        events,
     )
 }
 
@@ -540,7 +540,7 @@ async fn a_run_with_tool_calls_reports_each_turns_usage_as_it_lands() {
 }
 
 #[tokio::test]
-async fn a_post_tool_use_hook_runs_and_its_output_joins_the_tool_result() {
+async fn a_tool_finished_event_handler_runs_and_its_output_joins_the_tool_result() {
     let directory = tempfile::tempdir().expect("a temp directory is available");
     std::fs::write(directory.path().join("note.txt"), "hello\n").expect("the file is written");
 
@@ -555,7 +555,7 @@ async fn a_post_tool_use_hook_runs_and_its_output_joins_the_tool_result() {
     ))
     .await;
 
-    let agent = agent_with_fixture_hooks(
+    let agent = agent_with_fixture_events(
         ToolRegistry::with_builtins(),
         &server,
         directory.path(),
@@ -589,8 +589,8 @@ async fn a_post_tool_use_hook_runs_and_its_output_joins_the_tool_result() {
         "the tool's own output survives: {output}"
     );
     assert!(
-        output.contains("PostToolUse hook"),
-        "the hook is named in the result the model reads: {output}"
+        output.contains("event handler"),
+        "the handler is named in the result the model reads: {output}"
     );
     assert!(
         output.contains("wasm-hook-ran"),
@@ -599,7 +599,7 @@ async fn a_post_tool_use_hook_runs_and_its_output_joins_the_tool_result() {
 }
 
 #[tokio::test]
-async fn a_hook_whose_matcher_does_not_match_the_tool_stays_out() {
+async fn an_event_handler_whose_matcher_does_not_match_the_tool_stays_out() {
     let directory = tempfile::tempdir().expect("a temp directory is available");
     std::fs::write(directory.path().join("note.txt"), "hello\n").expect("the file is written");
 
@@ -614,7 +614,7 @@ async fn a_hook_whose_matcher_does_not_match_the_tool_stays_out() {
     ))
     .await;
 
-    let agent = agent_with_fixture_hooks(
+    let agent = agent_with_fixture_events(
         ToolRegistry::with_builtins(),
         &server,
         directory.path(),
@@ -644,12 +644,12 @@ async fn a_hook_whose_matcher_does_not_match_the_tool_stays_out() {
     let (_, output) = sink.tool_output("list_dir").expect("the call finished");
     assert!(
         !output.contains("wasm-hook-ran"),
-        "a Wasm hook must not run for a tool it does not match: {output}"
+        "a Wasm handler must not run for a tool it does not match: {output}"
     );
 }
 
 #[tokio::test]
-async fn a_refused_call_does_not_fire_its_hook() {
+async fn a_refused_call_does_not_fire_its_event_handler() {
     let directory = tempfile::tempdir().expect("a temp directory is available");
 
     let server = FakeServer::start(two_turns(
@@ -663,7 +663,7 @@ async fn a_refused_call_does_not_fire_its_hook() {
     ))
     .await;
 
-    let agent = agent_with_fixture_hooks(
+    let agent = agent_with_fixture_events(
         ToolRegistry::with_builtins(),
         &server,
         directory.path(),
@@ -698,7 +698,7 @@ async fn a_refused_call_does_not_fire_its_hook() {
     );
     assert!(
         !output.contains("wasm-hook-ran"),
-        "a refused call is not a tool use, so its Wasm hook must not describe one: {output}"
+        "a refused call is not a tool use, so its Wasm handler must not describe one: {output}"
     );
 }
 

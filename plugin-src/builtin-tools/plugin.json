@@ -2,7 +2,6 @@
   "name": "deluxe-builtin-tools",
   "version": "0.1.0",
   "runtime": {
-    "type": "wasm",
     "module": "plugin.wasm",
     "apiVersion": "deluxe.harness/plugin@0.1"
   }

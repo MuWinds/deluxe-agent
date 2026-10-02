@@ -14,8 +14,6 @@ pub const API_VERSION: &str = "deluxe.harness/plugin@0.1";
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WasmManifest {
-    #[serde(rename = "type")]
-    pub runtime_type: String,
     pub module: String,
     pub api_version: String,
     #[serde(default)]
@@ -58,10 +56,10 @@ impl WasmManifest {
     /// Returns `Err` for an unsupported ABI, invalid declarations, or escaped paths,
     /// including symlinks. Called only on a worker or blocking loader task.
     pub fn resolve_entry(&self, root: &Path) -> Result<PathBuf> {
-        if self.runtime_type != "wasm" || self.api_version != API_VERSION {
+        if self.api_version != API_VERSION {
             return Err(AgentError::new(
                 code::PLUGIN_API_MISMATCH,
-                "Unsupported plugin runtime or API version",
+                "Unsupported plugin API version",
             ));
         }
         for ids in [
@@ -151,7 +149,7 @@ mod tests {
         let root = tempfile::tempdir().expect("temp root");
         std::fs::write(root.path().join("plugin.wasm"), b"fixture").expect("fixture file");
         let mut manifest: WasmManifest = serde_json::from_str(
-            r#"{"type":"wasm","module":"./plugin.wasm","apiVersion":"deluxe.harness/plugin@0.1"}"#,
+            r#"{"module":"./plugin.wasm","apiVersion":"deluxe.harness/plugin@0.1"}"#,
         )
         .expect("valid manifest");
         assert!(manifest.resolve_entry(root.path()).is_ok());

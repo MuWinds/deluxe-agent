@@ -6,7 +6,6 @@
     "shortDescription": "MCP Wasmtime plugin"
   },
   "runtime": {
-    "type": "wasm",
     "module": "plugin.wasm",
     "apiVersion": "deluxe.harness/plugin@0.1",
     "ui": {

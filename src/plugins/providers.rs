@@ -1,6 +1,6 @@
-//! Wasmtime-backed adapters for generic tools and hooks.
+//! Wasmtime-backed adapters for generic tools and plugin events.
 //!
-//! Components own their hook semantics. This adapter only validates the
+//! Components own their event semantics. This adapter only validates the
 //! Component's JSON metadata and translates it into the harness port used by
 //! the agent loop.
 
@@ -12,7 +12,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{code, AgentError, Result};
-use crate::harness::{HookContext, HookRuntime};
+use crate::harness::{PluginEvent, PluginEventRuntime};
 
 use super::ui_protocol::MAX_PAYLOAD_BYTES;
 use super::wasm_runtime::{ComponentActor, Operation};
@@ -22,181 +22,183 @@ const MAX_PROVIDER_ID_BYTES: usize = 128;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct HookDescriptor {
+struct EventHandlerDescriptor {
     id: String,
     #[serde(default)]
     label: String,
+    /// Event kinds this handler subscribes to. Empty means every kind.
     #[serde(default)]
-    tools: Vec<String>,
+    events: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct HookOutput {
+struct EventHandlerOutput {
     output: String,
     #[serde(default)]
     failed: bool,
-    #[serde(default = "default_hook_matched")]
+    #[serde(default = "default_event_matched")]
     matched: bool,
 }
 
-fn default_hook_matched() -> bool {
+fn default_event_matched() -> bool {
     true
 }
 
-/// A hook exported by a Wasmtime Component.
-struct WasmHook {
+/// An event handler exported by a Wasmtime Component.
+struct WasmEventHandler {
     plugin_id: String,
-    descriptor: HookDescriptor,
+    descriptor: EventHandlerDescriptor,
     actor: Arc<ComponentActor>,
 }
 
-/// Runs Component hooks in stable plugin and declaration order.
-pub struct WasmHookRuntime {
-    hooks: Vec<WasmHook>,
+/// Delivers plugin events to Component handlers in stable plugin and declaration order.
+pub struct WasmEventRuntime {
+    handlers: Vec<WasmEventHandler>,
 }
 
-impl WasmHookRuntime {
-    /// Loads and validates hook declarations from the supplied Components.
+impl WasmEventRuntime {
+    /// Loads and validates event handler declarations from the supplied Components.
     pub async fn load(
         providers: impl IntoIterator<Item = (String, Arc<ComponentActor>)>,
     ) -> Result<Self> {
-        let mut hooks = Vec::new();
+        let mut handlers = Vec::new();
         for (plugin_id, actor) in providers {
-            let json = match actor.call(Operation::ListHooks).await {
+            let json = match actor.call(Operation::ListEventHandlers).await {
                 Ok(json) => json,
                 Err(error) => {
-                    tracing::warn!(plugin = %plugin_id, %error, "skipping Wasm hook provider");
+                    tracing::warn!(plugin = %plugin_id, %error, "skipping Wasm event handler provider");
                     continue;
                 }
             };
-            let descriptors: Vec<HookDescriptor> = match decode_list(&json, "hook") {
+            let descriptors: Vec<EventHandlerDescriptor> = match decode_list(&json, "event handler")
+            {
                 Ok(descriptors) => descriptors,
                 Err(error) => {
-                    tracing::warn!(plugin = %plugin_id, %error, "skipping invalid Wasm hook declarations");
+                    tracing::warn!(plugin = %plugin_id, %error, "skipping invalid Wasm event handler declarations");
                     continue;
                 }
             };
             if descriptors.len() > MAX_PROVIDER_ITEMS {
-                tracing::warn!(plugin = %plugin_id, "skipping provider with too many hook declarations");
+                tracing::warn!(plugin = %plugin_id, "skipping provider with too many event handler declarations");
                 continue;
             }
-            let mut provider_hooks = Vec::new();
+            let mut provider_handlers = Vec::new();
             for descriptor in descriptors {
                 if descriptor.id.len() > MAX_PROVIDER_ID_BYTES
-                    || descriptor.tools.len() > MAX_PROVIDER_ITEMS
-                    || descriptor.tools.iter().any(|tool| tool.is_empty())
+                    || descriptor.events.len() > MAX_PROVIDER_ITEMS
+                    || descriptor
+                        .events
+                        .iter()
+                        .any(|event| event.is_empty() || event.len() > MAX_PROVIDER_ID_BYTES)
                     || !valid_identifier(&descriptor.id)
                 {
                     tracing::warn!(
                         plugin = %plugin_id,
-                        "skipping invalid Wasm hook declaration"
+                        "skipping invalid Wasm event handler declaration"
                     );
                     continue;
                 }
-                provider_hooks.push(WasmHook {
+                provider_handlers.push(WasmEventHandler {
                     plugin_id: plugin_id.clone(),
                     descriptor,
                     actor: actor.clone(),
                 });
             }
-            hooks.extend(provider_hooks);
+            handlers.extend(provider_handlers);
         }
-        hooks.sort_by(|left, right| {
+        handlers.sort_by(|left, right| {
             left.plugin_id
                 .cmp(&right.plugin_id)
                 .then_with(|| left.descriptor.id.cmp(&right.descriptor.id))
         });
-        Ok(Self { hooks })
+        Ok(Self { handlers })
     }
 
-    /// Creates a runtime that ignores all hook events.
+    /// Creates a runtime that ignores all plugin events.
     pub fn empty() -> Self {
-        Self { hooks: Vec::new() }
+        Self {
+            handlers: Vec::new(),
+        }
     }
 }
 
 #[async_trait]
-impl HookRuntime for WasmHookRuntime {
-    async fn after_tool(
-        &self,
-        tool: &str,
-        output: &mut String,
-        context: &HookContext,
-        cancel: &CancellationToken,
-    ) -> Result<()> {
-        let event = serde_json::json!({
-            "tool": tool,
-            "output": output,
-            "project": context.project,
-            "maxOutputChars": context.max_output_chars,
+impl PluginEventRuntime for WasmEventRuntime {
+    async fn dispatch(&self, event: &PluginEvent, cancel: &CancellationToken) -> Result<String> {
+        let event_json = serde_json::json!({
+            "kind": event.kind,
+            "project": event.project,
+            "maxOutputChars": event.max_output_chars,
+            "payload": event.payload,
         })
         .to_string();
-        if event.len() > MAX_PAYLOAD_BYTES {
+        if event_json.len() > MAX_PAYLOAD_BYTES {
             return Err(AgentError::new(
                 code::PLUGIN_RESOURCE_LIMIT,
-                "Hook event exceeds the provider payload limit",
+                "Plugin event exceeds the provider payload limit",
             ));
         }
 
-        for hook in &self.hooks {
+        let mut contributed = String::new();
+        for handler in &self.handlers {
             if cancel.is_cancelled() {
-                return Ok(());
+                return Ok(contributed);
             }
-            if !hook.descriptor.tools.is_empty()
-                && !hook
+            if !handler.descriptor.events.is_empty()
+                && !handler
                     .descriptor
-                    .tools
+                    .events
                     .iter()
-                    .any(|name| name == tool || name == "*")
+                    .any(|kind| kind == event.kind)
             {
                 continue;
             }
 
             let result = tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return Ok(()),
-                result = hook.actor.call(Operation::InvokeHook {
-                    id: hook.descriptor.id.clone(),
-                    event: event.clone(),
+                _ = cancel.cancelled() => return Ok(contributed),
+                result = handler.actor.call(Operation::HandleEvent {
+                    id: handler.descriptor.id.clone(),
+                    event: event_json.clone(),
                 }) => result,
             };
             let result = match result {
                 Ok(result) => result,
                 Err(error) => {
-                    output.push_str(&format!(
-                        "\n\nPostToolUse hook `{}` (plugin {}) failed:\n{}",
-                        hook.descriptor.label_or_id(),
-                        hook.plugin_id,
+                    contributed.push_str(&format!(
+                        "\n\nPlugin event handler `{}` (plugin {}) failed:\n{}",
+                        handler.descriptor.label_or_id(),
+                        handler.plugin_id,
                         error
                     ));
                     continue;
                 }
             };
-            let hook_output: HookOutput = decode_json(&result, "hook output")?;
-            if !hook_output.matched {
+            let handler_output: EventHandlerOutput = decode_json(&result, "event handler output")?;
+            if !handler_output.matched {
                 continue;
             }
-            if hook_output.output.len() > MAX_PAYLOAD_BYTES {
+            if handler_output.output.len() > MAX_PAYLOAD_BYTES {
                 return Err(AgentError::new(
                     code::PLUGIN_INVALID_OUTPUT,
-                    "Hook output exceeds the provider payload limit",
+                    "Plugin event handler output exceeds the provider payload limit",
                 ));
             }
-            output.push_str("\n\n");
-            output.push_str(&format!(
-                "PostToolUse hook `{}` (plugin {}){}:\n{}",
-                hook.descriptor.label_or_id(),
-                hook.plugin_id,
-                if hook_output.failed { " failed" } else { "" },
-                hook_output.output.trim()
+            contributed.push_str("\n\n");
+            contributed.push_str(&format!(
+                "Plugin event handler `{}` (plugin {}){}:\n{}",
+                handler.descriptor.label_or_id(),
+                handler.plugin_id,
+                if handler_output.failed { " failed" } else { "" },
+                handler_output.output.trim()
             ));
         }
-        Ok(())
+        Ok(contributed)
     }
 }
 
-impl HookDescriptor {
+impl EventHandlerDescriptor {
     fn label_or_id(&self) -> &str {
         if self.label.is_empty() {
             &self.id

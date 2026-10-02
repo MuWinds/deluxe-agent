@@ -458,11 +458,10 @@ mod tests {
     fn the_real_figma_commands_parse_from_this_machines_install() {
         // Not a fixture: the actual files, so the shapes the tests above
         // encode are the shapes that ship. Skipped where figma is absent, so
-        // the suite still passes on a machine that has never run Codex.
+        // the suite still passes on a machine that has never installed it.
         let root = directories::UserDirs::new()
             .map(|dirs| {
-                dirs.home_dir()
-                    .join(".codex/plugins/cache/openai-curated/figma")
+                crate::plugins::plugin_cache_root(dirs.home_dir()).join("openai-curated/figma")
             })
             .filter(|path| path.is_dir());
         let Some(root) = root else {

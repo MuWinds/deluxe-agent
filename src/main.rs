@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -58,6 +59,16 @@ mod tools;
 
 #[cfg(test)]
 mod agent_loop_tests;
+
+/// How long a project's agent runtime may sit unused before it is dropped.
+///
+/// Component actors and host capabilities are deliberately not touched: they
+/// are the plugin's own state (a running MCP session, for example) and are
+/// released only when a plugin reload or uninstall invalidates the factory.
+const IDLE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// How often the worker sweeps for idle runtimes.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
@@ -226,12 +237,13 @@ fn spawn_worker(
     sink: EventSink,
 ) {
     handle.spawn(async move {
-        // Every run in flight, so a `Cancel` can reach whichever one it names.
-        // Shared with the run tasks, which retire their own entry when they
-        // finish — otherwise a long-lived window would pile up one dead token
-        // per run. The critical sections are a get, an insert and a remove, so
-        // a poisoned lock is recovered from rather than propagated.
-        let active: Arc<Mutex<HashMap<RunId, CancellationToken>>> =
+        // Every run in flight, so a `Cancel` can reach whichever one it names,
+        // and the idle sweep can tell which project is still busy. Shared with
+        // the run tasks, which retire their own entry when they finish —
+        // otherwise a long-lived window would pile up one dead token per run.
+        // The critical sections are a get, an insert and a remove, so a
+        // poisoned lock is recovered from rather than propagated.
+        let active: Arc<Mutex<HashMap<RunId, (PathBuf, CancellationToken)>>> =
             Arc::new(Mutex::new(HashMap::new()));
         // One agent per project. A single slot would be evicted by every run in
         // another project, rebuilding the HTTP client's connection pool each
@@ -250,18 +262,38 @@ fn spawn_worker(
             worker.settings.clone(),
             Arc::new(sink.clone()),
             // A global Component's generic file capability is bound here, not to
-            // the whole home directory: `~/.agents` holds plugin configuration
-            // (`.mcp.json`, `.hooks.json`, the personal marketplace) and nothing
-            // a plugin has no business reading.
+            // the whole home directory: `~/.deluxe-agents` holds plugin
+            // configuration (`.mcp.json`, `.hooks.json`, the personal
+            // marketplace) and nothing a plugin has no business reading.
             plugins::global_configuration_root(&worker.home),
         );
         // The model settings the GUI wants. Pushed before the first run and on
         // every settings save; `None` only until then.
         let mut llm_settings: Option<LlmSettings> = None;
+        // Last time each project was touched. Only the worker thread reads or
+        // writes it, so it needs no lock and is never held across an await.
+        let mut activity: HashMap<PathBuf, Instant> = HashMap::new();
+        let mut sweep =
+            tokio::time::interval_at(tokio::time::Instant::now() + SWEEP_INTERVAL, SWEEP_INTERVAL);
+        // A long command must not cause a burst of catch-up sweeps.
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        while let Some(cmd) = cmd_rx.recv().await {
+        loop {
+            let cmd = tokio::select! {
+                biased;
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(cmd) => cmd,
+                    None => break,
+                },
+                _ = sweep.tick() => {
+                    evict_idle_runtimes(&mut runtimes, &mut activity, &surfaces, &active);
+                    continue;
+                }
+            };
+
             match cmd {
                 Cmd::OpenPluginSurface(request) => {
+                    activity.insert(request.project.clone(), Instant::now());
                     let declaration = worker
                         .plugins
                         .for_project(&request.project)
@@ -629,7 +661,7 @@ fn spawn_worker(
                     let guard = active
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if let Some(token) = guard.get(&run_id) {
+                    if let Some((_, token)) = guard.get(&run_id) {
                         token.cancel();
                     }
                 }
@@ -649,6 +681,7 @@ fn spawn_worker(
                         });
                         continue;
                     };
+                    activity.insert(project.clone(), Instant::now());
 
                     // A plugin surface changed configuration since this
                     // project's agent was built. Rebuilding here — rather than
@@ -702,7 +735,7 @@ fn spawn_worker(
                     active
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .insert(run_id, cancel.clone());
+                        .insert(run_id, (project, cancel.clone()));
 
                     let sink = sink.clone();
                     let active = active.clone();
@@ -747,13 +780,13 @@ fn spawn_worker(
 async fn invalidate_runtimes(
     factory: &ProjectRuntimeFactory,
     runtimes: &mut HashMap<PathBuf, Arc<ProjectRuntime>>,
-    active: &Arc<Mutex<HashMap<RunId, CancellationToken>>>,
+    active: &Arc<Mutex<HashMap<RunId, (PathBuf, CancellationToken)>>>,
 ) {
     {
         let runs = active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for cancel in runs.values() {
+        for (_, cancel) in runs.values() {
             cancel.cancel();
         }
     }
@@ -764,6 +797,63 @@ async fn invalidate_runtimes(
     // The cache outlives the runtimes it fed; a shut-down actor must not be
     // handed back to the next surface or runtime build.
     factory.clear_components();
+}
+
+/// Projects whose last activity is at or past the idle deadline.
+///
+/// Split from the sweep so a test can pin the clock.
+fn expired_projects(
+    activity: &HashMap<PathBuf, Instant>,
+    now: Instant,
+    ttl: Duration,
+) -> Vec<PathBuf> {
+    activity
+        .iter()
+        .filter(|(_, last_active)| now.saturating_duration_since(**last_active) >= ttl)
+        .map(|(project, _)| project.clone())
+        .collect()
+}
+
+/// Drops the cached agent runtime of every project idle past `IDLE_TTL`.
+///
+/// A project is busy while it has a run in flight, a plugin surface open, or an
+/// unsettled job; a busy project is refreshed instead of evicted. The runtime
+/// is dropped without `ProjectRuntime::shutdown` on purpose: shutdown stops its
+/// components, which would end a plugin's own state such as a running MCP
+/// session. The factory's actor and host-capability caches stay untouched, so a
+/// later run rebuilds the agent against the same live actors.
+fn evict_idle_runtimes(
+    runtimes: &mut HashMap<PathBuf, Arc<ProjectRuntime>>,
+    activity: &mut HashMap<PathBuf, Instant>,
+    surfaces: &HashMap<SurfaceRequest, SurfaceHandle>,
+    active: &Arc<Mutex<HashMap<RunId, (PathBuf, CancellationToken)>>>,
+) {
+    let now = Instant::now();
+    for project in expired_projects(activity, now, IDLE_TTL) {
+        // The guard is scoped so it is never held while the map is mutated.
+        let has_run = {
+            let runs = active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            runs.values().any(|(root, _)| root == &project)
+        };
+        let has_surface = surfaces.keys().any(|request| request.project == project);
+        let has_jobs = runtimes.get(&project).is_some_and(|runtime| {
+            runtime
+                .jobs
+                .list()
+                .iter()
+                .any(|job| !job.status.is_settled())
+        });
+        if has_run || has_surface || has_jobs {
+            activity.insert(project.clone(), now);
+            continue;
+        }
+        if runtimes.remove(&project).is_some() {
+            tracing::debug!(project = %project.display(), "evicted an idle project runtime");
+        }
+        activity.remove(&project);
+    }
 }
 
 /// Records that a plugin surface produced a snapshot.
@@ -844,6 +934,34 @@ mod tests {
         assert!(
             !marked.contains(elsewhere),
             "another surface's project is untouched"
+        );
+    }
+
+    /// Only a project whose last activity is at or past the TTL is evicted; a
+    /// freshly used one survives, and the deadline is inclusive.
+    #[test]
+    fn only_projects_past_the_ttl_expire() {
+        let now = Instant::now();
+        let mut activity = HashMap::new();
+        activity.insert(PathBuf::from("/work/fresh"), now - Duration::from_secs(60));
+        activity.insert(
+            PathBuf::from("/work/boundary"),
+            now - Duration::from_secs(300),
+        );
+        activity.insert(PathBuf::from("/work/old"), now - Duration::from_secs(600));
+
+        let expired = expired_projects(&activity, now, IDLE_TTL);
+        assert!(
+            expired.contains(&PathBuf::from("/work/old")),
+            "a project past the ttl expires: {expired:?}"
+        );
+        assert!(
+            expired.contains(&PathBuf::from("/work/boundary")),
+            "exactly at the ttl counts as expired: {expired:?}"
+        );
+        assert!(
+            !expired.contains(&PathBuf::from("/work/fresh")),
+            "a recently active project survives: {expired:?}"
         );
     }
 }

@@ -27,12 +27,12 @@ impl Guest for BuiltinTools {
         deluxe::harness::host::invoke_tool(name, arguments_json).await
     }
 
-    async fn list_hooks() -> String {
+    async fn list_event_handlers() -> String {
         "[]".into()
     }
 
-    async fn invoke_hook(_hook_id: String, _event_json: String) -> Result<String, String> {
-        Err("bundled tools provider has no hooks".into())
+    async fn handle_event(_handler_id: String, _event_json: String) -> Result<String, String> {
+        Err("bundled tools provider has no event handlers".into())
     }
 
     async fn open_surface(_request_json: String) -> Result<String, String> {

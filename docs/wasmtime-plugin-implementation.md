@@ -105,7 +105,7 @@ Wasm 插件只能在 worker 侧运行。GUI 不得直接加载、实例化或调
 
 | 当前代码 | 当前职责 | 目标抽象 |
 | --- | --- | --- |
-| `src/agent.rs::Agent` | Agent loop、prompt、工具 dispatch、hook、事件 | `AgentDriver` + `ToolRuntime` + `PromptPipeline` + `HookRuntime` |
+| `src/agent.rs::Agent` | Agent loop、prompt、工具 dispatch、事件、事件转发 | `AgentDriver` + `ToolRuntime` + `PromptPipeline` + `PluginEventRuntime` |
 | `src/llm.rs::LlmClient` | OpenAI 兼容请求、流式解析、重试 | `LlmProvider` |
 | `src/tools/mod.rs::Tool` | 单个工具定义与执行 | 保留，作为宿主内部工具接口 |
 | `src/tools/mod.rs::ToolRegistry` | 工具注册、schema、共享 JobRegistry | `ToolRuntime` 的默认实现 |
@@ -115,7 +115,7 @@ Wasm 插件只能在 worker 侧运行。GUI 不得直接加载、实例化或调
 | `src/session.rs` | 会话模型、transcript、JSON 持久化 | `SessionStore` |
 | `src/tools/jobs.rs::JobRegistry` | 后台任务、取消、通知 | `JobRuntime` |
 | `src/plugins/mod.rs` | Codex 插件发现、scope、启停 | `PluginManager` |
-| `src/plugins/providers.rs` | Wasm tool、hook adapter | `ToolProvider`、`HookRuntime` |
+| `src/plugins/providers.rs` | Wasm tool、plugin event adapter | `ToolProvider`、`PluginEventRuntime` |
 | `src/plugins/capabilities.rs` | 显式授权的 tool/process/HTTP raw capability | `CapabilityHub` |
 | `wit/deluxe-harness.wit` | Wasm host capability 与 provider ABI | 版本化 Component ABI |
 | `src/ipc.rs::Event` | Agent 到 GUI 的传输协议 | 拆成 `AgentEvent` 和 `UiEvent` |
@@ -241,7 +241,7 @@ src/plugins/
 wit/
 └── deluxe-harness.wit
 
-plugin-fixtures/
+plugin-src/
 └── echo-tool/
     ├── Cargo.toml
     ├── src/lib.rs
@@ -416,27 +416,27 @@ pub struct PromptContext {
 
 这样可以保持 provider prompt cache 所依赖的前缀稳定性。
 
-### 5.5 AgentHook
+### 5.5 PluginEventRuntime
 
-当前 hook 已经由 Wasmtime Component export，宿主只负责传递事件和校验输出：
+宿主只做通用的插件事件转发，不解释具体事件语义。插件通过
+`list-event-handlers` 声明订阅哪些事件，宿主把 agent 事件（当前只有
+`tool.finished`）交给 `handle-event`：
 
 ```rust
 #[async_trait::async_trait]
-pub trait AgentHook: Send + Sync {
-    fn matches(&self, event: &AgentEvent) -> bool;
-
-    async fn on_event(
+pub trait PluginEventRuntime: Send + Sync {
+    async fn dispatch(
         &self,
-        event: &AgentEvent,
-        context: &HookContext,
+        event: &PluginEvent,
         cancel: &CancellationToken,
-    ) -> Result<HookResult>;
+    ) -> Result<String>;
 }
 ```
 
-`WasmHookRuntime` 只接受 `list-hooks` 和 `invoke-hook` 的 JSON metadata。hook
-如需执行命令，必须由 provider 自己实现 command 语义并调用显式的
-`invoke-tool` 或 raw process capability；宿主不会把 hook 隐式升级成 `exec` 调用。
+`WasmEventRuntime` 只接受 `list-event-handlers` 和 `handle-event` 的 JSON
+metadata。处理器如需执行命令，必须由 provider 自己实现 command 语义并调用显式的
+`invoke-tool` 或 raw process capability；宿主不会把它隐式升级成 `exec` 调用。
+PostToolUse 之类的 hook 语义留在插件里。
 
 ### 5.6 SessionStore
 
@@ -482,7 +482,7 @@ pub struct AgentServices {
     pub tools: Arc<dyn ToolRuntime>,
     pub jobs: Arc<dyn JobRuntime>,
     pub prompts: Arc<dyn PromptPipeline>,
-    pub hooks: Arc<dyn HookRuntime>,
+    pub events: Arc<dyn PluginEventRuntime>,
     pub context: Arc<dyn ContextPolicy>,
 }
 ```
@@ -543,24 +543,23 @@ let result = self
 
 这样 Wasm tool、MCP tool 和 builtin tool 对 Agent 都是同一种调用。
 
-### 6.3 hook 迁移
+### 6.3 插件事件迁移
 
-当前 `run_hooks` 从 Agent 移到 `HookRuntime`：
+工具执行后的事件从 Agent 移到 `PluginEventRuntime`：
 
 ```rust
-pub struct CompositeHookRuntime {
-    native: Vec<Arc<dyn AgentHook>>,
-    wasm: Vec<Arc<dyn AgentHook>>,
+pub struct WasmEventRuntime {
+    handlers: Vec<WasmEventHandler>,
 }
 ```
 
 执行顺序必须固定：
 
-1. Wasm hooks 按 plugin id、hook id 排序；
-3. 同一个 hook 内不并行；
-4. 被拒绝的工具调用不触发 PostToolUse；
-5. hook 输出继续附加到 tool output；
-6. hook 失败不让整个 Agent run 失败，但必须写入 tool output 和 tracing。
+1. Wasm 事件处理器按 plugin id、handler id 排序；
+2. 同一个处理器内不并行；
+3. 被拒绝的工具调用不触发 `tool.finished`；
+4. 处理器输出继续附加到 tool output；
+5. 处理器失败不让整个 Agent run 失败，但必须写入 tool output 和 tracing。
 
 ## 7. Wasm Component ABI
 
@@ -623,8 +622,8 @@ interface plugin {
     list-tools: async func() -> string;
     execute-tool: async func(name: string, arguments-json: string)
         -> result<string, string>;
-    list-hooks: async func() -> string;
-    invoke-hook: async func(hook-id: string, event-json: string)
+    list-event-handlers: async func() -> string;
+    handle-event: async func(handler-id: string, event-json: string)
         -> result<string, string>;
     open-surface: async func(request-json: string)
         -> result<string, string>;
@@ -657,7 +656,7 @@ WIT 负责稳定的函数、方向和异步语义，而宿主可以复用现有�
 - `host.read-plugin-file` 只接受当前 global/project configuration root 下的相对
   路径，并原样返回文件字节。这里的 configuration root 不是
   `plugin.wasm` 所在的插件包目录。project root 是当前项目目录，global root 是
-  插件配置目录 `~/.agents` 而非整个 home，避免把 `.ssh`、`.aws` 等无关文件
+  插件配置目录 `~/.deluxe-agents` 而非整个 home，避免把 `.ssh`、`.aws` 等无关文件
   暴露给通用读取能力；
 - `host.write-plugin-file` 用同一套相对路径规则替换 scope root 内的文件，且必须在
   manifest 里声明 `permissions.writePluginFiles = true`，否则返回 permission denied。
@@ -676,7 +675,7 @@ WIT 负责稳定的函数、方向和异步语义，而宿主可以复用现有�
 - Wasm 没有 WASI import，因此不能直接访问文件系统、网络、进程、环境变量或
   keyring。
 
-当前 Component export 包括通用的 `list-hooks`/`invoke-hook` 和
+当前 Component export 包括通用的 `list-event-handlers`/`handle-event` 和
 `list-tools`/`execute-tool`。MCP Component 把 `tools/list` 的结果转换成普通
 Wasmtime tool descriptor，并在 `execute-tool` 内完成 `tools/call`。
 MCP `initialize`、`initialized`、`tools/list`、`tools/call`、JSON-RPC、
@@ -716,9 +715,9 @@ world prompt-plugin {
     export prompt-provider;
 }
 
-world hook-plugin {
+world event-plugin {
     import host;
-    export hook-provider;
+    export event-provider;
 }
 
 world agent-plugin {
@@ -753,7 +752,6 @@ example-plugin/
     "shortDescription": "A small Component plugin"
   },
   "runtime": {
-    "type": "wasm",
     "module": "plugin.wasm",
     "apiVersion": "deluxe.harness/plugin@0.1",
     "ui": {
@@ -772,7 +770,6 @@ example-plugin/
 - `name`：插件的短 id；完整运行时 id 仍是
   `name@marketplace`；
 - `version`：插件自己的 SemVer；
-- `runtime.type`：当前必须是 `wasm`；
 - `runtime.module`：相对插件 root 的 Component 文件；
 - `runtime.apiVersion`：WIT ABI 版本；
 - `runtime.ui`：允许暴露给宿主 UI 的 surface/action 名称；
@@ -792,7 +789,7 @@ scope 仍由 marketplace 和 `PluginSettings` 决定，不由 Wasm manifest 自�
 global marketplace 的插件会进入所有适用项目的 catalogue；project-scoped
 marketplace 的插件只会进入对应 project 的 catalogue。`PluginCatalogue::for_project`
 先合并 global plugins，再合并该项目的 plugins，并按 id 让项目级插件覆盖同 id 的
-global plugin。宿主把 global Component 绑定到全局 configuration root（`~/.agents`），
+global plugin。宿主把 global Component 绑定到全局 configuration root（`~/.deluxe-agents`），
 把 project Component 绑定到项目 configuration root；disabled
 plugin 不会进入 runtime。项目级插件覆盖同 id 的全局插件时，使用项目实例对应的
 项目 scope 配置。
@@ -1181,7 +1178,7 @@ configuration root 读取；项目级同 id 覆盖 global plugin 时，使用项
 ```text
 docs/wasmtime-plugin-implementation.md
 wit/deluxe-harness.wit
-plugin-fixtures/echo-tool/
+plugin-src/echo-tool/
 ```
 
 验收：
@@ -1211,7 +1208,7 @@ src/harness/runtime.rs
 5. `Agent` 改为依赖 `AgentServices`；
 6. `build_system_prompt` 改为依赖 `PromptPipeline`；
 7. `Agent::dispatch` 只调用 `ToolRuntime`；
-8. `Agent::run_hooks` 移到 `HookRuntime`。
+8. Agent 的插件事件转发移到 `PluginEventRuntime`。
 
 验收：
 
@@ -1338,7 +1335,7 @@ src/plugins/wasm_runtime.rs 底部
 
 ### 15.2 Wasm fixture 测试
 
-`plugin-fixtures/echo-tool` 至少提供：
+`plugin-src/echo-tool` 至少提供：
 
 1. `echo`：原样返回参数；
 2. `surface`：打开、处理 action 并关闭一个 UI snapshot；
@@ -1354,7 +1351,7 @@ src/plugins/wasm_runtime.rs 底部
 
 构建产物也可以携带默认 Wasmtime 插件包。主程序通过 `include_bytes!` 嵌入
 Component 及其 manifest，首次启动时将它们写入普通的
-`.codex/plugins/cache/<marketplace>/<plugin>/<version>/` 缓存目录，再沿用同一套
+`.deluxe-agents/plugins/cache/<marketplace>/<plugin>/<version>/` 缓存目录，再沿用同一套
 discovery、scope、启停、UI 和卸载逻辑。当前预置的 MCP Component id 是
 `mcp@deluxe-defaults`；它不携带 `.mcp.json`，运行时从当前 global/project scope
 根目录主动请求配置。
@@ -1397,7 +1394,7 @@ discovery、scope、启停、UI 和卸载逻辑。当前预置的 MCP Component 
 1. Add harness domain types and service traits
 2. Adapt the native LLM client to LlmProvider
 3. Move tool dispatch behind ToolRuntime
-4. Move hooks behind HookRuntime
+4. Move tool events behind PluginEventRuntime
 5. Add PluginManager capability resolution
 6. Add the harness WIT package and echo fixture
 7. Add Wasmtime component loading
@@ -1503,7 +1500,7 @@ Component 通过同一个通用 ABI 暴露 hooks/tools，并主动调用 `read-p
 当前已经完成的 MVP 验收项：
 
 - [x] 文档中的当前 ABI 与 `wit/deluxe-harness.wit` 一致；
-- [x] `plugin-fixtures/echo-tool` 可在离线测试中加载、注册并执行；
+- [x] `plugin-src/echo-tool` 可在离线测试中加载、注册并执行；
 - [x] project-scoped catalogue 能隔离 Wasm plugin；
 - [x] Wasm tool 能显示在 `<tools>` 和 OpenAI tools schema 中；
 - [x] Wasm tool 能执行并返回受校验的 `ToolOutput`；

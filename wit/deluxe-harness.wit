@@ -28,8 +28,8 @@ interface plugin {
     configure: async func() -> result<_, string>;
     list-tools: async func() -> string;
     execute-tool: async func(name: string, arguments-json: string) -> result<string, string>;
-    list-hooks: async func() -> string;
-    invoke-hook: async func(hook-id: string, event-json: string) -> result<string, string>;
+    list-event-handlers: async func() -> string;
+    handle-event: async func(handler-id: string, event-json: string) -> result<string, string>;
     open-surface: async func(request-json: string) -> result<string, string>;
     handle-action: async func(action-json: string) -> result<string, string>;
     close-surface: async func(surface-id: string);
