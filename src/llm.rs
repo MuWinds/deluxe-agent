@@ -31,12 +31,12 @@ const RETRY_DELAY_MAX: Duration = Duration::from_secs(30);
 
 /// How much reasoning effort to ask a reasoning model for.
 ///
-/// The six strengths are hardcoded because pi-ai fixes the union upstream:
-/// `off | minimal | low | medium | high | xhigh | max`, where `off` is not a
-/// strength but the absence of one. That absence is what `None` means wherever
-/// this type is carried — the request then sends no parameter at all — so only
-/// the six strengths are modelled here. A provider that spells a level
-/// differently maps it; it does not add a level.
+/// The strengths are hardcoded because pi-ai fixes the union upstream:
+/// `off | minimal | low | medium | high | xhigh | max`. Two of them are not
+/// strengths: `None` (the option) omits `reasoning_effort` entirely and lets
+/// the endpoint decide, while [`ThinkingLevel::Off`] sends `"none"` to ask the
+/// endpoint to turn reasoning off. They are distinct choices, so both exist.
+/// A provider that spells a level differently maps it; it does not add a level.
 ///
 /// Lives beside the wire format rather than in the config because it is chosen
 /// per conversation, like pi's shift+tab indicator: every session carries its
@@ -45,6 +45,11 @@ const RETRY_DELAY_MAX: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
+    /// Reasoning off. Sent as `"none"`, the value OpenAI-compatible endpoints
+    /// take to skip chain-of-thought. Explicit rename because the variant is
+    /// `Off` but the wire spelling is `none`.
+    #[serde(rename = "none")]
+    Off,
     Minimal,
     Low,
     Medium,
@@ -59,7 +64,8 @@ pub enum ThinkingLevel {
 
 impl ThinkingLevel {
     /// Every strength, weakest first — the order a picker lists them in.
-    pub const ALL: [ThinkingLevel; 6] = [
+    pub const ALL: [ThinkingLevel; 7] = [
+        ThinkingLevel::Off,
         ThinkingLevel::Minimal,
         ThinkingLevel::Low,
         ThinkingLevel::Medium,
@@ -71,6 +77,7 @@ impl ThinkingLevel {
     /// The value sent as `reasoning_effort` on the wire.
     pub fn wire(self) -> &'static str {
         match self {
+            Self::Off => "none",
             Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
@@ -83,6 +90,7 @@ impl ThinkingLevel {
     /// The label a picker shows.
     pub fn label(self) -> &'static str {
         match self {
+            Self::Off => "关闭",
             Self::Minimal => "极简",
             Self::Low => "低",
             Self::Medium => "中",
@@ -1152,6 +1160,15 @@ mod tests {
         // not be handed one by default.
         let body = client().turn_body(&[], &json!([]), None);
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn off_sends_none_rather_than_omitting_the_parameter() {
+        // The explicit "关闭" choice and the unset default are different
+        // requests: one asks the endpoint to skip reasoning, the other says
+        // nothing. Collapsing them would silently change what a user picked.
+        let body = client().turn_body(&[], &json!([]), Some(ThinkingLevel::Off));
+        assert_eq!(body["reasoning_effort"], "none");
     }
 
     #[test]

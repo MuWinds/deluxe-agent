@@ -363,6 +363,10 @@ impl App {
                 if sidebar_row(ui, p, icons::NOTE_PENCIL, "新聊天", false, false).clicked() {
                     intents.push(UiIntent::NewSession);
                 }
+                if sidebar_row(ui, p, icons::FOLDER_SIMPLE, "新增项目", false, false).clicked()
+                {
+                    intents.push(UiIntent::AddProject);
+                }
                 ui.add_space(12.0);
 
                 if !query.is_empty() {
@@ -387,9 +391,7 @@ impl App {
                     .id_salt("sidebar")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        if section_header_with_add(ui, p, "项目") {
-                            intents.push(UiIntent::AddProject);
-                        }
+                        section_label(ui, p, "项目");
                         // A project list that could not be written is reported
                         // here, beside the projects it is about.
                         if let Some(error) = &sidebar_error {
@@ -418,9 +420,16 @@ impl App {
                                 for session in
                                     sessions.iter().filter(|s| &s.project == project).rev()
                                 {
-                                    if session_row(ui, p, session, selected, now, true).clicked() {
+                                    let response = session_row(ui, p, session, selected, now, true);
+                                    if response.clicked() {
                                         intents.push(UiIntent::SelectSession(session.id));
                                     }
+                                    response.context_menu(|ui| {
+                                        if ui.button("删除").clicked() {
+                                            intents.push(UiIntent::DeleteSession(session.id));
+                                            ui.close();
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -660,28 +669,6 @@ impl App {
                             }
 
                             ui.horizontal(|ui| {
-                                ui.menu_button(
-                                    RichText::new(icons::PLUS).size(theme::font(16.0)),
-                                    |ui| {
-                                        if ui.button("新建会话").clicked() {
-                                            intents.push(UiIntent::NewSession);
-                                            ui.close();
-                                        }
-                                        if ui.button("添加项目…").clicked() {
-                                            intents.push(UiIntent::AddProject);
-                                            ui.close();
-                                        }
-                                        if ui.button("粘贴图片").clicked() {
-                                            intents.push(UiIntent::PasteImage);
-                                            ui.close();
-                                        }
-                                        if ui.button("插入图片…").clicked() {
-                                            intents.push(UiIntent::PickImage);
-                                            ui.close();
-                                        }
-                                    },
-                                );
-
                                 let editor_width = (ui.available_width()
                                     - CONTEXT_GAUGE_RESERVE
                                     - THINKING_PICKER_RESERVE
@@ -1004,9 +991,8 @@ impl App {
     /// endpoint that never reported usage) leaves the arc unpainted, and no
     /// window configured (limit 0) greys the whole thing out.
     ///
-    /// Deliberately not a button: it is a gauge. The mouse paths to the image
-    /// intake stay where they already were, in the plus menu — duplicating them
-    /// here is what this slot used to do.
+    /// Deliberately not a button: it is a gauge. The image intake is Ctrl+V and
+    /// drag-and-drop only, so there is no mouse path to duplicate here.
     fn draw_context_gauge(&self, ui: &mut egui::Ui, p: &Palette) {
         let session = self.selected_session();
         let measured = session
@@ -1899,39 +1885,6 @@ fn section_label(ui: &mut egui::Ui, p: &Palette, text: &str) {
             .color(p.text_muted),
     );
     ui.add_space(2.0);
-}
-
-/// A section label with a trailing `+` button, for a section that can be added
-/// to. Returns whether `+` was clicked.
-///
-/// Laid out as a row rather than label-then-button so the action shares the
-/// header's line: a `+` that dropped to its own row would read as a control
-/// belonging to the first item rather than to the section.
-fn section_header_with_add(ui: &mut egui::Ui, p: &Palette, text: &str) -> bool {
-    let mut clicked = false;
-    ui.add_space(2.0);
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(text)
-                .size(theme::font(11.0))
-                .color(p.text_muted),
-        );
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            clicked = ui
-                .add(
-                    egui::Button::new(
-                        RichText::new(icons::PLUS)
-                            .size(theme::font(12.0))
-                            .color(p.text_muted),
-                    )
-                    .frame(false),
-                )
-                .on_hover_text("添加项目")
-                .clicked();
-        });
-    });
-    ui.add_space(2.0);
-    clicked
 }
 
 fn circle_button<'a>(icon: &'a str, p: &Palette) -> egui::Button<'a> {

@@ -1284,8 +1284,6 @@ impl App {
                 }
                 UiIntent::UninstallPlugin { id, scope } => self.uninstall_plugin(&id, &scope),
                 UiIntent::AddProject => self.add_project(),
-                UiIntent::PasteImage => self.paste_image(),
-                UiIntent::PickImage => self.pick_image(),
                 UiIntent::RemovePendingImage(id) => {
                     self.pending_images.retain(|image| image.id != id);
                 }
@@ -1369,30 +1367,6 @@ impl App {
         } else {
             self.notice_error(None, "剪贴板里没有图片或图片文件");
         }
-    }
-
-    /// Reads an image out of the clipboard and queues it.
-    ///
-    /// File paths first — what Explorer / Finder / file managers put there for
-    /// copied files — falling back to bitmap pixels, which is what a screenshot
-    /// or "copy image" produces.
-    fn paste_image(&mut self) {
-        if let Some(source) = clipboard_image() {
-            self.intake_image_source(source);
-        } else {
-            self.notice_error(None, "剪贴板里没有图片或图片文件");
-        }
-    }
-
-    /// Picks an image file and queues it.
-    fn pick_image(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("图片", &["png", "jpg", "jpeg", "webp", "gif"])
-            .pick_file()
-        else {
-            return;
-        };
-        self.intake_image_source(ClipboardImage::Paths(vec![path]));
     }
 
     /// Files dragged onto the window. The drop arrives as paths on every

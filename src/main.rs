@@ -13,8 +13,9 @@
 // keep the console so `tracing` output is visible while developing.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, RwLock};
@@ -239,6 +240,11 @@ fn spawn_worker(
         // context files are read from there) and every tool's working
         // directory.
         let mut runtimes: HashMap<PathBuf, Arc<ProjectRuntime>> = HashMap::new();
+        // Projects whose plugin configuration changed after their agent was
+        // built. A plugin surface action can stop or uninstall an MCP server,
+        // which changes the tools the agent must see; the project's runtime is
+        // rebuilt on the next run rather than waiting for a manual refresh.
+        let stale_projects: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
         let mut surfaces: HashMap<SurfaceRequest, SurfaceHandle> = HashMap::new();
         let factory = ProjectRuntimeFactory::new(
             worker.settings.clone(),
@@ -339,7 +345,12 @@ fn spawn_worker(
                             as Box<dyn PluginUiExecutor>)
                     };
                     let event_sink = sink.clone();
+                    let acted = Arc::new(AtomicBool::new(false));
+                    let stale = stale_projects.clone();
                     let emit = Arc::new(move |event| {
+                        if let PluginUiEvent::Updated { request, .. } = &event {
+                            note_surface_snapshot(&acted, &stale, &request.project);
+                        }
                         event_sink.emit_ui(match event {
                             PluginUiEvent::Updated { request, document } => {
                                 Event::PluginUiUpdated { request, document }
@@ -639,9 +650,19 @@ fn spawn_worker(
                         continue;
                     };
 
+                    // A plugin surface changed configuration since this
+                    // project's agent was built. Rebuilding here — rather than
+                    // on the action itself — lets the guest finish applying it
+                    // first, and a rebuild that reuses the cached actor and the
+                    // shared job registry leaves background jobs untouched.
+                    let stale = stale_projects
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&project);
+
                     let agent = match runtimes.get(&project) {
-                        Some(runtime) => runtime.agent.clone(),
-                        None => {
+                        Some(runtime) if !stale => runtime.agent.clone(),
+                        _ => {
                             let model = RuntimeModelSettings {
                                 base_url: settings.base_url.clone(),
                                 model: settings.model.clone(),
@@ -669,6 +690,9 @@ fn spawn_worker(
                                 }
                             };
                             let agent = runtime.agent.clone();
+                            // Replacing the entry drops the previous runtime
+                            // without calling `shutdown`, so a stale agent's
+                            // jobs keep running and stay listed.
                             runtimes.insert(project.clone(), runtime);
                             agent
                         }
@@ -742,6 +766,22 @@ async fn invalidate_runtimes(
     factory.clear_components();
 }
 
+/// Records that a plugin surface produced a snapshot.
+///
+/// The first snapshot follows the surface opening; every later one follows an
+/// action, which may have changed the plugin's configuration. Only the latter
+/// marks `project` stale, so the next run rebuilds its runtime. Marking when
+/// the guest replies — not when the action is queued — guarantees the rebuild
+/// reads the state the action produced.
+fn note_surface_snapshot(acted: &AtomicBool, stale: &Mutex<HashSet<PathBuf>>, project: &Path) {
+    if acted.swap(true, Ordering::SeqCst) {
+        stale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(project.to_path_buf());
+    }
+}
+
 /// Wraps the app so `eframe` can drive it, and so the runtime outlives the
 /// window instead of being dropped at the end of `main`.
 struct AgentFrame {
@@ -773,5 +813,37 @@ impl eframe::App for AgentFrame {
             runtime.shutdown_timeout(std::time::Duration::from_secs(2));
         }
         tracing::info!("window closed; the agent runtime has stopped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Opening a surface must not invalidate the agent; only a snapshot that
+    /// follows an action can have changed configuration, and only for the
+    /// project whose surface acted.
+    #[test]
+    fn only_a_snapshot_after_an_action_marks_its_project_stale() {
+        let stale = Mutex::new(HashSet::new());
+        let repo = AtomicBool::new(false);
+        let other = AtomicBool::new(false);
+        let project = Path::new("/work/repo");
+        let elsewhere = Path::new("/work/other");
+
+        note_surface_snapshot(&repo, &stale, project);
+        note_surface_snapshot(&other, &stale, elsewhere);
+        assert!(
+            stale.lock().expect("stale set is not poisoned").is_empty(),
+            "opening a surface changes nothing"
+        );
+
+        note_surface_snapshot(&repo, &stale, project);
+        let marked = stale.lock().expect("stale set is not poisoned");
+        assert!(marked.contains(project), "an action marks its project");
+        assert!(
+            !marked.contains(elsewhere),
+            "another surface's project is untouched"
+        );
     }
 }

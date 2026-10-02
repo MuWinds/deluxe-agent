@@ -51,8 +51,6 @@ pub(super) enum UiIntent {
     },
     AddProject,
     RemoveProject(String),
-    PasteImage,
-    PickImage,
     RemovePendingImage(String),
     SaveSettings,
 }
