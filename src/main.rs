@@ -941,7 +941,11 @@ mod tests {
     /// freshly used one survives, and the deadline is inclusive.
     #[test]
     fn only_projects_past_the_ttl_expire() {
-        let now = Instant::now();
+        // `Instant` has no fixed epoch: on some platforms it starts near
+        // process start, so dating an entry by subtracting from `now` can
+        // underflow. Move the reference 600s ahead — past the largest offset
+        // below — and build the entries forward from the real clock.
+        let now = Instant::now() + Duration::from_secs(600);
         let mut activity = HashMap::new();
         activity.insert(PathBuf::from("/work/fresh"), now - Duration::from_secs(60));
         activity.insert(
