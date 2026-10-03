@@ -6,8 +6,9 @@
 当前插件格式唯一固定为 Wasmtime Component，不兼容旧的可执行插件格式。每个插件
 都必须是 Wasmtime Component；tool、hook、MCP loading、MCP tool adapter 以及
 MCP transport 都由对应 Component 提供。宿主只提供显式授权的安全能力和 Agent
-编排。Component 仍可提供 skills、commands、agents 等声明式内容，这些内容仍
-属于同一个 Wasmtime 插件。
+编排。Component 还可以通过通用的 prompt 片段接口贡献系统提示词文本，通过通用
+工具接口贡献工具，以及提供 agents 子角色；宿主只把文本按原样拼进 system prompt，
+不解析其中的语义。
 
 `.mcp.json` 和 `.hooks.json` 不是插件包资源，也不属于 `plugin.json`。Plugin
 discovery 只读取插件根目录的 `plugin.json` 和 `plugin.wasm`，并根据插件的
@@ -22,8 +23,8 @@ Hooks matcher 和 command 执行都由对应 Component 自己负责。
 
 最终系统应具备以下能力：
 
-- 插件可以通过 Wasmtime Component 贡献工具、提示词片段、技能、命令、子 Agent
-  角色和生命周期 hook；
+- 插件可以通过 Wasmtime Component 贡献工具、提示词片段、子 Agent 角色和生命周期
+  hook；
 - 插件按 global/project scope 加载，project 插件不能泄漏到其他项目；
 - 所有插件都是 Wasm Component，不存在非 Wasm 插件；MCP 和 Hooks 由对应
   Component 实现，不是宿主识别的插件类型；
@@ -32,8 +33,8 @@ Hooks matcher 和 command 执行都由对应 Component 自己负责。
 - hooks 和 MCP server/tool discovery、连接、协议握手、framing、结果解析均在
   provider 内完成；
 - Agent loop 不关心工具的实现来源，只通过统一的宿主服务接口调用；
-- Wasm 插件拥有独立的实例状态、超时、取消、内存和执行预算；
-- 插件崩溃、trap、超时、非法返回值只影响当前插件调用，不拖垮 GUI 和其他 Agent；
+- Wasm 插件拥有独立的实例状态、取消和执行预算；
+- 插件崩溃、trap、out of fuel、非法返回值只影响当前插件调用，不拖垮 GUI 和其他 Agent；
 - 插件 ABI 通过 WIT 版本化，不把 Rust 私有类型直接暴露给 Wasm；
 - 宿主仍然掌握文件、进程、网络、LLM、会话和事件能力，但插件只能通过
   `CapabilityHub` 获得它们；
@@ -76,7 +77,7 @@ main
         -> Task Tool
         -> system prompt
            -> tools
-           -> skills
+           -> plugin prompt sections
            -> agents
            -> host rules
            -> project context
@@ -130,7 +131,7 @@ Wasm 插件只能在 worker 侧运行。GUI 不得直接加载、实例化或调
 4. hook 如何通过 Component export 执行；
 5. context compaction 如何请求摘要；
 6. JobRegistry 如何产生 notice；
-7. 插件的 skill、agent role 和 Wasmtime metadata 如何进入 prompt；
+7. 插件的 agent role、prompt 片段和 Wasmtime metadata 如何进入 prompt；
 8. GUI 需要哪些 `Event`。
 
 这使得 `Agent` 成为所有机制的耦合中心。插件化的第一步不是 Wasmtime，而是把
@@ -254,7 +255,7 @@ plugin-src/
   `PromptSection`、`AgentEvent` 等领域类型；
 - `harness/services.rs`：宿主内部 trait；
 - `harness/events.rs`：Agent 领域事件和订阅；
-- `harness/prompt.rs`：tools、skills、agents、rules 的贡献合并；
+- `harness/prompt.rs`：tools、plugin prompt sections、agents、rules 的贡献合并；
 - `harness/runtime.rs`：Agent 运行所需服务集合；
 - `plugins/wasm_manifest.rs`：Wasm 插件 manifest 解析；
 - `plugins/wasm_runtime.rs`：Wasmtime `Engine`、`Component`、`Linker`、`Store`
@@ -378,7 +379,8 @@ Wasm 工具最终也只需要实现 `ToolRuntime` 的 adapter，而不需要进�
 
 ### 5.4 PromptContributor
 
-当前 `build_system_prompt` 直接知道 skill、agent role 和 rules 的具体来源。应抽成：
+当前 `build_system_prompt` 直接知道 tool、agent role、plugin prompt section 和 rules
+的具体来源。应抽成：
 
 ```rust
 #[async_trait::async_trait]
@@ -405,8 +407,9 @@ pub struct PromptContext {
 当前实现映射为：
 
 - `BuiltinPromptContributor`：内置工具说明和 host rules；
-- `NativePluginPromptContributor`：skills、agents、commands 的 prompt 相关部分；
-- `WasmPromptContributor`：Wasm 插件导出的 prompt sections。
+- `NativePluginPromptContributor`：agents 的 prompt 相关部分；
+- `WasmPromptContributor`：Wasm 插件导出的 prompt sections（内置 prompt provider
+  读取 skills 等资源后在 `prompt-sections` 里贡献）。
 
 所有 contributor 必须返回稳定排序后的内容。排序规则：
 
@@ -514,7 +517,7 @@ pub struct Agent {
 - 工具 registry 的内部 map；
 - MCP JSON-RPC 或 transport framing；
 - provider 的 hook/MCP 声明格式；
-- skills 的目录；
+- 内置 prompt provider 读什么目录、怎么排版；
 - JobRegistry 的实现。
 
 ### 6.2 dispatch 迁移
@@ -916,22 +919,21 @@ wasmtime-wasi = "..."
 如果第一版不需要 WASI，则不要引入完整 WASI capability，只使用 component runtime
 和自定义 host imports。
 
-### 10.2 超时、取消和 CPU 限制
+### 10.2 取消和 fuel 限制
 
-一次插件调用至少有三层限制：
+一次插件调用只有两层控制：
 
-1. Tokio host timeout；
-2. `CancellationToken`；
-3. Wasmtime epoch/fuel。
+1. `CancellationToken`；
+2. Wasmtime fuel。
 
-三者职责不同：
+两者职责不同：
 
-- Tokio timeout 限制宿主异步 I/O 总时长；
-- cancellation 响应用户取消和插件卸载；
-- epoch/fuel 终止纯 Wasm CPU 死循环。
+- cancellation 响应用户取消和插件卸载，也结束正在等待的宿主 I/O；
+- fuel 终止纯 Wasm CPU 死循环，是唯一的执行预算。
 
-epoch/fuel 不能替代 Tokio timeout。插件调用宿主 `invoke-tool` 后，真正阻塞的可能
-是文件、进程、MCP 或 HTTP I/O，必须由宿主服务自己处理超时。
+宿主没有 wall-clock 超时：一次调用能跑多久由调用方是否取消决定，而不是由固定秒数
+决定。插件调用宿主 `invoke-tool` 后，文件、进程、MCP 或 HTTP I/O 由宿主服务在取消
+信号下自行收尾。
 
 取消路径：
 
@@ -942,23 +944,18 @@ epoch/fuel 不能替代 Tokio timeout。插件调用宿主 `invoke-tool` 后，�
   -> AgentRuntime 停止当前循环
   -> ToolRuntime 停止等待
   -> PluginActor 收到 cancel
-  -> epoch/future 返回 cancelled
+  -> future 返回 cancelled
   -> 清理插件 job
 ```
 
-### 10.3 内存和实例上限
+### 10.3 执行预算
 
-每个插件实例设置：
+插件实例只设置一个执行预算：
 
-- 最大 Wasm linear memory；
-- 最大 table elements；
-- 最大 concurrent instances；
-- 最大返回 payload；
-- 最大 event payload；
-- 最大 plugin-created jobs；
-- 最大 plugin log message。
+- 单次调用的 Wasmtime fuel（`CALL_FUEL = 10_000_000`）。
 
-超过限制统一返回 `plugin_resource_limit`，不允许转成宿主 panic。
+没有 linear memory、table、concurrent instances、payload、job 或 log 上限。fuel 耗尽
+统一返回 `plugin_resource_limit`，不允许转成宿主 panic。
 
 ### 10.4 WASI 权限
 
@@ -987,17 +984,17 @@ Wasm sandbox。Wasm 插件文件访问必须增加独立的 capability 检查，
 
 ### 10.5 错误和 panic
 
-插件侧的 trap、invalid return、out of fuel、超时和资源限制全部映射为稳定错误码：
+插件侧的 trap、invalid return、out of fuel 和资源限制全部映射为稳定错误码：
 
 ```text
 plugin_load_failed
 plugin_api_mismatch
 plugin_trap
-plugin_timeout
 plugin_cancelled
 plugin_resource_limit
 plugin_invalid_output
 plugin_permission_denied
+plugin_file_not_found
 ```
 
 宿主非测试代码继续禁止 `unwrap()`、`expect()` 和 `panic!()`。Wasm 调用返回的
@@ -1099,14 +1096,18 @@ registry = empty_with_jobs(host_registry.jobs())
 
 ### 12.3 Agent role 与 task
 
-当前不让 Wasm 插件直接创建任意 `Agent`。Wasm 插件如果需要子 Agent：
+Wasm 插件不直接创建 `Agent`，但可以委托宿主跑一次嵌套 Agent。宿主提供一个通用的
+`run-agent` import：插件传入角色的名字、instructions、prompt 和是否后台，宿主拥有模型
+循环、工具集和事件流，回传答案或 job id。
 
-- 先导出静态 role metadata；
-- 由宿主现有 `task` 工具调度；
-- role 的工具 registry 仍由宿主创建；
+- 角色文件（`agents/*.md`）由插件自己读取和解析，宿主不知道它们的布局；
+- 委托工具（`task`）由插件通过 `list-tools` 提供，`execute-tool` 里调用 `run-agent`；
+- 嵌套 Agent 的 registry 是宿主在注册委托工具之前拍的快照，所以它不能再委托，委托被
+  限制在单层；
 - 子 Agent 不继承 plugin hooks，沿用当前防止 hook 重复执行的规则。
 
-等 `AgentDriver` ABI 稳定后，再增加独立的 `agent-plugin` world。
+`run-agent` 是通用能力，任何被授予它的 Component 都能委托；内置的 agents Component 只是
+第一个使用者。等 `AgentDriver` ABI 稳定后，再考虑让插件替换整个 agent loop。
 
 ## 13. Wasm Provider 统一模型
 
@@ -1148,7 +1149,7 @@ server declaration，自己拥有协议、握手、消息 framing、transport �
 
 ```text
 Wasmtime plugin
-  -> skills / commands / agents
+  -> prompt sections / agents
   -> Component tools
   -> Hooks Component + read-plugin-file(".hooks.json")
   -> MCP Component + read-plugin-file(".mcp.json")
@@ -1428,7 +1429,7 @@ cargo test
 ```text
 identity
 tools
-skills
+plugin prompt sections
 agents
 rules
 project context

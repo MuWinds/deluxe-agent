@@ -17,6 +17,7 @@ pub use crate::harness::{AuditOutcome, HunkLines, RunId, RunState};
 use crate::llm::{Message, ThinkingLevel, Usage, UserTurn};
 use crate::plugins::ui_protocol::{PluginUiAction, PluginUiDocument, SurfaceRequest};
 use crate::plugins::{PluginCatalogue, PluginSettings, Scope};
+use crate::renderer::protocol::{Node, RenderKey, RenderKind, RenderMetrics, ToolRenderRequest};
 use crate::session::Session;
 use crate::tools::jobs::{JobSnapshot, JobStatus};
 use crate::tools::ToolSettings;
@@ -187,6 +188,22 @@ pub enum Cmd {
     KillJob {
         project: PathBuf,
         job_id: String,
+    },
+    /// Asks the worker to render a message body into a display list.
+    ///
+    /// `revision` is monotonic per `key`; the GUI discards a response whose
+    /// revision is older than the one it last requested.
+    RenderMessage {
+        key: RenderKey,
+        revision: u64,
+        text: String,
+        metrics: RenderMetrics,
+    },
+    /// Asks the worker to render a tool card body into a display list.
+    RenderTool {
+        key: RenderKey,
+        revision: u64,
+        request: ToolRenderRequest,
     },
 }
 
@@ -387,6 +404,32 @@ pub enum Event {
         job_id: String,
         event: Box<Event>,
     },
+    /// A message body was rendered. `nodes` is already decoded and validated.
+    MessageRendered {
+        key: RenderKey,
+        revision: u64,
+        nodes: Arc<Vec<Node>>,
+    },
+    /// A tool card was rendered. `nodes` is already decoded and validated.
+    ToolRendered {
+        key: RenderKey,
+        revision: u64,
+        nodes: Arc<Vec<Node>>,
+    },
+    /// A render request failed; the GUI falls back to plain text. The message
+    /// is a machine code plus a short human half, never the body text.
+    RenderFailed {
+        key: RenderKey,
+        revision: u64,
+        kind: RenderKind,
+        message: String,
+    },
+    /// The transcript-renderer plugin's availability changed. Emitted at worker
+    /// start and whenever the plugin catalogue is reloaded. When `available` is
+    /// false the GUI draws every body as plain text.
+    RendererAvailability {
+        available: bool,
+    },
 }
 
 /// Where a background job is, as the window's task list shows it.
@@ -429,6 +472,7 @@ impl JobState {
 #[derive(Debug, Clone)]
 pub struct JobView {
     pub id: String,
+    /// The job's tool name (`bash`, `exec`, …).
     /// `subagent` for a delegated child, otherwise the job's tool name (`bash`).
     pub kind: String,
     pub label: String,

@@ -179,6 +179,20 @@ export!(ExamplePlugin);
 
 所有 JSON 都是 UTF-8 字符串。未知字段通常会被 Agent 忽略。
 
+### 3.2 可选的 `prompt` interface
+
+除了 `plugin`，Component 还可以导出 `prompt` interface，让宿主把一段文本原样拼进
+system prompt：
+
+| 导出 | 返回值 | 用途 |
+| --- | --- | --- |
+| `prompt-sections()` | `result<string, string>` | 返回本生效范围要贡献的 prompt 文本；返回空串表示不贡献。 |
+
+宿主不解析这段文本，也不规定它的排版；Component 自己决定读什么、怎么措辞。使用它
+需要 world 同时 `export prompt`（见 `wit/deluxe-harness.wit` 的 `prompt-provider`
+world）。平台按 `prompt-plugin` world 做可选绑定，绑定失败只意味着该 Component 不
+贡献 prompt 文本，不影响它作为普通 `plugin` 加载。
+
 ## 4. 工具相关的协议
 
 ### 4.1 `list-tools`
@@ -336,8 +350,11 @@ WIT 的 `host` interface 提供以下能力：
 | --- | --- | --- |
 | `read-plugin-file(path)` | 无额外开关 | 读取当前生效范围（项目级或全局级）下配置根目录内的文件。 |
 | `write-plugin-file(path, contents)` | `writePluginFiles: true` | 写入当前生效范围配置根目录内的文件。 |
+| `list-plugin-files(path)` | 无额外开关 | 列出配置根目录下某个相对目录内的普通文件，返回相对根目录、以 `/` 分隔并排序的路径；目录不存在时报 `plugin_file_not_found:`。 |
+| `configuration-root()` | 无额外开关 | 返回本实例文件能力绑定的配置根目录绝对路径，供插件向模型展示绝对路径。 |
 | `list-tools()` | 仅返回 `invokeTools` 中允许的工具 | 查询可调用的宿主工具描述。 |
 | `invoke-tool(name, arguments-json)` | `invokeTools` | 按宿主正常工具运行时执行。 |
+| `run-agent(request-json)` | 由宿主按需授予，不在 manifest 里声明 | 跑一次嵌套 Agent：请求带角色的名字、instructions、prompt 和是否后台；前台返回 `{"answer": ...}`，后台返回 `{"jobId": ...}`。宿主拥有模型循环、工具集和事件流。 |
 | `spawn-process(...)` | `processCommands` | 启动插件拥有的 transport 进程。 |
 | `process-write/read/close` | 对应已创建的句柄 | 进程的有界字节 I/O。 |
 | `http-request(...)` | `networkHosts` | 对声明过的 host 发起 HTTP(S) 请求。 |
@@ -352,25 +369,16 @@ WIT 的 `host` interface 提供以下能力：
 - 插件文件路径必须是生效范围内的相对路径；不要使用绝对路径或 `..`；
 - `spawn-process` 的工作目录必须位于配置目录的根目录内；
 - process 和 HTTP 都是原始字节/响应能力，MCP JSON-RPC、SSE、framing 和协议解析由插件自己负责；
-- 所有请求、响应和单次读写都有 payload 上限；句柄不应长期泄漏；
+- 宿主不为 process/HTTP 的单次读写设置 payload 上限，插件应自行控制读取量；
 - 插件关闭或 reload 时，宿主会终止该实例创建的进程并释放 HTTP 响应。
 
-当前实现的主要硬限制如下
+当前实现只保留 fuel 作为唯一的执行预算；内存、payload、wall-clock 超时和句柄数量上限均已移除。
 
 | 项目 | 上限 |
 | --- | ---: |
-| `plugin.wasm` Component 大小 | 16 MiB |
-| 单次 Component JSON 响应和 UI payload | 256 KiB |
-| 单个插件配置文件读写 | 1 MiB |
-| 单次 process/HTTP 读取 | 256 KiB |
-| 一个 Component 实例的线性内存 | 32 MiB |
-| 一个 Component 实例的 table 元素 | 10,000 |
-| 一个 Component 实例的 Wasm instance 数 | 32 |
 | 单次 Component 调用 fuel | 10,000,000 |
-| 单次 Component/UI 调用 wall-clock 超时 | 60 秒 |
-| 一个实例同时持有的 process/HTTP transport 句柄 | 64 |
 
-超时、fuel、取消或资源限制命中时，宿主会结束当前调用并把错误限制在该插件运行时；插件仍应在正常路径主动关闭 process 和 HTTP 句柄。
+fuel 耗尽时，宿主会结束当前调用并把错误限制在该插件运行时；插件仍应在正常路径主动关闭 process 和 HTTP 句柄。
 
 ## 8. 构建 Component
 

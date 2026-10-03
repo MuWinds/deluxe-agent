@@ -32,7 +32,7 @@ pub(super) struct SubagentRun {
     pub(super) job_id: String,
     /// The `task` role the sub-agent runs.
     pub(super) agent: String,
-    /// Salt for the Markdown renderer's scroll areas.
+    /// Salt for the renderer's scroll areas.
     pub(super) salt: Uuid,
     pub(super) steps: Vec<Step>,
 }
@@ -92,8 +92,6 @@ pub struct App {
     pub(super) search: String,
     pub(super) context_limit_text: String,
     pub(super) max_output_tokens_text: String,
-    pub(super) command_highlight: usize,
-    pub(super) command_picker_dismissed: Option<String>,
     pub(super) expanded_reasoning: HashSet<Uuid>,
     pub(super) stick_to_bottom: bool,
     pub(super) jobs: Vec<JobView>,
@@ -110,4 +108,10 @@ pub struct App {
     pub(super) settings_error: Option<String>,
     pub(super) plugins_error: Option<String>,
     pub(super) sidebar_error: Option<String>,
+
+    /// The renderer's IR, in memory only. See [`super::render_cache`].
+    pub(super) render_cache: super::render_cache::RenderCache,
+    /// Cleared once the worker reports the renderer could not load, after which
+    /// the GUI stops sending render requests and draws the native parser.
+    pub(super) renderer_available: bool,
 }

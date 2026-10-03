@@ -26,6 +26,7 @@
 //! A foreground command that finishes inside its budget never exposes the id:
 //! its record is dropped, and the model sees the ordinary result.
 
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -128,11 +129,11 @@ impl ShellKind {
     }
 
     /// Builds the program and arguments for this backend.
-    fn command_line(self, command: &str) -> Result<(&'static str, Vec<String>)> {
+    fn command_line(self, command: &str) -> Result<(PathBuf, Vec<String>)> {
         match self {
             #[cfg(windows)]
             Self::PowerShell => Ok((
-                "pwsh.exe",
+                powershell_program(),
                 vec![
                     "-NoLogo".into(),
                     "-NoProfile".into(),
@@ -142,24 +143,59 @@ impl ShellKind {
                 ],
             )),
             #[cfg(windows)]
-            Self::GitBash => Ok(("bash.exe", vec!["-lc".into(), command.into()])),
+            Self::GitBash => Ok(("bash.exe".into(), vec!["-lc".into(), command.into()])),
             #[cfg(windows)]
             Self::Wsl => Ok((
-                "wsl.exe",
+                "wsl.exe".into(),
                 vec!["-e".into(), "bash".into(), "-lc".into(), command.into()],
             )),
             #[cfg(windows)]
-            Self::Cmd => Ok(("cmd.exe", vec!["/C".into(), command.into()])),
+            Self::Cmd => Ok(("cmd.exe".into(), vec!["/C".into(), command.into()])),
             #[cfg(unix)]
-            Self::Sh => Ok(("sh", vec!["-lc".into(), command.into()])),
+            Self::Sh => Ok(("sh".into(), vec!["-lc".into(), command.into()])),
             #[cfg(unix)]
-            Self::Bash => Ok(("bash", vec!["-lc".into(), command.into()])),
+            Self::Bash => Ok(("bash".into(), vec!["-lc".into(), command.into()])),
             #[cfg(unix)]
-            Self::Zsh => Ok(("zsh", vec!["-lc".into(), command.into()])),
+            Self::Zsh => Ok(("zsh".into(), vec!["-lc".into(), command.into()])),
             #[cfg(unix)]
-            Self::Fish => Ok(("fish", vec!["-lc".into(), command.into()])),
+            Self::Fish => Ok(("fish".into(), vec!["-lc".into(), command.into()])),
         }
     }
+}
+
+/// The PowerShell executable the `powershell` backend runs.
+///
+/// The backend is named `powershell` on this platform, but PowerShell 7's
+/// `pwsh.exe` is a separate install and is absent from a stock Windows —
+/// hardcoding it makes `exec` fail with "program not found" on every machine
+/// that never installed it. Prefer `pwsh`, then fall back to the Windows
+/// PowerShell 5.1 that ships inside `SystemRoot`, and let the OS resolve the
+/// bare name against `PATH` if even that lookup finds nothing.
+#[cfg(windows)]
+fn powershell_program() -> PathBuf {
+    if executable_on_path("pwsh.exe").is_some() {
+        return PathBuf::from("pwsh.exe");
+    }
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        let bundled = PathBuf::from(root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        if bundled.is_file() {
+            return bundled;
+        }
+    }
+    PathBuf::from("powershell.exe")
+}
+
+/// The first `program` on `PATH` that is an existing file, if any.
+#[cfg(windows)]
+fn executable_on_path(program: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file())
 }
 
 #[async_trait::async_trait]
@@ -497,7 +533,7 @@ mod tests {
     #[cfg(windows)]
     fn builds_gitbash_command() {
         let (program, args) = ShellKind::GitBash.command_line("git status").unwrap();
-        assert_eq!(program, "bash.exe");
+        assert_eq!(program, PathBuf::from("bash.exe"));
         assert_eq!(args, vec!["-lc", "git status"]);
     }
 
@@ -505,15 +541,33 @@ mod tests {
     #[cfg(windows)]
     fn builds_wsl_command_with_the_default_distro() {
         let (program, args) = ShellKind::Wsl.command_line("ls -la").unwrap();
-        assert_eq!(program, "wsl.exe");
+        assert_eq!(program, PathBuf::from("wsl.exe"));
         assert_eq!(args, vec!["-e", "bash", "-lc", "ls -la"]);
+    }
+
+    /// A stock Windows has no `pwsh.exe`, so the resolver must still name a
+    /// PowerShell — otherwise `exec` dies on "program not found" for every
+    /// command.
+    #[test]
+    #[cfg(windows)]
+    fn resolves_a_powershell_even_without_pwsh() {
+        let program = powershell_program();
+        let name = program
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert!(
+            name.eq_ignore_ascii_case("pwsh.exe") || name.eq_ignore_ascii_case("powershell.exe"),
+            "expected a PowerShell executable, got `{}`",
+            program.display()
+        );
     }
 
     #[test]
     #[cfg(unix)]
     fn builds_unix_command_lines() {
         let (program, args) = ShellKind::Sh.command_line("ls -la").unwrap();
-        assert_eq!(program, "sh");
+        assert_eq!(program, PathBuf::from("sh"));
         assert_eq!(args, vec!["-lc", "ls -la"]);
     }
 }

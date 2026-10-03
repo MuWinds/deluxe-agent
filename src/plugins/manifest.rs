@@ -22,13 +22,6 @@ pub struct PluginManifest {
     /// written for people and reads better, carries no short description.
     #[serde(default)]
     pub description: Option<String>,
-    /// Relative path to the skill directories, e.g. `./skills/`.
-    ///
-    /// A *supplement* to the standard location, not a replacement: Codex scans
-    /// `skills/` whether or not this is set, and so does this agent. See
-    /// [`crate::plugins::skills`].
-    #[serde(default)]
-    pub skills: Option<String>,
     #[serde(default)]
     pub interface: Option<PluginInterface>,
     #[serde(default)]
@@ -227,7 +220,6 @@ mod tests {
       "repository": "https://github.com/openai/plugins",
       "license": "LicenseRef-Figma-Developer-Terms",
       "keywords": ["figma", "design"],
-      "skills": "./skills/",
       "apps": "./.app.json",
       "interface": {
         "displayName": "Figma",
@@ -252,7 +244,6 @@ mod tests {
 
         assert_eq!(manifest.name, "figma");
         assert_eq!(manifest.version.as_deref(), Some("2.0.20"));
-        assert_eq!(manifest.skills.as_deref(), Some("./skills/"));
     }
 
     #[test]
@@ -275,7 +266,6 @@ mod tests {
 
         assert_eq!(manifest.name, "bare");
         assert!(manifest.interface.is_none());
-        assert!(manifest.skills.is_none());
         // Falls back to the identifier when there is no interface block.
         assert_eq!(manifest.display_name(), "bare");
         assert_eq!(manifest.summary(), None);

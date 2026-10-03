@@ -1,0 +1,8 @@
+{
+  "name": "deluxe-agents",
+  "version": "0.1.0",
+  "runtime": {
+    "module": "plugin.wasm",
+    "apiVersion": "deluxe.harness/plugin@0.1"
+  }
+}

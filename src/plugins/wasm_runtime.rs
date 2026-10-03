@@ -3,17 +3,15 @@
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use wasmtime::component::{Accessor, Component, HasData, Instance as ComponentInstance, Linker};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
+use wasmtime::{Config, Engine, Store, Trap};
 
 use crate::error::{code, AgentError, Result};
 
 use super::capabilities::CapabilityHub;
-use super::ui_protocol::MAX_PAYLOAD_BYTES;
 use super::wasm_manifest::WasmManifest;
 
 mod bindings {
@@ -25,23 +23,37 @@ mod bindings {
     });
 }
 
+// A second, optional view of the same Component: only the transcript renderer
+// exports `renderer`, so a binding that fails here means "this Component does
+// not render". Keeping it separate from the harness binding leaves every other
+// plugin untouched.
+mod renderer_bindings {
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "renderer-plugin",
+        imports: { default: async },
+        exports: { default: async },
+    });
+}
+
+// A third optional view: only a prompt provider exports `prompt`, so a binding
+// that fails here means "this Component contributes no prompt text".
+mod prompt_bindings {
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "prompt-plugin",
+        imports: { default: async },
+        exports: { default: async },
+    });
+}
+
 const CALL_FUEL: u64 = 10_000_000;
-pub const CALL_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_COMPONENT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Compiles a component file without instantiating it or granting capabilities.
 ///
-/// Returns `Err` when the file exceeds the component size limit, cannot be
-/// read, or is not a valid Wasmtime Component. Call from a blocking worker.
+/// Returns `Err` when the file cannot be read or is not a valid Wasmtime
+/// Component. Call from a blocking worker.
 pub fn validate_component_file(path: &Path) -> Result<()> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|error| AgentError::from_io("Read Wasmtime component metadata", error))?;
-    if metadata.len() > MAX_COMPONENT_BYTES {
-        return Err(AgentError::new(
-            code::PLUGIN_RESOURCE_LIMIT,
-            "Component exceeds its byte limit",
-        ));
-    }
     let bytes = std::fs::read(path)
         .map_err(|error| AgentError::from_io("Read Wasmtime component", error))?;
     compile_component(&bytes).map(|_| ())
@@ -54,12 +66,6 @@ pub fn validate_component_bytes(bytes: &[u8]) -> Result<()> {
 }
 
 fn compile_component(bytes: &[u8]) -> Result<(Engine, Component)> {
-    if bytes.len() as u64 > MAX_COMPONENT_BYTES {
-        return Err(AgentError::new(
-            code::PLUGIN_RESOURCE_LIMIT,
-            "Component exceeds its byte limit",
-        ));
-    }
     let mut config = Config::new();
     config
         .wasm_component_model(true)
@@ -73,7 +79,6 @@ fn compile_component(bytes: &[u8]) -> Result<(Engine, Component)> {
 }
 
 struct StoreState {
-    limits: StoreLimits,
     capabilities: CapabilityHub,
     cancel: CancellationToken,
 }
@@ -126,6 +131,37 @@ impl bindings::deluxe::harness::host::HostWithStore for HostState {
         }
     }
 
+    fn list_plugin_files<T>(
+        accessor: &Accessor<T, Self>,
+        path: String,
+    ) -> impl Future<Output = std::result::Result<Vec<String>, String>> + Send {
+        let (capabilities, cancel) = accessor.with(|mut access| {
+            let state: &mut StoreState = access.get();
+            (state.capabilities.clone(), state.cancel.clone())
+        });
+        async move {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err("capability call cancelled".into()),
+                result = capabilities.list_plugin_files(&path) => {
+                    result.map_err(|error| format!("{}: {}", error.code, error.message))
+                }
+            }
+        }
+    }
+
+    fn configuration_root<T>(accessor: &Accessor<T, Self>) -> impl Future<Output = String> + Send {
+        let root = accessor.with(|mut access| {
+            let state: &mut StoreState = access.get();
+            state
+                .capabilities
+                .configuration_root
+                .to_string_lossy()
+                .into_owned()
+        });
+        std::future::ready(root)
+    }
+
     fn list_tools<T>(accessor: &Accessor<T, Self>) -> impl Future<Output = String> + Send {
         let capabilities = accessor.with(|mut access| {
             let state: &mut StoreState = access.get();
@@ -150,6 +186,22 @@ impl bindings::deluxe::harness::host::HostWithStore for HostState {
         async move {
             capabilities
                 .invoke(&name, &arguments_json, &cancel)
+                .await
+                .map_err(|error| format!("{}: {}", error.code, error.message))
+        }
+    }
+
+    fn run_agent<T>(
+        accessor: &Accessor<T, Self>,
+        request_json: String,
+    ) -> impl Future<Output = std::result::Result<String, String>> + Send {
+        let (capabilities, cancel) = accessor.with(|mut access| {
+            let state: &mut StoreState = access.get();
+            (state.capabilities.clone(), state.cancel.clone())
+        });
+        async move {
+            capabilities
+                .run_agent(&request_json, &cancel)
                 .await
                 .map_err(|error| format!("{}: {}", error.code, error.message))
         }
@@ -288,12 +340,26 @@ impl bindings::deluxe::harness::host::HostWithStore for HostState {
 
 pub enum Operation {
     ListTools,
-    Execute { name: String, arguments: String },
+    Execute {
+        name: String,
+        arguments: String,
+    },
     ListEventHandlers,
-    HandleEvent { id: String, event: String },
+    HandleEvent {
+        id: String,
+        event: String,
+    },
     Open(String),
     Action(String),
     Close(String),
+    /// Renders a message request JSON into display-list response JSON. Only a
+    /// Component that exports the renderer interface can serve it.
+    RenderMessage(String),
+    /// Renders a tool request JSON into display-list response JSON.
+    RenderTool(String),
+    /// Asks the Component for the prompt text it contributes for its bound
+    /// scope. Only a Component that exports the prompt interface can serve it.
+    PromptSections,
 }
 
 struct Request {
@@ -315,7 +381,7 @@ impl Drop for ComponentActor {
 impl ComponentActor {
     /// Compiles and starts an isolated component actor for one project.
     ///
-    /// Returns `Err` for escaped entries, oversized binaries, compilation or ABI errors.
+    /// Returns `Err` for escaped entries, compilation or ABI errors.
     /// No WASI imports or deserialized native code are accepted.
     pub async fn load(
         root: std::path::PathBuf,
@@ -336,12 +402,7 @@ impl ComponentActor {
         let (engine, component) = tokio::task::spawn_blocking(move || compile_component(&bytes))
             .await
             .map_err(|error| AgentError::internal(format!("Component loader failed: {error}")))??;
-        let mut instance = tokio::time::timeout(
-            CALL_TIMEOUT,
-            instantiate(&engine, &component, capabilities.clone()),
-        )
-        .await
-        .map_err(|_| timeout_error())??;
+        let mut instance = instantiate(&engine, &component, capabilities.clone()).await?;
         let (tx, mut rx) = mpsc::channel::<Request>(32);
         let lifetime = CancellationToken::new();
         let actor = Arc::new(Self {
@@ -359,20 +420,20 @@ impl ComponentActor {
                 }
                 let cancel = CancellationToken::new();
                 instance.0.data_mut().cancel = cancel.clone();
+                // Fuel is the only budget a call has: a runaway guest burns it
+                // and traps, and a caller that goes away closes the reply.
                 let result = tokio::select! {
                     biased;
                     _ = lifetime.cancelled() => Err(cancelled_error()),
                     _ = request.reply.closed() => Err(cancelled_error()),
-                    result = tokio::time::timeout(CALL_TIMEOUT, call(&mut instance, request.operation)) => {
-                        result.unwrap_or_else(|_| Err(timeout_error()))
-                    }
+                    result = call(&mut instance, request.operation) => result,
                 };
                 cancel.cancel();
                 // A guest that returns an error result is normal control flow and
-                // leaves the Store usable. Only a trap, a resource limit, a timed
-                // out call, or a cancelled one can leave it poisoned. Rebuilding
-                // on a guest error would silently discard the plugin's own memory
-                // state — for example the MCP provider's stopped servers.
+                // leaves the Store usable. Only a trap or a cancelled call can
+                // leave it poisoned. Rebuilding on a guest error would silently
+                // discard the plugin's own memory state — for example the MCP
+                // provider's stopped servers.
                 let recover = result
                     .as_ref()
                     .err()
@@ -383,13 +444,8 @@ impl ComponentActor {
                 }
                 if recover {
                     capabilities.shutdown().await;
-                    match tokio::time::timeout(
-                        CALL_TIMEOUT,
-                        instantiate(&engine, &component, capabilities.clone()),
-                    )
-                    .await
-                    {
-                        Ok(Ok(fresh)) => instance = fresh,
+                    match instantiate(&engine, &component, capabilities.clone()).await {
+                        Ok(fresh) => instance = fresh,
                         _ => break,
                     }
                 }
@@ -399,26 +455,33 @@ impl ComponentActor {
         Ok(actor)
     }
 
-    /// Enqueues a bounded call. Dropping this future cancels its actor request.
+    /// Enqueues a bounded call, waiting for room in the actor's queue. Dropping
+    /// this future cancels its actor request.
     ///
-    /// Returns `Err` for shutdown, queue saturation, timeout, trap, or invalid output.
+    /// The wait is bounded by the actor's lifetime, so a shutdown unblocks every
+    /// waiter. Returns `Err` for shutdown, trap, or invalid output.
     pub async fn call(&self, operation: Operation) -> Result<String> {
         let (reply, response) = oneshot::channel();
-        self.tx
-            .try_send(Request { operation, reply })
-            .map_err(|_| {
-                AgentError::new(
-                    code::PLUGIN_RESOURCE_LIMIT,
-                    "Component queue is unavailable or full",
-                )
-            })?;
+        // Wait for room instead of failing when the queue is full. The GUI
+        // dispatches one render request per transcript item in a single frame,
+        // so a non-blocking send would drop everything past the queue capacity
+        // and the render cache would mark those items as permanently failed.
+        tokio::select! {
+            biased;
+            _ = self.lifetime.cancelled() => return Err(cancelled_error()),
+            sent = self.tx.send(Request { operation, reply }) => {
+                sent.map_err(|_| {
+                    AgentError::new(
+                        code::PLUGIN_RESOURCE_LIMIT,
+                        "Component queue is unavailable",
+                    )
+                })?;
+            }
+        }
         tokio::select! {
             biased;
             _ = self.lifetime.cancelled() => Err(cancelled_error()),
-            result = tokio::time::timeout(CALL_TIMEOUT + Duration::from_secs(1), response) => {
-                result.map_err(|_| timeout_error())?
-                    .map_err(|_| cancelled_error())?
-            }
+            result = response => result.map_err(|_| cancelled_error())?,
         }
     }
 
@@ -431,6 +494,10 @@ impl ComponentActor {
 type Instance = (
     Store<StoreState>,
     bindings::HarnessPlugin,
+    // Present only when the Component exports the renderer interface.
+    Option<renderer_bindings::RendererPlugin>,
+    // Present only when the Component exports the prompt interface.
+    Option<prompt_bindings::PromptPlugin>,
     ComponentInstance,
 );
 
@@ -442,23 +509,15 @@ async fn instantiate(
     let mut linker = Linker::new(engine);
     bindings::HarnessPlugin::add_to_linker::<_, HostState>(&mut linker, |state| state)
         .map_err(load_error)?;
-    let limits = StoreLimitsBuilder::new()
-        .memory_size(32 * 1024 * 1024)
-        .table_elements(10_000)
-        .instances(32)
-        .memories(4)
-        .tables(4)
-        .trap_on_grow_failure(true)
-        .build();
+    // Fuel is the only resource limit a Component gets: no memory, table, or
+    // instance caps, and no wall-clock deadline.
     let mut store = Store::new(
         engine,
         StoreState {
-            limits,
             capabilities,
             cancel: CancellationToken::new(),
         },
     );
-    store.limiter(|state| &mut state.limits);
     store.set_fuel(CALL_FUEL).map_err(runtime_error)?;
     store
         .fuel_async_yield_interval(Some(50_000))
@@ -468,13 +527,20 @@ async fn instantiate(
         .await
         .map_err(load_error)?;
     let bindings = bindings::HarnessPlugin::new(&mut store, &instance).map_err(load_error)?;
-    let mut instance = (store, bindings, instance);
+    // A Component that also exports the renderer interface gets a second,
+    // optional binding. A failure here is not an error: it only means this
+    // Component is not a renderer.
+    let renderer = renderer_bindings::RendererPlugin::new(&mut store, &instance).ok();
+    // Same optional shape for the prompt provider: a failure only means this
+    // Component contributes no prompt text.
+    let prompt = prompt_bindings::PromptPlugin::new(&mut store, &instance).ok();
+    let mut instance = (store, bindings, renderer, prompt, instance);
     configure(&mut instance).await?;
     Ok(instance)
 }
 
 async fn configure(instance: &mut Instance) -> Result<()> {
-    let (store, bindings, component_instance) = instance;
+    let (store, bindings, _renderer, _prompt, component_instance) = instance;
     store.set_fuel(CALL_FUEL).map_err(runtime_error)?;
     let plugin = bindings.deluxe_harness_plugin();
     component_instance
@@ -487,9 +553,35 @@ async fn configure(instance: &mut Instance) -> Result<()> {
         .map_err(guest_error)
 }
 
-async fn call((store, bindings, instance): &mut Instance, operation: Operation) -> Result<String> {
+async fn call(
+    (store, bindings, renderer, prompt, instance): &mut Instance,
+    operation: Operation,
+) -> Result<String> {
+    if renderer.is_none()
+        && matches!(
+            operation,
+            Operation::RenderMessage(_) | Operation::RenderTool(_)
+        )
+    {
+        return Err(AgentError::new(
+            code::PLUGIN_LOAD_FAILED,
+            "Component does not implement the renderer ABI",
+        ));
+    }
+    if prompt.is_none() && matches!(operation, Operation::PromptSections) {
+        return Err(AgentError::new(
+            code::PLUGIN_LOAD_FAILED,
+            "Component does not implement the prompt ABI",
+        ));
+    }
     store.set_fuel(CALL_FUEL).map_err(runtime_error)?;
     let plugin = bindings.deluxe_harness_plugin();
+    let renderer = renderer
+        .as_ref()
+        .map(|bindings| bindings.deluxe_harness_renderer());
+    let prompt = prompt
+        .as_ref()
+        .map(|bindings| bindings.deluxe_harness_prompt());
     let output = instance
         .run_concurrent(&mut *store, async move |accessor| match operation {
             Operation::ListTools => plugin
@@ -512,17 +604,23 @@ async fn call((store, bindings, instance): &mut Instance, operation: Operation) 
                 .call_close_surface(accessor, surface)
                 .await
                 .map(|_| Ok::<String, String>(String::new())),
+            Operation::RenderMessage(request) => match renderer {
+                Some(renderer) => renderer.call_render_message(accessor, request).await,
+                None => Ok(Err("Component does not implement the renderer ABI".into())),
+            },
+            Operation::RenderTool(request) => match renderer {
+                Some(renderer) => renderer.call_render_tool(accessor, request).await,
+                None => Ok(Err("Component does not implement the renderer ABI".into())),
+            },
+            Operation::PromptSections => match prompt {
+                Some(prompt) => prompt.call_prompt_sections(accessor).await,
+                None => Ok(Err("Component does not implement the prompt ABI".into())),
+            },
         })
         .await
         .map_err(runtime_error)?
         .map_err(runtime_error)?
         .map_err(guest_error)?;
-    if output.len() > MAX_PAYLOAD_BYTES {
-        return Err(AgentError::new(
-            code::PLUGIN_INVALID_OUTPUT,
-            "Component response exceeds its payload limit",
-        ));
-    }
     Ok(output)
 }
 
@@ -536,29 +634,16 @@ fn load_error(error: wasmtime::Error) -> AgentError {
 
 fn runtime_error(error: wasmtime::Error) -> AgentError {
     tracing::warn!(%error, "component call failed");
-    let code = if matches!(error.downcast_ref::<Trap>(), Some(Trap::OutOfFuel))
-        || error.to_string().contains("memory")
-        || error.to_string().contains("table")
-    {
+    let code = if matches!(error.downcast_ref::<Trap>(), Some(Trap::OutOfFuel)) {
         code::PLUGIN_RESOURCE_LIMIT
     } else {
         code::PLUGIN_TRAP
     };
-    AgentError::new(
-        code,
-        "Component execution trapped or exceeded its resource budget",
-    )
+    AgentError::new(code, "Component execution trapped or ran out of fuel")
 }
 
 fn guest_error(message: String) -> AgentError {
     AgentError::new(code::PLUGIN_INVALID_OUTPUT, super::cap_chars(&message, 512))
-}
-
-fn timeout_error() -> AgentError {
-    AgentError::new(
-        code::PLUGIN_TIMEOUT,
-        "Component exceeded its host time limit",
-    )
 }
 
 fn cancelled_error() -> AgentError {

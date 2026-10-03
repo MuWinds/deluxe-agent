@@ -1,0 +1,19 @@
+[package]
+name = "deluxe-agents"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A Component that reads a scope's `agents/` directory through the host file
+# capability, parses each role itself, and contributes a `task` tool the model
+# calls to delegate. Executing that tool reaches the host's generic `run-agent`
+# capability, which owns the nested loop. Built as a core module for
+# `wasm32-unknown-unknown` and wrapped into a Component by
+# `plugin-src/componentize`.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wit-bindgen = { version = "0.46", default-features = true }

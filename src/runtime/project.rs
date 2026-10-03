@@ -16,19 +16,18 @@ use crate::context::ContextSettings;
 use crate::error::Result;
 use crate::harness::services::native_services;
 use crate::harness::{
-    AgentEventSink, AgentRole, JobRuntime, NativeJobRuntime, PromptAgent, PromptContext,
-    PromptSkill, SubagentContext,
+    AgentEventSink, JobRuntime, NativeJobRuntime, NestedAgentRuntime, PromptContext,
 };
 use crate::llm::LlmClient;
 use crate::plugins::capabilities::CapabilityHub;
 use crate::plugins::providers::WasmEventRuntime;
 use crate::plugins::wasm::tools;
-use crate::plugins::wasm_runtime::ComponentActor;
-use crate::plugins::PluginCatalogue;
-use crate::tools::task::Task;
+use crate::plugins::wasm_manifest::Permissions;
+use crate::plugins::wasm_runtime::{ComponentActor, Operation};
+use crate::plugins::{PluginCatalogue, HOME_DIR};
 use crate::tools::{JobRegistry, ToolRegistry, ToolSettings};
 
-use super::subagents::NativeSubagentRunner;
+use super::nested_agent::NativeNestedAgent;
 
 #[derive(Clone)]
 pub struct RuntimeModelSettings {
@@ -200,38 +199,17 @@ impl ProjectRuntimeFactory {
         )?;
 
         let host = self.host_capabilities(project, model.supports_images);
-        let mut registry = ToolRegistry::empty_with_jobs(host.jobs.clone());
+        // The built-ins are native: the agent dispatches `read_file`,
+        // `apply_patch` and the rest directly. They share the host job registry
+        // so the jobs the agent starts are the ones the UI and a Component's
+        // `invoke_tool` observe.
+        let mut registry =
+            ToolRegistry::with_builtins_sharing(host.jobs.clone(), model.supports_images);
 
         let plugins = catalogue.for_project(project);
         let capabilities = host.runtime.clone();
         let mut components = BTreeMap::new();
         let mut provider_actors = Vec::new();
-        let builtin_manifest = builtin_manifest(model.supports_images)?;
-        let builtin_hub = CapabilityHub::new(
-            project.to_path_buf(),
-            project.to_path_buf(),
-            builtin_manifest.permissions.clone(),
-            capabilities.clone(),
-        )?;
-        match ComponentActor::load_bytes(
-            include_bytes!("../../plugin-src/builtin-tools/plugin.wasm"),
-            builtin_hub,
-        )
-        .await
-        {
-            Ok(actor) => {
-                components.insert("__deluxe_builtin_tools".into(), actor.clone());
-                match tools(actor.clone()).await {
-                    Ok(tools) => {
-                        for tool in tools {
-                            registry.register(tool);
-                        }
-                    }
-                    Err(error) => tracing::warn!(%error, "bundled tool provider failed"),
-                }
-            }
-            Err(error) => tracing::warn!(%error, "bundled tool provider failed to load"),
-        }
         for plugin in &plugins {
             let Some(manifest) = plugin.manifest.wasm_runtime() else {
                 continue;
@@ -285,37 +263,35 @@ impl ProjectRuntimeFactory {
             }
         }
 
-        let roles: Vec<AgentRole> = plugins
-            .iter()
-            .flat_map(|plugin| plugin.agents.iter())
-            .map(|role| AgentRole {
-                name: role.name.clone(),
-                description: role.description.clone(),
-                instructions: role.instructions.clone(),
-                plugin: role.plugin.clone(),
-                path: role.path.clone(),
-            })
-            .collect();
+        let plugin_sections = load_prompt_sections(
+            &self.global_configuration_root,
+            project,
+            capabilities.clone(),
+        )
+        .await;
 
         let jobs: Arc<dyn JobRuntime> = Arc::new(NativeJobRuntime::new(registry.jobs().clone()));
-        if !roles.is_empty() {
-            let sub_registry = Arc::new(registry.clone());
-            let runner = Arc::new(NativeSubagentRunner::new(
-                client.clone(),
-                sub_registry,
-                self.settings.clone(),
-            ));
-            registry.register(Arc::new(Task::new(
-                roles.clone(),
-                runner,
-                jobs.clone(),
-                SubagentContext {
-                    project: project.to_path_buf(),
-                    context_settings: model.context,
-                },
-                self.sink.clone(),
-            )));
-        }
+        // The nested runner is handed the registry *as it stands before the
+        // delegating Component registers its tool*, which is what bounds
+        // delegation to a single level: a nested agent cannot delegate again.
+        let nested: Arc<dyn NestedAgentRuntime> = Arc::new(NativeNestedAgent::new(
+            client.clone(),
+            Arc::new(registry.clone()),
+            self.settings.clone(),
+            model.context,
+            project.to_path_buf(),
+            jobs.clone(),
+            self.sink.clone(),
+        ));
+        load_agents_component(
+            project,
+            &self.global_configuration_root,
+            capabilities.clone(),
+            nested,
+            &mut registry,
+            &mut components,
+        )
+        .await;
 
         let registry = Arc::new(registry);
         let mut native = native_services(
@@ -346,33 +322,7 @@ impl ProjectRuntimeFactory {
         })?;
         let prompt_context = PromptContext {
             tools: services.tools.descriptors(),
-            skills: plugins
-                .iter()
-                .flat_map(|plugin| plugin.skills.iter())
-                .map(|skill| PromptSkill {
-                    name: skill.name.clone(),
-                    description: skill.description.clone(),
-                    path: skill.path.clone(),
-                    plugin: skill.plugin.clone(),
-                })
-                .collect(),
-            agents: if services
-                .tools
-                .descriptors()
-                .iter()
-                .any(|tool| tool.name == "task")
-            {
-                roles
-                    .iter()
-                    .map(|role| PromptAgent {
-                        name: role.name.clone(),
-                        description: role.description.clone(),
-                        plugin: role.plugin.clone(),
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            },
+            plugin_sections,
             project_instructions,
         };
         let system_prompt = services.prompts.build_system_prompt(&prompt_context)?;
@@ -392,27 +342,111 @@ impl ProjectRuntimeFactory {
     }
 }
 
-fn builtin_manifest(supports_images: bool) -> Result<crate::plugins::wasm_manifest::WasmManifest> {
-    let mut invoke_tools = vec![
-        "read_file".to_string(),
-        "list_dir".to_string(),
-        "exec".to_string(),
-        "apply_patch".to_string(),
-        "job_output".to_string(),
-        "job_list".to_string(),
-        "job_kill".to_string(),
-    ];
-    if supports_images {
-        invoke_tools.push("read_image".to_string());
+/// The bundled Component that contributes prompt text for a scope.
+///
+/// Fixed: it is not a catalogue plugin, so it cannot be disabled and does not
+/// appear in the plugins window. The host only binds each
+/// instance to one scope root and appends whatever text comes back, so it never
+/// learns what the Component reads or how it words its section.
+const PROMPT_PROVIDER_COMPONENT: &[u8] = include_bytes!("../../plugin-src/skills/plugin.wasm");
+
+/// The bundled Component that contributes the delegating tool.
+///
+/// Fixed: it is not a catalogue plugin, so it cannot be disabled and does not
+/// appear in the plugins window. It owns the role files
+/// and the tool's shape; the host only binds it to one scope root, grants it the
+/// nested-agent capability, and registers whatever tool comes back.
+const AGENTS_COMPONENT: &[u8] = include_bytes!("../../plugin-src/agents/plugin.wasm");
+
+/// Loads the bundled agents Component and registers the tool it contributes.
+///
+/// A failure is logged and skipped: delegation is a convenience, and a broken
+/// Component must not make the rest of a project's agent unusable.
+async fn load_agents_component(
+    project: &Path,
+    scope_root: &Path,
+    capabilities: Arc<dyn crate::harness::ports::ToolRuntime>,
+    nested: Arc<dyn NestedAgentRuntime>,
+    registry: &mut ToolRegistry,
+    components: &mut BTreeMap<String, Arc<ComponentActor>>,
+) {
+    let hub = match CapabilityHub::new(
+        project.to_path_buf(),
+        scope_root.to_path_buf(),
+        Permissions::default(),
+        capabilities,
+    ) {
+        Ok(hub) => hub.with_nested_agent(nested),
+        Err(error) => {
+            tracing::warn!(%error, "bundled agents provider failed to start");
+            return;
+        }
+    };
+    match ComponentActor::load_bytes(AGENTS_COMPONENT, hub).await {
+        Ok(actor) => {
+            components.insert("__deluxe_agents".into(), actor.clone());
+            match tools(actor).await {
+                Ok(tools) => {
+                    for tool in tools {
+                        let name = tool.descriptor().name;
+                        if registry.get(&name).is_some() {
+                            tracing::warn!(tool = %name, "keeping the first tool registration");
+                        } else {
+                            registry.register(tool);
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "bundled agents provider failed"),
+            }
+        }
+        Err(error) => tracing::warn!(%error, "bundled agents provider failed to load"),
     }
-    serde_json::from_value(serde_json::json!({
-        "module": "builtin-tools.wasm",
-        "apiVersion": crate::plugins::wasm_manifest::API_VERSION,
-        "permissions": { "invokeTools": invoke_tools }
-    }))
-    .map_err(|error| {
-        crate::error::AgentError::internal(format!("Build bundled provider manifest: {error}"))
-    })
+}
+
+/// Collects the prompt text the global and project scopes contribute, through
+/// the bundled prompt Component.
+///
+/// The Component owns the layout, the parsing, and the wording; the host only
+/// binds each instance to one scope root and asks for the text. A scope that
+/// fails is logged and skipped, so a broken global directory cannot take a
+/// project's contribution down with it.
+async fn load_prompt_sections(
+    global_root: &Path,
+    project: &Path,
+    capabilities: Arc<dyn crate::harness::ports::ToolRuntime>,
+) -> Vec<String> {
+    let mut sections = Vec::new();
+    let scopes = [
+        (global_root.to_path_buf(), "global"),
+        (project.join(HOME_DIR), "project"),
+    ];
+    for (root, scope) in scopes {
+        match load_scope_prompt(&root, project, capabilities.clone()).await {
+            Ok(text) if !text.trim().is_empty() => sections.push(text),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, scope, "skipping a scope's prompt contribution"),
+        }
+    }
+    sections
+}
+
+/// Asks one prompt Component instance for its scope's text.
+///
+/// The instance is loaded per call and dropped afterwards: it holds no state
+/// between reads, so there is nothing to cache.
+async fn load_scope_prompt(
+    root: &Path,
+    project: &Path,
+    capabilities: Arc<dyn crate::harness::ports::ToolRuntime>,
+) -> Result<String> {
+    let hub = CapabilityHub::new(
+        project.to_path_buf(),
+        root.to_path_buf(),
+        Permissions::default(),
+        capabilities,
+    )?;
+    let actor = ComponentActor::load_bytes(PROMPT_PROVIDER_COMPONENT, hub).await?;
+    actor.call(Operation::PromptSections).await
 }
 
 #[cfg(test)]
@@ -456,6 +490,223 @@ mod tests {
         ComponentActor::load_bytes(package.component, hub)
             .await
             .expect("the bundled MCP Component loads")
+    }
+
+    #[tokio::test]
+    async fn the_bundled_prompt_provider_renders_its_scope() {
+        let root = tempfile::tempdir().expect("a temporary scope root is available");
+        std::fs::create_dir_all(root.path().join("skills/computer-use"))
+            .expect("the fixture is writable");
+        std::fs::write(
+            root.path().join("skills/computer-use/SKILL.md"),
+            "---\nname: computer-use\ndescription: Control Windows apps\n---\n\nBody.\n",
+        )
+        .expect("the fixture is writable");
+
+        let text = load_scope_prompt(
+            root.path(),
+            root.path(),
+            Arc::new(crate::harness::services::RegistryToolRuntime::new(
+                Arc::new(ToolRegistry::with_builtins()),
+                Arc::new(RwLock::new(ToolSettings::default())),
+            )),
+        )
+        .await
+        .expect("the bundled prompt Component renders a section");
+
+        // The guest joins the bound root with its own layout and normalises the
+        // separator, so the path it prints is absolute and forward-slashed.
+        let root_slash = root.path().to_string_lossy().replace('\\', "/");
+        let expected = format!(
+            "{}/skills/computer-use/SKILL.md",
+            root_slash.trim_end_matches('/')
+        );
+        assert!(text.contains("<skills>"), "{text}");
+        assert!(text.contains("`computer-use`"), "{text}");
+        assert!(text.contains("Control Windows apps"), "{text}");
+        assert!(
+            text.contains("do not act on a skill from its summary alone"),
+            "the catalog must warn that a summary is not the instructions: {text}"
+        );
+        assert!(
+            text.contains("`read_file`"),
+            "the catalog must name the tool that loads the body: {text}"
+        );
+        assert!(text.contains(&expected), "expected `{expected}` in {text}");
+    }
+
+    #[tokio::test]
+    async fn a_scope_without_skills_contributes_nothing() {
+        let root = tempfile::tempdir().expect("a temporary scope root is available");
+
+        let text = load_scope_prompt(
+            root.path(),
+            root.path(),
+            Arc::new(crate::harness::services::RegistryToolRuntime::new(
+                Arc::new(ToolRegistry::with_builtins()),
+                Arc::new(RwLock::new(ToolSettings::default())),
+            )),
+        )
+        .await
+        .expect("a missing skills directory is not a failure");
+
+        assert!(text.trim().is_empty(), "got {text:?}");
+    }
+
+    /// A nested-agent stand-in that records what the Component asked for.
+    #[derive(Default)]
+    struct RecordingAgent {
+        requests: Mutex<Vec<serde_json::Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::harness::NestedAgentRuntime for RecordingAgent {
+        async fn run(
+            &self,
+            request_json: &str,
+            _cancel: &tokio_util::sync::CancellationToken,
+        ) -> crate::error::Result<String> {
+            let request: serde_json::Value =
+                serde_json::from_str(request_json).expect("the request is JSON");
+            let background = request["background"].as_bool().unwrap_or(false);
+            self.requests.lock().unwrap().push(request);
+            Ok(if background {
+                r#"{"jobId":"subagent-9"}"#.to_string()
+            } else {
+                r#"{"answer":"done"}"#.to_string()
+            })
+        }
+    }
+
+    async fn load_agents(root: &Path, agent: Arc<RecordingAgent>) -> Arc<ComponentActor> {
+        let hub = CapabilityHub::new(
+            root.to_path_buf(),
+            root.to_path_buf(),
+            Default::default(),
+            Arc::new(crate::harness::services::RegistryToolRuntime::new(
+                Arc::new(ToolRegistry::with_builtins()),
+                Arc::new(RwLock::new(ToolSettings::default())),
+            )),
+        )
+        .expect("scope host")
+        .with_nested_agent(agent);
+        ComponentActor::load_bytes(AGENTS_COMPONENT, hub)
+            .await
+            .expect("the bundled agents Component loads")
+    }
+
+    #[tokio::test]
+    async fn the_bundled_agents_component_offers_a_task_tool_and_runs_it() {
+        let root = tempfile::tempdir().expect("a temporary scope root is available");
+        std::fs::create_dir_all(root.path().join("agents")).expect("the fixture is writable");
+        std::fs::write(
+            root.path().join("agents/figma-implementation-agent.md"),
+            "You are the Figma Implementation Agent.\n\nTranslate a node into code.\n",
+        )
+        .expect("the fixture is writable");
+
+        let agent = Arc::new(RecordingAgent::default());
+        let actor = load_agents(root.path(), agent.clone()).await;
+
+        let json = actor
+            .call(Operation::ListTools)
+            .await
+            .expect("the Component lists its tool");
+        let tools: Vec<serde_json::Value> =
+            serde_json::from_str(&json).expect("the tool list is JSON");
+        assert_eq!(tools.len(), 1, "one `task` tool: {json}");
+        assert_eq!(tools[0]["name"], "task");
+        let description = tools[0]["description"].as_str().unwrap_or_default();
+        assert!(
+            description.contains("`figma-implementation-agent`"),
+            "{description}"
+        );
+        assert!(
+            description.contains("You are the Figma Implementation Agent."),
+            "{description}"
+        );
+
+        let output = actor
+            .call(Operation::Execute {
+                name: "task".into(),
+                arguments: serde_json::json!({
+                    "agent": "figma-implementation-agent",
+                    "prompt": "do it",
+                })
+                .to_string(),
+            })
+            .await
+            .expect("the task tool runs");
+        let output: serde_json::Value = serde_json::from_str(&output).expect("output is JSON");
+        assert_eq!(output["isError"], false, "{output}");
+        assert_eq!(output["content"][0]["text"], "done", "{output}");
+
+        let requests = agent.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["name"], "figma-implementation-agent");
+        assert_eq!(requests[0]["prompt"], "do it");
+        assert_eq!(requests[0]["background"], false);
+        assert!(
+            requests[0]["instructions"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Figma Implementation Agent"),
+            "the role body is carried whole: {}",
+            requests[0]["instructions"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_background_delegation_returns_the_job_id() {
+        let root = tempfile::tempdir().expect("a temporary scope root is available");
+        std::fs::create_dir_all(root.path().join("agents")).expect("the fixture is writable");
+        std::fs::write(
+            root.path().join("agents/worker.md"),
+            "You are the worker.\n",
+        )
+        .expect("the fixture is writable");
+
+        let agent = Arc::new(RecordingAgent::default());
+        let actor = load_agents(root.path(), agent.clone()).await;
+
+        let output = actor
+            .call(Operation::Execute {
+                name: "task".into(),
+                arguments: serde_json::json!({
+                    "agent": "worker",
+                    "prompt": "do it",
+                    "runInBackground": true,
+                })
+                .to_string(),
+            })
+            .await
+            .expect("the task tool runs");
+        let output: serde_json::Value = serde_json::from_str(&output).expect("output is JSON");
+        assert_eq!(output["isError"], false, "{output}");
+        assert!(
+            output["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("started background job subagent-9"),
+            "{output}"
+        );
+        assert_eq!(agent.requests.lock().unwrap()[0]["background"], true);
+    }
+
+    #[tokio::test]
+    async fn a_scope_without_agents_offers_no_tool() {
+        let root = tempfile::tempdir().expect("a temporary scope root is available");
+        let agent = Arc::new(RecordingAgent::default());
+        let actor = load_agents(root.path(), agent).await;
+
+        assert_eq!(
+            actor
+                .call(Operation::ListTools)
+                .await
+                .expect("the Component lists its tools"),
+            "[]",
+            "a missing agents directory contributes no tool"
+        );
     }
 
     #[tokio::test]

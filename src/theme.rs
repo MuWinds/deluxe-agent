@@ -143,6 +143,15 @@ pub fn palette(choice: ThemeChoice) -> Palette {
     }
 }
 
+/// The green of a success indicator — a finished job, an applied patch.
+pub const OK_GREEN: Color32 = rgb(0x2e, 0xa0, 0x43);
+
+/// The amber of a warning — a job stopping, a denied command.
+pub const WARN_AMBER: Color32 = rgb(0xd9, 0x8a, 0x00);
+
+/// The red of a failure — a crashed job, a rejected command.
+pub const BAD_RED: Color32 = rgb(0xc0, 0x39, 0x2b);
+
 /// The window's type size, as a multiple of egui's own.
 ///
 /// Every font size in the window — both the explicit `.size(…)` call sites and

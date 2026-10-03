@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use crate::error::{code, AgentError, Result};
 
 pub const UI_SCHEMA_VERSION: u32 = 1; // 1 = declarative snapshot protocol.
-pub const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_NODES: usize = 512;
 const MAX_DEPTH: usize = 24;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
@@ -127,11 +126,8 @@ pub struct PluginUiAction {
     pub value: Option<UiValue>,
 }
 
-/// Decodes a bounded JSON document. Returns `Err` for malformed or oversized data.
+/// Decodes a JSON document. Returns `Err` for malformed data.
 pub fn decode_document(json: &str) -> Result<PluginUiDocument> {
-    if json.len() > MAX_PAYLOAD_BYTES {
-        return Err(invalid("UI response exceeds the payload limit"));
-    }
     serde_json::from_str(json).map_err(|error| invalid(format!("Invalid UI JSON: {error}")))
 }
 
@@ -158,7 +154,6 @@ pub fn validate_document(
     let mut ids = HashSet::new();
     let mut stack = vec![(&document.root, 1)];
     let mut count = 0;
-    let mut total_bytes = document.title.len();
     while let Some((node, depth)) = stack.pop() {
         count += 1;
         if count > MAX_NODES || depth > MAX_DEPTH {
@@ -240,10 +235,6 @@ pub fn validate_document(
         }
         for text in texts {
             check_text(text)?;
-            total_bytes += text.len();
-            if total_bytes > MAX_PAYLOAD_BYTES {
-                return Err(invalid("UI text exceeds the aggregate payload limit"));
-            }
         }
     }
     Ok(())

@@ -14,7 +14,6 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{code, AgentError, Result};
 use crate::harness::{PluginEvent, PluginEventRuntime};
 
-use super::ui_protocol::MAX_PAYLOAD_BYTES;
 use super::wasm_runtime::{ComponentActor, Operation};
 
 const MAX_PROVIDER_ITEMS: usize = 128;
@@ -133,12 +132,6 @@ impl PluginEventRuntime for WasmEventRuntime {
             "payload": event.payload,
         })
         .to_string();
-        if event_json.len() > MAX_PAYLOAD_BYTES {
-            return Err(AgentError::new(
-                code::PLUGIN_RESOURCE_LIMIT,
-                "Plugin event exceeds the provider payload limit",
-            ));
-        }
 
         let mut contributed = String::new();
         for handler in &self.handlers {
@@ -178,12 +171,6 @@ impl PluginEventRuntime for WasmEventRuntime {
             let handler_output: EventHandlerOutput = decode_json(&result, "event handler output")?;
             if !handler_output.matched {
                 continue;
-            }
-            if handler_output.output.len() > MAX_PAYLOAD_BYTES {
-                return Err(AgentError::new(
-                    code::PLUGIN_INVALID_OUTPUT,
-                    "Plugin event handler output exceeds the provider payload limit",
-                ));
             }
             contributed.push_str("\n\n");
             contributed.push_str(&format!(
@@ -228,12 +215,6 @@ fn decode_list<T: for<'de> Deserialize<'de>>(json: &str, kind: &str) -> Result<T
 }
 
 fn decode_json<T: for<'de> Deserialize<'de>>(json: &str, kind: &str) -> Result<T> {
-    if json.len() > MAX_PAYLOAD_BYTES {
-        return Err(AgentError::new(
-            code::PLUGIN_INVALID_OUTPUT,
-            format!("Provider {kind} exceeds the payload limit"),
-        ));
-    }
     serde_json::from_str(json)
         .map_err(|_| invalid_provider(format!("Provider {kind} is malformed")))
 }

@@ -8,9 +8,7 @@ use crate::error::{code, AgentError, Result};
 use crate::tools::{Tool, ToolDescriptor, ToolOutput, ToolSettings};
 
 use super::runtime::PluginUiExecutor;
-use super::ui_protocol::{
-    decode_document, PluginUiAction, PluginUiDocument, SurfaceRequest, MAX_PAYLOAD_BYTES,
-};
+use super::ui_protocol::{decode_document, PluginUiAction, PluginUiDocument, SurfaceRequest};
 use super::wasm_runtime::{ComponentActor, Operation};
 
 pub struct WasmUiExecutor {
@@ -59,11 +57,6 @@ impl Tool for WasmTool {
 
     async fn execute(&self, arguments: Value, _settings: &ToolSettings) -> Result<ToolOutput> {
         let arguments = arguments.to_string();
-        if arguments.len() > MAX_PAYLOAD_BYTES {
-            return Err(AgentError::invalid_params(
-                "Component tool arguments exceed the payload limit",
-            ));
-        }
         let json = self
             .actor
             .call(Operation::Execute {
@@ -118,16 +111,10 @@ pub async fn tools(actor: Arc<ComponentActor>) -> Result<Vec<Arc<dyn Tool>>> {
 
 /// Decodes a component tool result.
 ///
-/// Returns `Err` for malformed data or payloads over the component limit. The
-/// component protocol leaves output ownership to the user, so plugins may
-/// return images and patch hunk metadata for their own workflows.
+/// Returns `Err` for malformed data. The component protocol leaves output
+/// ownership to the user, so plugins may return images and patch hunk metadata
+/// for their own workflows.
 pub fn decode_tool_output(json: &str) -> Result<ToolOutput> {
-    if json.len() > MAX_PAYLOAD_BYTES {
-        return Err(AgentError::new(
-            code::PLUGIN_INVALID_OUTPUT,
-            "Tool output exceeds the payload limit",
-        ));
-    }
     let output: ToolOutput = serde_json::from_str(json).map_err(|_| {
         AgentError::new(code::PLUGIN_INVALID_OUTPUT, "Invalid component tool output")
     })?;
@@ -895,7 +882,7 @@ mod tests {
             .await
             .expect("the raw process capability writes provider framing");
         let raw_response = raw_process_hub
-            .process_read(raw_handle, MAX_PAYLOAD_BYTES as u32)
+            .process_read(raw_handle, 256 * 1024)
             .await
             .expect("the raw process capability reads provider bytes");
         assert!(
@@ -985,12 +972,5 @@ mod tests {
         let decoded = decode_tool_output(&output.to_string())
             .expect("a component can return an image reference");
         assert_eq!(decoded.images()[0].id, "host-owned");
-    }
-
-    #[test]
-    fn component_output_payloads_are_bounded() {
-        let error = decode_tool_output(&"x".repeat(MAX_PAYLOAD_BYTES + 1))
-            .expect_err("oversized guest output is denied");
-        assert_eq!(error.code, code::PLUGIN_INVALID_OUTPUT);
     }
 }

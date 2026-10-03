@@ -29,16 +29,19 @@ use harness::{
     NativeSecretStore, PluginManager, SecretStore, SessionStore,
 };
 use ipc::{Cmd, Event, JobView, LlmSettings, RunId};
+use plugins::capabilities::CapabilityHub;
 use plugins::runtime::{PluginUiEvent, PluginUiExecutor, SurfaceHandle};
 use plugins::ui_protocol::SurfaceRequest;
+use plugins::wasm_manifest::Permissions;
+use plugins::wasm_runtime::{ComponentActor, Operation};
 use plugins::PluginCatalogue;
+use renderer::protocol::RenderKind;
 use runtime::project::{ProjectRuntime, ProjectRuntimeFactory, RuntimeModelSettings};
 use tools::ToolSettings;
 
 mod agent;
 mod app;
 mod attachments;
-mod code_view;
 mod config;
 mod context;
 mod error;
@@ -48,9 +51,9 @@ mod icons;
 mod image_ops;
 mod ipc;
 mod llm;
-mod markdown;
 mod plugins;
 mod process;
+mod renderer;
 mod runtime;
 mod runtime_context;
 mod session;
@@ -230,6 +233,47 @@ struct Worker {
     plugin_manager: Arc<dyn PluginManager>,
 }
 
+/// The plugin id the bundled transcript renderer installs under.
+const RENDERER_PLUGIN_ID: &str = "transcript-renderer@deluxe-defaults";
+
+/// Loads the transcript renderer's plugin actor, if the plugin is enabled.
+///
+/// Returns `None` when the plugin is disabled or missing, or when its Component
+/// fails to load; the caller then reports the renderer as unavailable and the
+/// GUI draws plain text. The renderer imports no host capability, so the hub it
+/// is given is inert — it only exists because every plugin actor has one.
+async fn load_renderer(
+    catalogue: &PluginCatalogue,
+    factory: &ProjectRuntimeFactory,
+    home: &Path,
+) -> Option<Arc<ComponentActor>> {
+    let plugin = catalogue
+        .global()
+        .iter()
+        .find(|plugin| plugin.id == RENDERER_PLUGIN_ID)?;
+    let manifest = plugin.manifest.wasm_runtime()?;
+    let root = plugins::global_configuration_root(home);
+    let hub = match CapabilityHub::new(
+        root.clone(),
+        root.clone(),
+        Permissions::default(),
+        factory.host_capabilities(&root, false).runtime,
+    ) {
+        Ok(hub) => hub,
+        Err(error) => {
+            tracing::warn!(%error, "transcript renderer capabilities could not be built");
+            return None;
+        }
+    };
+    match ComponentActor::load(plugin.root.clone(), manifest, hub).await {
+        Ok(actor) => Some(actor),
+        Err(error) => {
+            tracing::warn!(%error, "transcript renderer failed to load");
+            None
+        }
+    }
+}
+
 fn spawn_worker(
     handle: &tokio::runtime::Handle,
     mut worker: Worker,
@@ -267,6 +311,14 @@ fn spawn_worker(
             // marketplace) and nothing a plugin has no business reading.
             plugins::global_configuration_root(&worker.home),
         );
+        // The transcript renderer is an ordinary built-in plugin, loaded once
+        // for the worker's life through the plugin platform. When it is
+        // disabled, missing, or fails, the GUI is told and falls back to plain
+        // text.
+        let mut renderer = load_renderer(&worker.plugins, &factory, &worker.home).await;
+        sink.emit_ui(Event::RendererAvailability {
+            available: renderer.is_some(),
+        });
         // The model settings the GUI wants. Pushed before the first run and on
         // every settings save; `None` only until then.
         let mut llm_settings: Option<LlmSettings> = None;
@@ -487,6 +539,16 @@ fn spawn_worker(
                             surfaces.clear();
                             invalidate_runtimes(&factory, &mut runtimes, &active).await;
                             worker.plugins = plugins.clone();
+                            // The renderer is a plugin too: a reload may have
+                            // disabled or re-enabled it. Reload the actor and
+                            // tell the GUI only when its availability changed.
+                            let was_available = renderer.is_some();
+                            renderer = load_renderer(&worker.plugins, &factory, &worker.home).await;
+                            if renderer.is_some() != was_available {
+                                sink.emit_ui(Event::RendererAvailability {
+                                    available: renderer.is_some(),
+                                });
+                            }
                             sink.emit_ui(Event::PluginsUpdated {
                                 request_id,
                                 catalogue: plugins,
@@ -568,6 +630,16 @@ fn spawn_worker(
                             surfaces.clear();
                             invalidate_runtimes(&factory, &mut runtimes, &active).await;
                             worker.plugins = plugins.clone();
+                            // The renderer is a plugin too: a reload may have
+                            // disabled or re-enabled it. Reload the actor and
+                            // tell the GUI only when its availability changed.
+                            let was_available = renderer.is_some();
+                            renderer = load_renderer(&worker.plugins, &factory, &worker.home).await;
+                            if renderer.is_some() != was_available {
+                                sink.emit_ui(Event::RendererAvailability {
+                                    available: renderer.is_some(),
+                                });
+                            }
                             sink.emit_ui(Event::PluginsUpdated {
                                 request_id,
                                 catalogue: plugins,
@@ -652,6 +724,87 @@ fn spawn_worker(
                     {
                         tracing::warn!(job = %job_id, %error, "failed to stop a background job");
                     }
+                }
+
+                // Render requests are pure computation: spawn each so a slow
+                // render cannot stall the command loop, and let the GUI discard
+                // a response whose revision it has already superseded.
+                Cmd::RenderMessage {
+                    key,
+                    revision,
+                    text,
+                    metrics,
+                } => {
+                    let Some(renderer) = renderer.clone() else {
+                        continue;
+                    };
+                    let sink = sink.clone();
+                    tokio::spawn(async move {
+                        let request = renderer::protocol::message_request(revision, &text, metrics);
+                        let result = renderer
+                            .call(Operation::RenderMessage(request))
+                            .await
+                            .and_then(|json| {
+                                renderer::protocol::decode(&json, revision, RenderKind::Message)
+                            });
+                        let event = match result {
+                            Ok(nodes) => Event::MessageRendered {
+                                key,
+                                revision,
+                                nodes: Arc::new(nodes),
+                            },
+                            Err(error) => Event::RenderFailed {
+                                key,
+                                revision,
+                                kind: RenderKind::Message,
+                                message: error.message,
+                            },
+                        };
+                        sink.emit_ui(event);
+                    });
+                }
+
+                Cmd::RenderTool {
+                    key,
+                    revision,
+                    request,
+                } => {
+                    let Some(renderer) = renderer.clone() else {
+                        continue;
+                    };
+                    let sink = sink.clone();
+                    tokio::spawn(async move {
+                        let result =
+                            match serde_json::to_string(&request) {
+                                Ok(json) => renderer
+                                    .call(Operation::RenderTool(json))
+                                    .await
+                                    .and_then(|json| {
+                                        renderer::protocol::decode(
+                                            &json,
+                                            revision,
+                                            RenderKind::Tool,
+                                        )
+                                    }),
+                                Err(error) => Err(crate::error::AgentError::internal(format!(
+                                    "renderer request could not be serialized: {error}"
+                                ))),
+                            };
+                        let event = match result {
+                            Ok(nodes) => Event::ToolRendered {
+                                key,
+                                revision,
+                                nodes: Arc::new(nodes),
+                            },
+                            Err(error) => Event::RenderFailed {
+                                key,
+                                revision,
+                                kind: RenderKind::Tool,
+                                message: error.message,
+                            },
+                        };
+                        sink.emit_ui(event);
+                    });
                 }
 
                 Cmd::Cancel { run_id } => {

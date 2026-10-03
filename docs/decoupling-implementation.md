@@ -18,8 +18,10 @@
 - 所有 I/O 继续运行在 tokio worker，不把业务操作放回 egui 主线程。
 
 本项目的插件格式唯一固定为 Wasmtime Component，不兼容旧的可执行插件格式。
-每个插件都必须声明 Wasmtime Component；Component 可以同时提供 skills、commands、agents、tool
-和声明式 UI。Hooks 与 MCP 的实现全部位于各自的 Wasmtime Component 中。Component
+每个插件都必须声明 Wasmtime Component；Component 可以同时提供 tools、prompt
+sections、声明式 UI，以及通过通用 `run-agent` 能力委托的嵌套 Agent（角色文件由
+Component 自己读取，委托工具由它通过 `list-tools` 提供）。Hooks 与 MCP 的实现全部
+位于各自的 Wasmtime Component 中。Component
 需要配置时，通过通用 `read-plugin-file` 请求宿主读取当前 global/project
 configuration root 下的 `.hooks.json` 或 `.mcp.json`；宿主不在 discovery 阶段
 读取或解析这些文件。project configuration root 是当前 project root；global
@@ -47,7 +49,7 @@ root 绑到 home 会把 `.ssh`、`.aws`、API key 等与插件无关的文件一
 - 管理 context compaction；
 - 读取 `JobRegistry` 通知；
 - 向 GUI 发送 `ipc::Event`；
-- 解释 `LoadedPlugin`、`Skill`、`AgentRole` 和 `Hook`。
+- 解释 `LoadedPlugin`、`AgentRole` 和 `Hook`。
 
 关键入口：
 
@@ -468,7 +470,7 @@ pub struct PromptContext {
     pub project: PathBuf,
     pub project_files: Vec<ProjectInstruction>,
     pub tools: Vec<ToolDescriptor>,
-    pub skills: Vec<SkillSummary>,
+    pub plugin_sections: Vec<String>,
     pub roles: Vec<RoleSummary>,
 }
 ```
@@ -478,7 +480,7 @@ pub struct PromptContext {
 ```text
 identity
 tools
-skills
+plugin prompt sections
 agents
 rules
 project context
@@ -584,7 +586,6 @@ Agent 不再保存：
 - `ToolRegistry`；
 - `Vec<Hook>`；
 - `LoadedPlugin`；
-- `Skill`；
 - `AgentRole`。
 
 这些都在 runtime factory 中解析成 service。
@@ -608,7 +609,7 @@ Agent 不负责：
 - 插件 discovery；
 - MCP handshake、JSON-RPC 和 transport framing；
 - `.hooks.json` matcher、command 解析和 command 执行；
-- skill 文件扫描；
+- 插件资源目录的扫描与解析；
 - JSON session save；
 - GUI channel；
 - Wasmtime Store。
@@ -877,8 +878,6 @@ Worker 不负责：
 - manifest；
 - root；
 - scope；
-- skills；
-- commands；
 - agents；
 - Wasm runtime module 和 permissions；
 - 由 Component 主动读取的 global/project configuration root 级 `.hooks.json` /
@@ -908,7 +907,6 @@ pub struct ProjectCapabilities {
     pub tools: Vec<Arc<dyn Tool>>,
     pub prompts: Vec<Arc<dyn PromptProvider>>,
     pub roles: Vec<AgentRole>,
-    pub commands: Vec<Command>,
     pub wasm_providers: Vec<PluginRuntimeDescriptor>,
 }
 ```
@@ -1124,7 +1122,6 @@ pub struct JsonSessionStore {
 当前 prompt 由 `Agent::new` 直接从：
 
 - `ToolRegistry`；
-- `Skill`；
 - `AgentRole`；
 - `Hook`；
 - project files；
@@ -1151,7 +1148,7 @@ pub trait PromptContributor: Send + Sync {
 ```text
 Identity
 Tools
-Skills
+PluginPromptSections
 Agents
 Rules
 ProjectInstructions
@@ -1175,7 +1172,7 @@ section id
 必须保持：
 
 - ToolRegistry 的 BTreeMap 顺序；
-- skills 的名称顺序；
+- plugin prompt section 的收集顺序；
 - agents 的名称顺序；
 - plugin id 顺序；
 - hook 不进入 prompt 的既有行为。
@@ -1459,7 +1456,7 @@ rg "plugins::discover|remove_dir_all|McpClient::connect|Wasmtime" src/app
 
 - `HOST_RULES` 不改；
 - `SUB_AGENT_RULES` 不改；
-- identity、tools、skills、agents、rules、project context 顺序不改；
+- identity、tools、plugin prompt sections、agents、rules、project context 顺序不改；
 - prompt 中的插件排序保持稳定；
 - provider cache prefix 不因 adapter 改写而变化。
 
@@ -1540,7 +1537,7 @@ UI 再决定如何展示。
 解耦阶段完成的判断标准：
 
 - [ ] `Agent` 不再直接依赖 `LlmClient`；
-- [ ] `Agent` 不再直接依赖 `LoadedPlugin`、`Skill`、`AgentRole` 和 `Hook`；
+- [ ] `Agent` 不再直接依赖 `LoadedPlugin`、`AgentRole` 和 `Hook`；
 - [ ] `Agent` 的工具执行通过 `ToolRuntime`；
 - [ ] `Task` 不再导入或构造 `Agent`；
 - [ ] `context::summarize` 不再接收具体 `LlmClient`；

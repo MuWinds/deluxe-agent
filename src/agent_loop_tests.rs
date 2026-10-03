@@ -362,8 +362,7 @@ fn agent_with_settings_and_events(
     let services = Arc::new(native);
     let prompt_context = PromptContext {
         tools: services.tools.descriptors(),
-        skills: Vec::new(),
-        agents: Vec::new(),
+        plugin_sections: Vec::new(),
         project_instructions: crate::runtime::prompt::read_project_instructions(directory),
     };
     let system_prompt = services

@@ -3,8 +3,23 @@ package deluxe:harness@0.1.0;
 interface host {
     read-plugin-file: async func(path: string) -> result<list<u8>, string>;
     write-plugin-file: async func(path: string, contents: list<u8>) -> result<_, string>;
+    // Lists the regular files below a relative directory under the bound
+    // configuration root, as `/`-separated paths relative to that root. A
+    // missing directory is reported as `plugin_file_not_found:`, so a caller
+    // can tell "nothing here yet" from a real failure.
+    list-plugin-files: async func(path: string) -> result<list<string>, string>;
+    // The absolute path this instance's file capability is bound to. A Component
+    // that has to name a file to the model in absolute terms asks here.
+    configuration-root: async func() -> string;
     list-tools: async func() -> string;
     invoke-tool: async func(name: string, arguments-json: string) -> result<string, string>;
+    // Runs one nested agent on the Component's behalf and returns a JSON
+    // object. The request carries the role's name and instructions, the
+    // prompt, and whether to run detached; the host owns the model loop, the
+    // tool set, and the event stream, so a Component can delegate work without
+    // holding a model client or a registry of its own. A foreground call
+    // answers `{"answer": "..."}`; a detached one answers `{"jobId": "..."}`.
+    run-agent: async func(request-json: string) -> result<string, string>;
     spawn-process: async func(
         command: string,
         arguments-json: string,
@@ -35,7 +50,51 @@ interface plugin {
     close-surface: async func(surface-id: string);
 }
 
+interface renderer {
+    render-message: async func(request-json: string) -> result<string, string>;
+    render-tool: async func(request-json: string) -> result<string, string>;
+}
+
+interface prompt {
+    // Returns prompt text the host appends verbatim to the system prompt for
+    // this instance's scope. The Component owns the wording and any markup; the
+    // host neither parses nor reorders it, so it never learns what the text
+    // means. An empty string contributes nothing.
+    prompt-sections: async func() -> result<string, string>;
+}
+
 world harness-plugin {
     import host;
     export plugin;
+}
+
+// The transcript renderer's own world. It exports `plugin` with inert
+// implementations so the plugin platform can load it, plus `renderer`, which
+// the host calls to shape a message or tool result into a display list. It
+// deliberately imports nothing: a renderer is pure computation and must not be
+// able to reach a host capability.
+world transcript-renderer {
+    export plugin;
+    export renderer;
+}
+
+// The platform's optional view of a Component: only a renderer exports this,
+// so a binding that fails here means "not a renderer".
+world renderer-plugin {
+    export renderer;
+}
+
+// The prompt provider's own world. Unlike a renderer it needs the host's file
+// capability, because reading its configuration root is its whole job; it still
+// exports `plugin` inertly so the plugin platform can load it.
+world prompt-provider {
+    import host;
+    export plugin;
+    export prompt;
+}
+
+// The platform's optional view of a Component: only a prompt provider exports
+// this, so a binding that fails here means "not a prompt provider".
+world prompt-plugin {
+    export prompt;
 }

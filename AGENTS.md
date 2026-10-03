@@ -50,7 +50,6 @@ cargo clippy --all-targets -- -D warnings
 | 各模块文件底部 | `#[cfg(test)] mod tests { use super::*; ... }` | 单元测试，可测私有函数 |
 | `src/agent_loop_tests.rs` | 由 `main.rs` 的 `#[cfg(test)] mod agent_loop_tests;` 挂载 | agent 循环端到端测试 |
 
-当前约 **406** 个 `#[test]` / `#[tokio::test]`。
 
 规则：
 
@@ -82,7 +81,8 @@ deluxe-agent/
 └── src/
     ├── main.rs            # 入口：tracing、config/session/plugin 预加载、tokio runtime、eframe
     ├── app/               # 桌面外壳：视图状态、事件折叠与 egui 绘制
-    │   ├── mod.rs         # 视图状态与状态机（Cmd 下行 / Event 上行），不画控件
+    │   ├── mod.rs         # 视图状态与状态机（Cmd 下行 / Event 上行）
+    │   ├── render_cache.rs# 渲染 IR 的内存缓存
     │   └── ui.rs          # 全部 egui 绘制：布局、调色板取用与自由函数
     ├── agent.rs           # agent 循环：system prompt 组装、工具分发、流式回合
     ├── agent_loop_tests.rs# 循环层的端到端测试
@@ -94,16 +94,17 @@ deluxe-agent/
     ├── error.rs           # AgentError + code 常量 + Result 别名
     ├── attachments.rs     # 图片附件存储（ImageRef）
     ├── image_ops.rs       # 图片缩放 / 重编码（png、zune-jpeg）
-    ├── markdown.rs        # Markdown 渲染
-    ├── code_view.rs       # 代码块与 diff 渲染
+    ├── renderer/          # 内置渲染器插件：display-list 协议 + 宿主通用渲染
+    │   ├── protocol.rs    # display-list IR、请求投影与 decode/validate（RENDER_* 错误码）
+    │   └── present.rs     # 通用 display-list → egui 渲染器
     ├── theme.rs           # 调色板与主题
     ├── fonts.rs  icons.rs
     ├── process.rs         # hide_console：Windows 下子进程不开控制台窗口
-    ├── tools/             # 工具层：read_file、list_dir、exec、apply_patch、job_*、read_image、task
+    ├── tools/             # 工具层：read_file、list_dir、exec、apply_patch、job_*、read_image
     │   ├── mod.rs         # Tool trait、ToolRegistry、ObjectSchema、参数校验
-    │   ├── fs.rs  shell.rs  patch.rs  jobs.rs  image.rs  task.rs  settings.rs
+    │   ├── fs.rs  shell.rs  patch.rs  jobs.rs  image.rs  settings.rs
     ├── mcp/               # MCP 客户端与传输（stdio / HTTP）
-    └── plugins/           # Codex 风格插件：manifest、skills、commands、agents、hooks
+    └── plugins/           # wasmtime 插件运行时
 ```
 
 线程模型（`main.rs` 顶部注释，全仓库依赖此约定）：
@@ -116,6 +117,45 @@ deluxe-agent/
 新增一个工具的三处落点：在 `src/tools/<name>.rs` 实现 `Tool`、在
 `ToolRegistry::with_builtins` 中 `register`、`ToolDescriptor` 会把它自动带进
 prompt 的 `<tools>` / `<rules>` 段落（不需要手抄一份工具清单）。
+
+Transcript renderer（内置默认插件）：
+
+- guest 在 `plugin-src/transcript-renderer/`（独立 crate，不进根 workspace）：
+  `src/lib.rs` 是 `wit-bindgen` 导出，`src/markdown.rs` / `src/code_view.rs` 是
+  Markdown 与工具面板的**全部**解析与排版（只产出通用 display-list），
+  `src/display.rs` 是 display-list 的 guest 镜像；
+- 它的 ABI 在共享的 `wit/deluxe-harness.wit` 里：`interface renderer`
+  （`render-message` / `render-tool`），以及两个 world —— `transcript-renderer`
+  （导出 `plugin` + `renderer`，不 import host）和 `renderer-plugin`
+  （只导出 `renderer`，供平台做可选绑定）；
+- 它以**普通内置插件**的形式发布：`builtin-plugins/transcript-renderer/`
+  （`plugin.json` + `plugin.wasm`），首次运行由 `ensure_bundled_defaults` 安装并
+  启用，在插件面板可见、可停用。`plugin.wasm` 是提交进仓库的构建产物（CI 不构建
+  Component）。改了 guest 源码要重新构建并提交它（并升 `plugin.json.version`，
+  否则缓存副本不会被刷新）：
+
+  ```bash
+  rustup target add wasm32-unknown-unknown
+  cargo build --manifest-path plugin-src/transcript-renderer/Cargo.toml \
+      --release --target wasm32-unknown-unknown
+  cargo run --manifest-path plugin-src/componentize/Cargo.toml -- \
+      plugin-src/transcript-renderer/target/wasm32-unknown-unknown/release/deluxe_transcript_renderer.wasm \
+      builtin-plugins/transcript-renderer/plugin.wasm \
+      wit
+  ```
+- 宿主通过插件平台调用它：`ComponentActor` 实例化时按 `renderer-plugin` world 做一次
+  **可选**绑定（失败即「不是渲染器」），`Operation::RenderMessage` / `RenderTool`
+  分派到 `render-message` / `render-tool`；worker 启动时从 `catalogue.global()` 找到
+  `transcript-renderer@deluxe-defaults` 并加载一个全局单例（渲染与项目无关）。插件
+  被停用/卸载/加载失败时发 `Event::RendererAvailability { available: false }`，
+  GUI 退回纯文本；
+- 宿主**不认识 Markdown 或工具语义**：`src/renderer/protocol.rs` 定义通用的
+  display-list（`Node` / `Run` / 语义 `ColorRole` / `FontRole`），
+  `src/renderer/present.rs` 是唯一把它画成 egui 的地方。宿主代码里不得再出现
+  markdown / code_view 的解析或排版痕迹；
+- renderer 不可用时**退回纯文本**：消息直接画原始正文，工具卡退化为
+  「工具名 + 原始输出」的最小折叠。`src/renderer/golden.rs` 的测试断言 guest
+  产出的 display-list 形状与内容。
 
 ---
 
@@ -137,6 +177,7 @@ prompt 的 `<tools>` / `<rules>` 段落（不需要手抄一份工具清单）�
   `#[serde(default, skip_serializing_if = ...)]`。
 - **异步**：工具实现 `#[async_trait::async_trait] impl Tool`；可取消的耗时路径传入
   `CancellationToken`。
+- **用户没有明确说明的情况下不要考虑历史兼容**
 - 注释与文档里的标识符用反引号包裹（rustdoc 风格）。
 
 ### 注释规范

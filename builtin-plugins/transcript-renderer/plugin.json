@@ -1,0 +1,12 @@
+{
+  "name": "transcript-renderer",
+  "version": "0.1.0",
+  "interface": {
+    "displayName": "Transcript renderer",
+    "shortDescription": "Shapes messages and tool results into the transcript display list"
+  },
+  "runtime": {
+    "module": "plugin.wasm",
+    "apiVersion": "deluxe.harness/plugin@0.1"
+  }
+}

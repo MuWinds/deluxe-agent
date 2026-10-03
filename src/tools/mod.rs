@@ -20,7 +20,6 @@ pub mod jobs;
 pub mod patch;
 pub mod settings;
 pub mod shell;
-pub mod task;
 
 pub use crate::harness::HunkLines;
 pub use jobs::JobRegistry;
@@ -138,8 +137,7 @@ impl ToolOutput {
     /// A successful result whose whole content is one block of text.
     ///
     /// The counterpart to [`ToolOutput::error`], for a tool that produces a
-    /// plain answer rather than a rendering — `task`, whose result is a
-    /// sub-agent's reply.
+    /// plain answer rather than a rendering.
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             content: vec![ContentBlock::text(text)],
@@ -247,20 +245,17 @@ pub trait Tool: Send + Sync {
 
 /// The tool catalogue.
 ///
-/// `Clone` is shallow and cheap — the entries are `Arc`s — and exists for one
-/// caller: `task`, which hands a sub-agent the registry *as it stood before
-/// `task` itself was registered*. That snapshot is what bounds delegation to a
-/// single level; see [`crate::tools::task`].
+/// `Clone` is shallow and cheap — the entries are `Arc`s — and snapshots the
+/// map. A nested agent is handed a clone taken before the delegating tool was
+/// registered, which is what bounds delegation to a single level.
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
     /// The background job runtime every tool in this registry shares.
     ///
-    /// Held here rather than in `main` so a tool that starts a job (`exec`,
-    /// `task`) and the tools that read one (`job_output`, `job_list`,
-    /// `job_kill`) are wired to the same registry without a separate handle to
-    /// thread through. The `task` tool's sub-registry is a clone, so a
-    /// delegated job is visible to its parent.
+    /// Held here rather than in `main` so a tool that starts a job (`exec`) and
+    /// the tools that read one (`job_output`, `job_list`, `job_kill`) are wired
+    /// to the same registry without a separate handle to thread through.
     jobs: Arc<JobRegistry>,
 }
 
@@ -279,19 +274,7 @@ impl ToolRegistry {
     /// The registry every agent starts from: `read_file`, `list_dir`, `exec`,
     /// `apply_patch` and the three `job_*` tools, sharing one job runtime.
     pub fn with_builtins() -> Self {
-        let job_registry = Arc::new(JobRegistry::new());
-        let mut registry = Self {
-            tools: BTreeMap::new(),
-            jobs: job_registry.clone(),
-        };
-        registry.register(Arc::new(fs::ReadFile));
-        registry.register(Arc::new(fs::ListDir));
-        registry.register(Arc::new(shell::Exec::new(job_registry.clone())));
-        registry.register(Arc::new(patch::ApplyPatch));
-        registry.register(Arc::new(jobs::JobOutput::new(job_registry.clone())));
-        registry.register(Arc::new(jobs::JobList::new(job_registry.clone())));
-        registry.register(Arc::new(jobs::JobKill::new(job_registry)));
-        registry
+        Self::with_builtins_sharing(Arc::new(JobRegistry::new()), false)
     }
 
     /// The built-ins plus `read_image`.
@@ -301,8 +284,27 @@ impl ToolRegistry {
     /// confusing provider error, so the capability decides whether the tool
     /// exists at all — the same gate the DeepSeek Harness applies.
     pub fn with_image_input() -> Self {
-        let mut registry = Self::with_builtins();
-        registry.register(Arc::new(image::ReadImage));
+        Self::with_builtins_sharing(Arc::new(JobRegistry::new()), true)
+    }
+
+    /// The built-ins sharing an existing background job runtime.
+    ///
+    /// `exec` and the `job_*` readers must agree on one job registry. A caller
+    /// that already owns one — the host capability runtime, whose Components
+    /// start jobs through `invoke_tool` — uses this so both sides observe the
+    /// same jobs. `supports_images` decides whether `read_image` is registered.
+    pub fn with_builtins_sharing(jobs: Arc<JobRegistry>, supports_images: bool) -> Self {
+        let mut registry = Self::empty_with_jobs(jobs.clone());
+        registry.register(Arc::new(fs::ReadFile));
+        registry.register(Arc::new(fs::ListDir));
+        registry.register(Arc::new(shell::Exec::new(jobs.clone())));
+        registry.register(Arc::new(patch::ApplyPatch));
+        registry.register(Arc::new(jobs::JobOutput::new(jobs.clone())));
+        registry.register(Arc::new(jobs::JobList::new(jobs.clone())));
+        registry.register(Arc::new(jobs::JobKill::new(jobs)));
+        if supports_images {
+            registry.register(Arc::new(image::ReadImage));
+        }
         registry
     }
 

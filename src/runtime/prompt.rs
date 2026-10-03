@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::harness::ports::PromptProvider;
-use crate::harness::{AgentRole, ProjectInstruction, PromptAgent, PromptContext, PromptSkill};
+use crate::harness::{ProjectInstruction, PromptContext};
 use crate::tools::ToolDescriptor;
 
 pub struct NativePromptProvider;
@@ -24,14 +24,6 @@ impl Default for NativePromptProvider {
 impl PromptProvider for NativePromptProvider {
     fn build_system_prompt(&self, context: &PromptContext) -> crate::error::Result<String> {
         Ok(build_system_prompt(context))
-    }
-
-    fn build_role_prompt(
-        &self,
-        role: &AgentRole,
-        tools: &[ToolDescriptor],
-    ) -> crate::error::Result<String> {
-        Ok(build_role_prompt(role, tools))
     }
 
     fn tool_schema(&self, tools: &[ToolDescriptor]) -> serde_json::Value {
@@ -92,15 +84,14 @@ pub fn build_system_prompt(context: &PromptContext) -> String {
         String::from("You are a useful coding agent running on the user's own machine.\n\n");
     prompt.push_str(&tool_section(&context.tools));
 
-    if !context.skills.is_empty() {
+    // Each plugin formats its own text; the host only separates the blocks so a
+    // section cannot run into the tool list or the rules.
+    for section in &context.plugin_sections {
+        if section.trim().is_empty() {
+            continue;
+        }
         prompt.push('\n');
-        prompt.push_str(&render_skills(&context.skills));
-        prompt.push('\n');
-    }
-
-    if !context.agents.is_empty() {
-        prompt.push('\n');
-        prompt.push_str(&render_agents(&context.agents));
+        prompt.push_str(section);
         prompt.push('\n');
     }
 
@@ -114,11 +105,14 @@ pub fn build_system_prompt(context: &PromptContext) -> String {
     prompt
 }
 
-/// Builds the fixed delegated-agent prompt from its role and tool descriptors.
-pub fn build_role_prompt(role: &AgentRole, tools: &[ToolDescriptor]) -> String {
+/// Builds the fixed delegated-agent prompt from its instructions and tools.
+///
+/// The instructions are a Component's own text, handed over through the host's
+/// `run-agent` capability; the host only frames them with the tool list and the
+/// sub-agent rules.
+pub fn build_role_prompt(instructions: &str, tools: &[ToolDescriptor]) -> String {
     format!(
-        "{}\n\n{}{}",
-        role.instructions,
+        "{instructions}\n\n{}{}",
         tool_section(tools),
         rule_section(tools, SUB_AGENT_RULES)
     )
@@ -145,52 +139,6 @@ fn rule_section(tools: &[ToolDescriptor], host_rules: &str) -> String {
     }
     rules.push_str(host_rules);
     rules
-}
-
-fn render_skills(skills: &[PromptSkill]) -> String {
-    let mut section = String::from(
-        "<skills>\n\
-         Reusable instructions contributed by installed plugins. The list carries only a \
-         summary: when one matches the task, read its SKILL.md in full before acting.\n",
-    );
-    for skill in skills {
-        section.push_str("- `");
-        section.push_str(&skill.name);
-        section.push_str("` (");
-        section.push_str(&skill.plugin);
-        section.push(')');
-        if let Some(description) = &skill.description {
-            section.push_str(": ");
-            section.push_str(description);
-        }
-        section.push_str("\n  SKILL.md: ");
-        section.push_str(&skill.path.display().to_string());
-        section.push('\n');
-    }
-    section.push_str("</skills>");
-    section
-}
-
-fn render_agents(agents: &[PromptAgent]) -> String {
-    let mut section = String::from(
-        "<agents>\n\
-         Sub-agents contributed by installed plugins. Delegate to one with the `task` tool \
-         when its role fits a job better than doing it yourself.\n",
-    );
-    for agent in agents {
-        section.push_str("- `");
-        section.push_str(&agent.name);
-        section.push_str("` (");
-        section.push_str(&agent.plugin);
-        section.push(')');
-        if let Some(description) = &agent.description {
-            section.push_str(": ");
-            section.push_str(description);
-        }
-        section.push('\n');
-    }
-    section.push_str("</agents>");
-    section
 }
 
 fn render_project_context(context: &[ProjectInstruction]) -> String {
@@ -221,7 +169,6 @@ mod tests {
 
     use crate::tools::{ObjectSchema, ToolRegistry};
     use serde_json::json;
-    use std::path::PathBuf;
 
     fn prompt_tools() -> Vec<ToolDescriptor> {
         ToolRegistry::with_builtins().descriptors()
@@ -230,8 +177,7 @@ mod tests {
     fn prompt_context() -> PromptContext {
         PromptContext {
             tools: prompt_tools(),
-            skills: Vec::new(),
-            agents: Vec::new(),
+            plugin_sections: Vec::new(),
             project_instructions: Vec::new(),
         }
     }
@@ -259,31 +205,25 @@ mod tests {
     #[test]
     fn plugin_sections_precede_rules_and_empty_sections_are_omitted() {
         let mut context = prompt_context();
-        context.skills.push(PromptSkill {
-            name: "computer-use".into(),
-            description: Some("Control Windows apps".into()),
-            path: PathBuf::from("/plugins/computer-use/SKILL.md"),
-            plugin: "computer-use@openai-bundled".into(),
-        });
-        context.agents.push(PromptAgent {
-            name: "figma-implementation-agent".into(),
-            description: Some("Write the code".into()),
-            plugin: "figma@openai-curated".into(),
-        });
+        context
+            .plugin_sections
+            .push("<contributed>\nA block a Component wrote.\n</contributed>".into());
 
         let prompt = build_system_prompt(&context);
-        assert!(prompt.contains("`computer-use`"));
-        assert!(prompt.contains("/plugins/computer-use/SKILL.md"));
-        assert!(prompt.contains("`figma-implementation-agent`"));
+        assert!(prompt.contains("<contributed>"));
+        assert!(prompt.contains("A block a Component wrote."));
         assert!(
-            prompt.find("<skills>").unwrap() < prompt.find("<agents>").unwrap()
-                && prompt.find("<agents>").unwrap() < prompt.find("<rules>").unwrap(),
-            "skill, agent, and rules sections keep their established order"
+            prompt.find("<contributed>").unwrap() < prompt.find("<rules>").unwrap(),
+            "contributed text keeps its established place before the rules"
         );
 
         let empty = build_system_prompt(&prompt_context());
-        assert!(!empty.contains("<skills>"), "{empty}");
-        assert!(!empty.contains("<agents>"), "{empty}");
+        assert!(!empty.contains("<contributed>"), "{empty}");
+
+        // A Component that contributes only whitespace must not leave a gap.
+        let mut blank = prompt_context();
+        blank.plugin_sections.push("  \n\t".into());
+        assert_eq!(build_system_prompt(&blank), empty);
     }
 
     #[test]
@@ -309,14 +249,7 @@ mod tests {
         let readme = prompt.find("path=\"README.md\"").unwrap();
         assert!(agents < claude && claude < readme);
 
-        let role = AgentRole {
-            name: "worker".into(),
-            description: None,
-            instructions: "Do the assigned work.".into(),
-            plugin: "test@local".into(),
-            path: PathBuf::from("/agents/worker.md"),
-        };
-        let role_prompt = build_role_prompt(&role, &context.tools);
+        let role_prompt = build_role_prompt("Do the assigned work.", &context.tools);
         assert!(role_prompt.starts_with("Do the assigned work.\n\n<tools>\n"));
         assert!(role_prompt.ends_with(SUB_AGENT_RULES));
         assert!(!role_prompt.contains(HOST_RULES));

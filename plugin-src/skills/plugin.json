@@ -1,5 +1,5 @@
 {
-  "name": "deluxe-builtin-tools",
+  "name": "deluxe-skills",
   "version": "0.1.0",
   "runtime": {
     "module": "plugin.wasm",

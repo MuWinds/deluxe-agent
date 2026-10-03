@@ -16,7 +16,7 @@
 3. `ui.rs` 通过 `use super::*` 直接访问和修改大量 `App` 内部状态。
 4. 绘制函数中仍然包含配置修改、持久化、主题更新、图片读取、IPC 命令触发等副作用。
 5. `Actions` 虽然已经是延迟执行机制，但目前仍然是 GUI 内部私有结构，不是稳定的 UI 意图协议。
-6. [src/plugins/manifest.rs](C:/Users/MuWinds/Documents/Coding%20Project/github/deluxe-agent/src/plugins/manifest.rs) 描述 Wasmtime 插件的 manifest、skills、commands、agents 和 UI 能力。
+6. [src/plugins/manifest.rs](C:/Users/MuWinds/Documents/Coding%20Project/github/deluxe-agent/src/plugins/manifest.rs) 描述 Wasmtime 插件的 manifest、agents 和 UI 能力。
 
 这些问题如果直接延伸到 Wasmtime，最容易出现的错误是让 Wasm 插件直接操作 `egui::Ui` 或 `egui::Painter`。这样会把 egui 的生命周期、线程模型、版本升级和宿主内部布局全部暴露给插件，最终形成另一种更严重的耦合。
 

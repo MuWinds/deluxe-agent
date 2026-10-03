@@ -19,7 +19,7 @@ use crate::tools::jobs::JobSnapshot;
 use crate::tools::{ToolDescriptor, ToolOutput};
 
 use super::events::AgentEvent;
-use super::types::{AgentRole, AuditOutcome, PromptContext};
+use super::types::{AuditOutcome, PromptContext};
 
 #[derive(Debug, Clone)]
 pub enum LlmStreamEvent {
@@ -106,9 +106,6 @@ pub trait PromptProvider: Send + Sync {
     /// Builds the stable root-agent system prompt from a snapshot.
     fn build_system_prompt(&self, context: &PromptContext) -> Result<String>;
 
-    /// Builds the system prompt for one delegated role.
-    fn build_role_prompt(&self, role: &AgentRole, tools: &[ToolDescriptor]) -> Result<String>;
-
     /// Converts descriptors into the provider-specific tool request schema.
     fn tool_schema(&self, tools: &[ToolDescriptor]) -> Value;
 }
@@ -134,23 +131,18 @@ pub trait PluginEventRuntime: Send + Sync {
     async fn dispatch(&self, event: &PluginEvent, cancel: &CancellationToken) -> Result<String>;
 }
 
-#[derive(Debug, Clone)]
-pub struct SubagentContext {
-    pub project: PathBuf,
-    pub context_settings: crate::context::ContextSettings,
-}
-
+/// Runs one nested agent loop on a Component's behalf.
+///
+/// The host owns the model client, the tool set, and the event stream, so a
+/// Component that delegates work only hands over instructions and a prompt.
 #[async_trait]
-pub trait SubagentRunner: Send + Sync {
-    /// Runs one plugin role and streams its runtime events to `sink`.
-    async fn run_role(
-        &self,
-        role: &AgentRole,
-        prompt: String,
-        context: SubagentContext,
-        sink: Arc<dyn AgentEventSink>,
-        cancel: CancellationToken,
-    ) -> Result<String>;
+pub trait NestedAgentRuntime: Send + Sync {
+    /// Runs one nested agent and returns its answer as a JSON object.
+    ///
+    /// `request_json` carries the role's name and instructions, the prompt, and
+    /// whether the run is detached. The reply is `{"answer": ...}` for a
+    /// foreground run and `{"jobId": ...}` for a detached one.
+    async fn run(&self, request_json: &str, cancel: &CancellationToken) -> Result<String>;
 }
 
 pub type JobFuture = Pin<Box<dyn Future<Output = Result<String>> + Send + 'static>>;

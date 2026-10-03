@@ -10,7 +10,6 @@ use crate::error::{code, AgentError, Result};
 use super::ui_protocol::{
     validate_action, validate_document, PluginUiAction, PluginUiDocument, SurfaceRequest,
 };
-use super::wasm_runtime::CALL_TIMEOUT;
 
 #[async_trait::async_trait]
 pub trait PluginUiExecutor: Send {
@@ -88,14 +87,12 @@ where
                 let open_result = tokio::select! {
                     biased;
                     _ = token.cancelled() => None,
-                    result = tokio::time::timeout(CALL_TIMEOUT, executor.open_surface(&request)) => {
-                        Some(result)
-                    },
+                    result = executor.open_surface(&request) => Some(result),
                 };
-                let Some(open_result) = open_result else {
+                let Some(document) = open_result else {
                     return Ok(());
                 };
-                let mut document = open_result.map_err(|_| timeout_error())??;
+                let mut document = document?;
                 opened = true;
                 validate_document(&document, &request, &actions, None)?;
                 emit(PluginUiEvent::Updated {
@@ -121,12 +118,8 @@ where
                     let updated = tokio::select! {
                         biased;
                         _ = token.cancelled() => break,
-                        result = tokio::time::timeout(
-                            CALL_TIMEOUT,
-                            executor.handle_action(&action),
-                        ) => result,
-                    }
-                    .map_err(|_| timeout_error())??;
+                        result = executor.handle_action(&action) => result,
+                    }?;
                     validate_document(&updated, &request, &actions, Some(document.revision))?;
                     document = updated;
                     emit(PluginUiEvent::Updated {
@@ -138,13 +131,7 @@ where
             }
             .await;
             if opened {
-                let close_result = tokio::time::timeout(
-                    CALL_TIMEOUT,
-                    executor.close_surface(&request),
-                )
-                .await
-                .map_err(|_| timeout_error())
-                .and_then(|result| result);
+                let close_result = executor.close_surface(&request).await;
                 if result.is_ok() {
                     result = close_result;
                 } else if let Err(error) = close_result {
@@ -165,13 +152,6 @@ where
         emit(PluginUiEvent::Closed { request });
     });
     SurfaceHandle { tx, cancel }
-}
-
-fn timeout_error() -> AgentError {
-    AgentError::new(
-        code::PLUGIN_TIMEOUT,
-        "Plugin UI call exceeded its host time limit",
-    )
 }
 
 #[cfg(test)]

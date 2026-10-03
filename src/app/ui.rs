@@ -14,7 +14,9 @@
 use super::*;
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use eframe::egui;
 use egui::text::LayoutJob;
@@ -26,16 +28,20 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::attachments::{self, ImageRef};
-use crate::code_view;
 use crate::config::InputModality;
 use crate::icons;
 use crate::image_ops;
 use crate::ipc::{AuditOutcome, JobState, JobView, RunState};
 use crate::llm::ThinkingLevel;
-use crate::markdown;
 use crate::plugins::{self};
+use crate::renderer::present;
+use crate::renderer::protocol::{
+    HunkLines, Node, RenderKey, RenderMetrics, ToolRenderRequest, ToolRenderResult,
+};
 use crate::session::{self, Session, Step, ToolResult};
 use crate::theme::{self, Palette, ThemeChoice};
+
+use super::render_cache;
 
 /// Width of the far-left icon rail.
 const RAIL_WIDTH: f32 = 52.0;
@@ -61,15 +67,6 @@ pub(super) const CHAT_MARGIN_X: f32 = 16.0;
 
 /// Height of the round buttons in the composer.
 const COMPOSER_BUTTON: f32 = 30.0;
-
-/// How tall the slash-command picker grows before it scrolls.
-///
-/// Roughly six rows: enough that a plugin's whole command list is usually
-/// visible at once, short enough that the picker cannot eat the transcript.
-const COMMAND_PICKER_MAX_HEIGHT: f32 = 186.0;
-
-/// One picker row's height.
-const COMMAND_ROW_HEIGHT: f32 = 26.0;
 
 /// Space between the gauge ring and its percentage.
 const GAUGE_RING_GAP: f32 = 7.0;
@@ -106,14 +103,6 @@ const STICK_THRESHOLD: f32 = 24.0;
 
 /// What a user-message attachment renders as in the transcript.
 const TRANSCRIPT_THUMB: (f32, f32) = (180.0, 130.0);
-
-/// Side of the square an attached image is shown at, in the composer strip and
-/// in the transcript.
-const OK_GREEN: Color32 = Color32::from_rgb(0x2e, 0xa0, 0x43);
-
-const WARN_AMBER: Color32 = Color32::from_rgb(0xd9, 0x8a, 0x00);
-
-const BAD_RED: Color32 = Color32::from_rgb(0xc0, 0x39, 0x2b);
 
 /// The most job rows the composer draws. Running jobs are always kept; settled
 /// ones fill the rest, newest first, so an old job cannot push out a live one.
@@ -395,7 +384,11 @@ impl App {
                         // A project list that could not be written is reported
                         // here, beside the projects it is about.
                         if let Some(error) = &sidebar_error {
-                            ui.label(RichText::new(error).size(theme::font(11.0)).color(BAD_RED));
+                            ui.label(
+                                RichText::new(error)
+                                    .size(theme::font(11.0))
+                                    .color(theme::BAD_RED),
+                            );
                         }
                         for project in &projects {
                             let name = project_name(project);
@@ -482,6 +475,143 @@ impl App {
     /// be toggled, and every other step through [`draw_step`]; the salt folds in
     /// the session id so a code block's scroll offset cannot leak between
     /// sessions.
+    /// Decides, for every visible step, whether the renderer's IR is ready and
+    /// queues a request for the ones whose input changed.
+    ///
+    /// Runs before the transcript borrows the session, so it can send commands
+    /// and touch the cache. A step whose render is pending or failed is simply
+    /// left out of the result and drawn with the fallback.
+    fn collect_rendered(
+        &mut self,
+        session_id: Uuid,
+        index: usize,
+        metrics: RenderMetrics,
+    ) -> Rendered {
+        let mut rendered = Rendered::default();
+        if !self.renderer_available {
+            return rendered;
+        }
+        // The layout width is part of the input: the renderer picks a table's
+        // form from it, so a resize has to invalidate the cached list. Bucketed
+        // to 16 px so a drag does not re-render on every pixel.
+        let bucket = (metrics.available_width / 16.0).round() as u32;
+        let mut requests = Vec::new();
+        {
+            let steps = &self.sessions[index].steps;
+            for (step_index, step) in steps.iter().enumerate() {
+                match step {
+                    Step::Assistant { text }
+                    | Step::Notice { text }
+                    | Step::HostMessage { text } => {
+                        let key = RenderKey::Message {
+                            session: session_id,
+                            step: step_index,
+                        };
+                        let fp = render_cache::fingerprint((text, bucket));
+                        match self.render_cache.rendered(&key, fp) {
+                            Some(nodes) => {
+                                rendered.message.insert((session_id, step_index), nodes);
+                            }
+                            None if !self.render_cache.was_requested(&key, fp) => {
+                                requests.push(PendingRender::Message {
+                                    key,
+                                    fp,
+                                    text: text.clone(),
+                                    metrics,
+                                });
+                            }
+                            None => {}
+                        }
+                    }
+                    Step::Tool {
+                        call_id,
+                        name,
+                        arguments,
+                        result,
+                        ..
+                    } => {
+                        let key = RenderKey::Tool {
+                            session: session_id,
+                            call_id: call_id.clone(),
+                        };
+                        let fp = render_cache::fingerprint((
+                            tool_fingerprint(name, arguments, result.as_ref()),
+                            bucket,
+                        ));
+                        match self.render_cache.rendered(&key, fp) {
+                            Some(nodes) => {
+                                rendered.tool.insert((session_id, call_id.clone()), nodes);
+                            }
+                            None if !self.render_cache.was_requested(&key, fp) => {
+                                requests.push(PendingRender::Tool {
+                                    key,
+                                    fp,
+                                    name: name.clone(),
+                                    arguments: arguments.clone(),
+                                    result: result.clone(),
+                                    metrics,
+                                });
+                            }
+                            None => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for request in requests {
+            self.dispatch_render(request);
+        }
+        rendered
+    }
+
+    /// Sends one render request at the next revision for its key.
+    fn dispatch_render(&mut self, request: PendingRender) {
+        match request {
+            PendingRender::Message {
+                key,
+                fp,
+                text,
+                metrics,
+            } => {
+                let revision = self.next_revision(&key);
+                self.render_cache.begin(&key, revision, fp);
+                let _ = self.cmd_tx.send(Cmd::RenderMessage {
+                    key,
+                    revision,
+                    text,
+                    metrics,
+                });
+            }
+            PendingRender::Tool {
+                key,
+                fp,
+                name,
+                arguments,
+                result,
+                metrics,
+            } => {
+                let revision = self.next_revision(&key);
+                self.render_cache.begin(&key, revision, fp);
+                let request =
+                    ToolRenderRequest::new(revision, name, arguments, tool_result(result), metrics);
+                let _ = self.cmd_tx.send(Cmd::RenderTool {
+                    key,
+                    revision,
+                    request,
+                });
+            }
+        }
+    }
+
+    fn next_revision(&self, key: &RenderKey) -> u64 {
+        self.render_cache
+            .get(key)
+            .map(|entry| entry.latest_revision)
+            .unwrap_or(0)
+            + 1
+    }
+
     pub(super) fn draw_transcript(
         &mut self,
         ui: &mut egui::Ui,
@@ -511,11 +641,17 @@ impl App {
         // reasoning block writes back into `expanded_reasoning` while the steps
         // are still being read, and going through `self` for both would make that
         // a conflict.
-        // Salt for the Markdown renderer's scroll areas. The session id is in
-        // it because a step index is only unique within one session, and a
-        // code block that inherited another session's scroll offset would open
-        // scrolled to a line that is not in it.
+        // Salt for the renderer's scroll areas. The session id is in it because a
+        // step index is only unique within one session, and a code block that
+        // inherited another session's scroll offset would open scrolled to a
+        // line that is not in it.
         let session_id = self.sessions[index].id;
+        // The renderer has no fonts, so it is told the column width and the
+        // advance of one character; it decides a table's form from them.
+        let metrics = render_metrics(ui, ui.available_width() - 2.0 * CHAT_MARGIN_X);
+        // Decide renderer-vs-fallback and queue requests before the session is
+        // borrowed immutably below.
+        let rendered = self.collect_rendered(session_id, index, metrics);
         let steps = &self.sessions[index].steps;
         let expanded_reasoning = &mut self.expanded_reasoning;
         // Same story as `expanded_reasoning`: a thumbnail decode on miss writes
@@ -550,7 +686,7 @@ impl App {
                                     }
                                 }
                             }
-                            _ => draw_step(ui, p, step, salt, max_width, thumbs),
+                            _ => draw_step(ui, p, step, salt, max_width, thumbs, &rendered),
                         }
                     }
                 });
@@ -564,7 +700,7 @@ impl App {
             >= output.content_size.y - STICK_THRESHOLD;
     }
 
-    /// The composer: the command picker, the input row and the queued images.
+    /// The composer: the input row and the queued images.
     fn draw_composer(&mut self, ui: &mut egui::Ui, p: &Palette, intents: &mut Vec<UiIntent>) {
         // Whether the *open* session is running, not whether anything is: the
         // composer is bound to that session, so another run in flight must leave
@@ -592,82 +728,6 @@ impl App {
                         .show(ui, |ui| {
                             ui.set_width(width);
 
-                            // Everything the picker needs, in a block so the
-                            // borrow of the catalogue ends before the input row
-                            // below takes `self` mutably. A `Vec<&Command>` holds
-                            // its borrow until it is dropped, so merely letting it
-                            // fall out of scope later would not be soon enough.
-                            let (clicked_name, highlighted_name, picker_open) = {
-                                let query = command_query(&self.prompt).map(str::to_string);
-
-                                // The picker's own keys, consumed before the
-                                // editor sees them — otherwise Up and Down would
-                                // move the caret as well as the highlight.
-                                if query.is_some() {
-                                    let (up, down, escape) = ui.input_mut(|input| {
-                                        (
-                                            input.consume_key(
-                                                egui::Modifiers::NONE,
-                                                egui::Key::ArrowUp,
-                                            ),
-                                            input.consume_key(
-                                                egui::Modifiers::NONE,
-                                                egui::Key::ArrowDown,
-                                            ),
-                                            input.consume_key(
-                                                egui::Modifiers::NONE,
-                                                egui::Key::Escape,
-                                            ),
-                                        )
-                                    });
-                                    if up {
-                                        self.command_highlight =
-                                            self.command_highlight.saturating_sub(1);
-                                    }
-                                    if down {
-                                        self.command_highlight += 1;
-                                    }
-                                    if escape {
-                                        self.command_picker_dismissed = query.clone();
-                                    }
-                                }
-
-                                let project = self.sending_project();
-                                let candidates = match query.as_deref() {
-                                    Some(query)
-                                        if self.command_picker_dismissed.as_deref()
-                                            != Some(query) =>
-                                    {
-                                        matching_commands(&self.catalogue, &project, query)
-                                    }
-                                    _ => Vec::new(),
-                                };
-
-                                if candidates.is_empty() {
-                                    (None, None, false)
-                                } else {
-                                    let clicked = draw_command_picker(
-                                        ui,
-                                        p,
-                                        &candidates,
-                                        &mut self.command_highlight,
-                                    );
-                                    ui.add_space(6.0);
-                                    let clicked_name = clicked
-                                        .and_then(|index| candidates.get(index))
-                                        .map(|command| command.name.clone());
-                                    // The highlight is what Enter takes; the click
-                                    // is taken now, below.
-                                    let highlighted_name = candidates
-                                        .get(self.command_highlight)
-                                        .map(|command| command.name.clone());
-                                    (clicked_name, highlighted_name, true)
-                                }
-                            };
-                            if let Some(name) = &clicked_name {
-                                apply_command_choice(&mut self.prompt, name);
-                            }
-
                             ui.horizontal(|ui| {
                                 let editor_width = (ui.available_width()
                                     - CONTEXT_GAUGE_RESERVE
@@ -683,19 +743,12 @@ impl App {
                                         .hint_text("随心输入")
                                         .margin(Margin::symmetric(2, 6)),
                                 );
-                                // Enter completes the highlighted command while
-                                // the picker is open, and sends otherwise — the
-                                // two cannot both fire, or a keystroke meant to
-                                // finish a name would also launch the run.
-                                // Shift+Enter still breaks the line either way.
+                                // Enter sends while the editor has focus.
+                                // Shift+Enter still breaks the line.
                                 let enter = ui.input(|input| {
                                     input.key_pressed(egui::Key::Enter) && !input.modifiers.shift
                                 });
-                                if enter && picker_open {
-                                    if let Some(name) = &highlighted_name {
-                                        apply_command_choice(&mut self.prompt, name);
-                                    }
-                                } else if editor.has_focus() && enter {
+                                if editor.has_focus() && enter {
                                     intents.push(UiIntent::SendPrompt);
                                 }
 
@@ -877,7 +930,7 @@ impl App {
                             ui.label(
                                 RichText::new(state.label())
                                     .size(theme::font(11.0))
-                                    .color(OK_GREEN),
+                                    .color(theme::OK_GREEN),
                             );
                             if ui.button("停止").clicked() {
                                 stop = true;
@@ -917,7 +970,15 @@ impl App {
                                         }
                                     }
                                 }
-                                _ => draw_step(ui, p, step, step_salt, max_width, thumbs),
+                                _ => draw_step(
+                                    ui,
+                                    p,
+                                    step,
+                                    step_salt,
+                                    max_width,
+                                    thumbs,
+                                    &Rendered::default(),
+                                ),
                             }
                         }
                     });
@@ -1013,11 +1074,11 @@ impl App {
         let colour = if limit == 0 {
             p.text_muted
         } else if ratio >= compaction {
-            BAD_RED
+            theme::BAD_RED
         } else if ratio >= warning {
-            WARN_AMBER
+            theme::WARN_AMBER
         } else {
-            OK_GREEN
+            theme::OK_GREEN
         };
 
         let mut summary = match (measured, limit > 0) {
@@ -1318,7 +1379,7 @@ impl App {
                 // not in some shared corner of the window.
                 if let Some(error) = &self.settings_error {
                     ui.add_space(6.0);
-                    ui.label(RichText::new(error).color(BAD_RED));
+                    ui.label(RichText::new(error).color(theme::BAD_RED));
                 }
             });
 
@@ -1464,7 +1525,7 @@ impl App {
                 // performed it.
                 if let Some(error) = &self.plugins_error {
                     ui.add_space(6.0);
-                    ui.label(RichText::new(error).color(BAD_RED));
+                    ui.label(RichText::new(error).color(theme::BAD_RED));
                 }
                 ui.add_space(6.0);
 
@@ -1618,7 +1679,7 @@ fn draw_plugin_row(
                 .is_some_and(|(id, scope)| id == &plugin.id && scope == &plugin.scope);
             if is_pending {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("确认卸载？").color(BAD_RED));
+                    ui.label(RichText::new("确认卸载？").color(theme::BAD_RED));
                     if ui.button("确认").clicked() {
                         intents.push(UiIntent::UninstallPlugin {
                             id: plugin.id.clone(),
@@ -1635,31 +1696,16 @@ fn draw_plugin_row(
         });
 }
 
-/// What one plugin brought, listed by name.
+/// What one plugin declared, listed by capability.
 ///
-/// Names rather than just counts: the question this window answers is "did the
-/// thing I enabled actually load?", and `技能 2` cannot answer it — the two
-/// skills might be the wrong two. A plugin that brings nothing still says so,
-/// so an empty body is never mistaken for a failed load.
+/// A plugin that declares nothing still says so, so an empty body is never
+/// mistaken for a failed load.
 fn draw_plugin_contents(ui: &mut egui::Ui, plugin: &plugins::LoadedPlugin) {
     let Some(runtime) = plugin.manifest.wasm_runtime() else {
         ui.weak("插件没有有效的 Wasmtime runtime");
         return;
     };
-    let mut sections: Vec<(&str, Vec<&str>)> = vec![
-        (
-            "技能",
-            plugin.skills.iter().map(|s| s.name.as_str()).collect(),
-        ),
-        (
-            "命令",
-            plugin.commands.iter().map(|c| c.name.as_str()).collect(),
-        ),
-        (
-            "子代理",
-            plugin.agents.iter().map(|a| a.name.as_str()).collect(),
-        ),
-    ];
+    let mut sections: Vec<(&str, Vec<&str>)> = Vec::new();
     let mut any = false;
     ui.horizontal_wrapped(|ui| {
         ui.weak("运行时：");
@@ -1778,11 +1824,11 @@ fn job_button(ui: &mut egui::Ui, icon: &str, selected: bool, tooltip: &str) -> e
 
 fn job_colour(job: &JobView, p: &Palette) -> Color32 {
     match job.state {
-        JobState::Running => OK_GREEN,
-        JobState::Stopping => WARN_AMBER,
+        JobState::Running => theme::OK_GREEN,
+        JobState::Stopping => theme::WARN_AMBER,
         JobState::Completed => p.text_muted,
-        JobState::Killed => WARN_AMBER,
-        JobState::Failed => BAD_RED,
+        JobState::Killed => theme::WARN_AMBER,
+        JobState::Failed => theme::BAD_RED,
     }
 }
 
@@ -1865,7 +1911,7 @@ fn session_row(
             if session.state == RunState::Running {
                 p.accent
             } else {
-                BAD_RED
+                theme::BAD_RED
             },
         );
     }
@@ -1892,79 +1938,6 @@ fn circle_button<'a>(icon: &'a str, p: &Palette) -> egui::Button<'a> {
         .fill(p.text)
         .corner_radius(CornerRadius::same(COMPOSER_BUTTON as u8 / 2))
         .min_size(Vec2::splat(COMPOSER_BUTTON))
-}
-
-/// One picker row: the command's name, then its summary in muted type.
-///
-/// A single `LayoutJob` rather than two widgets, because the row has to be one
-/// clickable target — two would leave the gap between them dead to the mouse.
-fn command_row_job(command: &plugins::Command, p: &Palette) -> LayoutJob {
-    let name_font = FontId::proportional(theme::font(13.0));
-    let summary_font = FontId::proportional(theme::font(11.0));
-    let mut job = LayoutJob::default();
-
-    append_run(&mut job, &format!("/{}", command.name), &name_font, p.text);
-    if let Some(description) = &command.description {
-        append_run(&mut job, "  ", &summary_font, p.text_muted);
-        append_run(
-            &mut job,
-            &shorten(description, 64),
-            &summary_font,
-            p.text_muted,
-        );
-    }
-    job
-}
-
-/// The command picker: what a `/` in the composer can become.
-///
-/// A row of the composer card rather than a floating overlay. An overlay
-/// anchored above a bottom panel has to be positioned by hand against a rect the
-/// panel is still reserving, and is clipped when the window is short; a row in
-/// the card is always visible and needs no positioning at all. The cost is that
-/// it pushes the transcript up while it is open, which is honest about the space
-/// it takes.
-///
-/// Returns the row the user clicked, if any. The highlight is clamped here rather
-/// than by the caller so a list that shrinks as the user types cannot leave it
-/// pointing past the end.
-fn draw_command_picker(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    candidates: &[&plugins::Command],
-    highlight: &mut usize,
-) -> Option<usize> {
-    *highlight = (*highlight).min(candidates.len().saturating_sub(1));
-
-    let mut clicked = None;
-    Frame::NONE
-        .fill(p.main_bg)
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::symmetric(6, 4))
-        .show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("composer-command-picker")
-                .max_height(COMMAND_PICKER_MAX_HEIGHT)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    for (index, command) in candidates.iter().enumerate() {
-                        let row = ui.add_sized(
-                            [ui.available_width(), COMMAND_ROW_HEIGHT],
-                            // The growing atom soaks up the slack, which pins the
-                            // text left; a `Button` centres its contents otherwise.
-                            egui::Button::selectable(
-                                index == *highlight,
-                                (command_row_job(command, p), egui::Atom::grow()),
-                            )
-                            .truncate(),
-                        );
-                        if row.clicked() {
-                            clicked = Some(index);
-                        }
-                    }
-                });
-        });
-    clicked
 }
 
 /// The placeholder mark: a rounded square with a terminal glyph in it, which is
@@ -2007,6 +1980,95 @@ fn draw_empty_state(ui: &mut egui::Ui, p: &Palette, project: Option<&str>) {
     });
 }
 
+/// The renderer IR available for the visible steps, keyed the same way the draw
+/// loop keys its salts.
+#[derive(Default)]
+struct Rendered {
+    message: HashMap<(Uuid, usize), Arc<Vec<Node>>>,
+    tool: HashMap<(Uuid, String), Arc<Vec<Node>>>,
+}
+
+/// One render request waiting to be sent.
+enum PendingRender {
+    Message {
+        key: RenderKey,
+        fp: u64,
+        text: String,
+        metrics: RenderMetrics,
+    },
+    Tool {
+        key: RenderKey,
+        fp: u64,
+        name: String,
+        arguments: Value,
+        result: Option<ToolResult>,
+        metrics: RenderMetrics,
+    },
+}
+
+/// The measurements the renderer needs but cannot take itself.
+///
+/// `width` is the message column before clamping; `char_width` is measured from
+/// the body font so the guest's width arithmetic tracks the host's type scale.
+fn render_metrics(ui: &egui::Ui, width: f32) -> RenderMetrics {
+    let font = FontId::proportional(theme::font(14.0));
+    let char_width = ui
+        .painter()
+        .layout_no_wrap("0".to_string(), font, Color32::PLACEHOLDER)
+        .size()
+        .x;
+    // A non-finite width would serialize as `null` and the guest would reject
+    // the request; fall back to the column's own maximum instead.
+    let width = if width.is_finite() {
+        width
+    } else {
+        COMPOSER_MAX_WIDTH
+    };
+    RenderMetrics {
+        available_width: width.clamp(0.0, COMPOSER_MAX_WIDTH),
+        char_width: char_width.max(1.0),
+        column_gap: 12.0,
+    }
+}
+
+/// Hashes a tool call's panel-relevant input.
+fn tool_fingerprint(name: &str, arguments: &Value, result: Option<&ToolResult>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    arguments.to_string().hash(&mut hasher);
+    if let Some(result) = result {
+        serde_json::to_string(result)
+            .unwrap_or_default()
+            .hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Projects a host tool result onto the wire, dropping images.
+fn tool_result(result: Option<ToolResult>) -> Option<ToolRenderResult> {
+    result.map(|result| ToolRenderResult {
+        outcome: outcome_code(result.outcome).to_string(),
+        output: result.output,
+        hunks: result
+            .hunks
+            .into_iter()
+            .map(|section| HunkLines {
+                path: section.path,
+                lines: section.lines,
+            })
+            .collect(),
+        duration_ms: result.duration_ms,
+    })
+}
+
+fn outcome_code(outcome: AuditOutcome) -> &'static str {
+    match outcome {
+        AuditOutcome::Executed => "executed",
+        AuditOutcome::Denied => "denied",
+        AuditOutcome::Failed => "failed",
+    }
+}
+
 /// Renders one transcript step.
 ///
 /// `max_width` is the message column every step is laid out in — the user's
@@ -2018,36 +2080,75 @@ fn draw_step(
     salt: (Uuid, usize),
     max_width: f32,
     thumbs: &mut HashMap<String, TextureHandle>,
+    rendered: &Rendered,
 ) {
+    let nodes = rendered.message.get(&salt).map(|nodes| nodes.as_slice());
     match step {
         Step::User { text, images } => {
-            draw_bubble(ui, p, text, salt, p.bubble_user, Align::Max, max_width);
+            draw_bubble(
+                ui,
+                p,
+                Message {
+                    text,
+                    nodes: None,
+                    salt,
+                },
+                p.bubble_user,
+                Align::Max,
+                max_width,
+            );
             draw_user_images(ui, salt, images, thumbs);
         }
-        Step::Assistant { text } => draw_agent_message(ui, p, text, salt, max_width),
+        Step::Assistant { text } => {
+            draw_agent_message(ui, p, Message { text, nodes, salt }, max_width)
+        }
         Step::Notice { text } => {
-            draw_bubble(ui, p, text, salt, p.bubble_notice, Align::Center, max_width);
+            draw_bubble(
+                ui,
+                p,
+                Message { text, nodes, salt },
+                p.bubble_notice,
+                Align::Center,
+                max_width,
+            );
         }
         // A host message reached the model as a user turn, but it is not the
         // user's own words — it renders like a notice, not like a user bubble.
         Step::HostMessage { text } => {
-            draw_bubble(ui, p, text, salt, p.bubble_notice, Align::Center, max_width);
+            draw_bubble(
+                ui,
+                p,
+                Message { text, nodes, salt },
+                p.bubble_notice,
+                Align::Center,
+                max_width,
+            );
         }
         // Reasoning needs the expanded set, which this function has no access to;
         // `draw_transcript` intercepts it before calling here. This arm only
-        // exists to keep the match exhaustive, and renders collapsed. (The id
-        // lives on the step; without the expanded set there is nothing to look
-        // up.)
+        // exists to keep the match exhaustive, and renders collapsed.
         Step::Reasoning { text, .. } => {
             draw_reasoning_block(ui, p, text, false, max_width);
         }
         Step::Tool {
             call_id,
             name,
-            arguments,
             result,
             ..
-        } => draw_tool_card(ui, p, call_id, name, arguments, result.as_ref(), max_width),
+        } => {
+            let nodes = rendered.tool.get(&(salt.0, call_id.clone()));
+            draw_tool_card(
+                ui,
+                p,
+                ToolCard {
+                    call_id,
+                    name,
+                    result: result.as_ref(),
+                    nodes: nodes.map(|nodes| nodes.as_slice()),
+                },
+                max_width,
+            );
+        }
         Step::Compaction { summary } => {
             let text = if summary.trim().is_empty() {
                 "上下文压缩失败，对话按原样继续".to_string()
@@ -2057,8 +2158,11 @@ fn draw_step(
             draw_bubble(
                 ui,
                 p,
-                &text,
-                salt,
+                Message {
+                    text: &text,
+                    nodes: None,
+                    salt,
+                },
                 p.bubble_notice,
                 Align::Center,
                 max_width,
@@ -2207,7 +2311,19 @@ fn draw_reasoning_block(
     clicked
 }
 
-/// The assistant's reply, as plain Markdown in a centred column.
+/// One transcript message as the drawing code needs it.
+///
+/// `nodes` is the renderer's display list once it is ready and takes precedence;
+/// `text` is the raw body the plain-text fallback draws, and `salt` names the
+/// message's scroll-area state. The three travel together through every
+/// message-drawing function, so they are passed as one value.
+pub(super) struct Message<'a> {
+    pub(super) text: &'a str,
+    pub(super) nodes: Option<&'a [Node]>,
+    pub(super) salt: (Uuid, usize),
+}
+
+/// The assistant's reply, in a centred column.
 ///
 /// Deliberately not a bubble. A fill around every reply only adds a box to read
 /// past, and the column is already narrower than the panel, so the two sides
@@ -2217,13 +2333,8 @@ fn draw_reasoning_block(
 /// The column is a fixed width rather than content-sized so consecutive replies
 /// start at the same x — a column that shrank to each message would drift
 /// around the middle of the window as the answer streamed in.
-fn draw_agent_message(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    text: &str,
-    salt: (Uuid, usize),
-    max_width: f32,
-) {
+fn draw_agent_message(ui: &mut egui::Ui, p: &Palette, message: Message<'_>, max_width: f32) {
+    let Message { text, nodes, salt } = message;
     ui.vertical_centered(|ui| {
         // No fill and no corner radius: `Frame` is here only to give the column
         // a width for `vertical_centered` to centre, the way the composer's
@@ -2233,14 +2344,39 @@ fn draw_agent_message(
         Frame::NONE.show(ui, |ui| {
             ui.set_width(max_width);
             ui.vertical(|ui| {
-                markdown::draw_text(ui, p, text, salt);
+                draw_message_body(ui, p, text, nodes, salt);
             });
         });
     });
     ui.add_space(8.0);
 }
 
-/// One message, as a bubble of rendered Markdown.
+/// Draws a message body from the renderer's display list when it is ready, else
+/// as plain text.
+fn draw_message_body<S: Hash>(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    text: &str,
+    nodes: Option<&[Node]>,
+    salt: S,
+) {
+    match nodes {
+        Some(nodes) => present::draw(ui, p, nodes, salt),
+        None => draw_plain_text(ui, p, text),
+    }
+}
+
+/// The fallback for a message the renderer could not shape: the raw body,
+/// selectable and wrapped, with no Markdown applied.
+fn draw_plain_text(ui: &mut egui::Ui, p: &Palette, text: &str) {
+    ui.add(
+        egui::Label::new(RichText::new(text).size(theme::font(14.0)).color(p.text))
+            .wrap()
+            .selectable(true),
+    );
+}
+
+/// One message, as a bubble of rendered content.
 ///
 /// `side` is where the bubble sits: the user's turns go `Align::Max` so they
 /// hang off the right, and the system's notices `Align::Center`. Nothing uses
@@ -2264,12 +2400,12 @@ fn draw_agent_message(
 pub(super) fn draw_bubble(
     ui: &mut egui::Ui,
     p: &Palette,
-    text: &str,
-    salt: (Uuid, usize),
+    message: Message<'_>,
     fill: Color32,
     side: Align,
     max_width: f32,
 ) -> egui::Rect {
+    let Message { text, nodes, salt } = message;
     // The band the bubble may draw in. The gap is only spent on the side the
     // bubble hugs; the agent's column already keeps the user's turns off the
     // left, and a centred notice is away from both edges by construction.
@@ -2303,7 +2439,7 @@ pub(super) fn draw_bubble(
             .inner_margin(Margin::symmetric(BUBBLE_PADDING_X as i8, 9))
             .show(&mut probe, |frame| {
                 frame.vertical(|ui| {
-                    markdown::draw_text(ui, p, text, (salt, "measure"));
+                    draw_message_body(ui, p, text, nodes, (salt, "measure"));
                 });
             });
         // A message wider than the band is clamped to it; rounding inside the
@@ -2340,7 +2476,7 @@ pub(super) fn draw_bubble(
             // bubble promises.
             frame.set_min_width(measured - 2.0 * BUBBLE_PADDING_X);
             frame.vertical(|ui| {
-                markdown::draw_text(ui, p, text, salt);
+                draw_message_body(ui, p, text, nodes, salt);
             });
         });
     // Hand the vertical space the bubble occupied back to the caller's layout.
@@ -2352,105 +2488,88 @@ pub(super) fn draw_bubble(
     drawn.min_rect()
 }
 
-/// One tool call, collapsed by default.
+/// One tool call as the card draws it.
 ///
-/// The collapsed row carries no bubble fill: a run of calls should read as a
-/// log, not as a stack of cards. Expanding it hands the body to `code_view`,
-/// which shapes it by tool — a patch becomes a diff, an `exec` becomes a
-/// terminal, anything else is plain output.
+/// The call's identity and result, plus the renderer's display list once it has
+/// returned. They are the same call's data, so they travel as one value.
+struct ToolCard<'a> {
+    call_id: &'a str,
+    name: &'a str,
+    result: Option<&'a ToolResult>,
+    nodes: Option<&'a [Node]>,
+}
+
+/// One tool call.
 ///
-/// The row's glyph is the *outcome* (✓ / ⚠ / ✕) rather than the tool's own, so
-/// a failure is visible without expanding anything; the tool's own glyph heads
-/// the panel instead.
-fn draw_tool_card(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    call_id: &str,
-    name: &str,
-    arguments: &Value,
-    result: Option<&ToolResult>,
-    max_width: f32,
-) {
-    let accent = match result {
-        None => p.text_muted,
-        Some(result) => outcome_colour(result.outcome),
-    };
+/// When the renderer has shaped it, the whole card — the collapsed row and the
+/// expanded body — is its display list, drawn by [`present::draw`]. When it has
+/// not, a minimal host fold stands in: the tool's name over its raw output.
+fn draw_tool_card(ui: &mut egui::Ui, p: &Palette, card: ToolCard<'_>, max_width: f32) {
+    let ToolCard {
+        call_id,
+        name,
+        result,
+        nodes,
+    } = card;
 
     // The same centred column the replies use: left to itself the row hugs the
     // transcript's edge, and a run of calls reads as a second flow beside the
-    // prose it belongs to. The expanded panel fills the column — still slab
-    // wide for a diff, just not wider than the conversation it edits.
+    // prose it belongs to.
     ui.vertical_centered(|ui| {
         Frame::NONE.show(ui, |ui| {
             ui.set_width(max_width);
-            egui::CollapsingHeader::new(header_job(p, name, arguments, result, accent))
-                .id_salt(call_id)
-                .default_open(false)
-                .show_background(false)
-                .show(ui, |ui| {
-                    let spec = tool_panel(name, arguments, result, accent);
-                    code_view::draw(ui, p, call_id, &spec, max_width);
-
-                    // A tool this build does not know gets a panel like any
-                    // other, but nothing on screen then says what it was
-                    // *asked* to do, so its arguments stay reachable.
-                    if !code_view::is_known(name) {
-                        egui::CollapsingHeader::new(
-                            RichText::new("参数")
-                                .size(theme::font(11.0))
-                                .color(p.text_muted),
-                        )
-                        .id_salt((call_id, "arguments"))
-                        .default_open(false)
-                        .show_background(false)
-                        .show(ui, |ui| selectable_code(ui, &pretty(arguments)));
-                    }
-                });
+            match nodes {
+                Some(nodes) => present::draw(ui, p, nodes, call_id),
+                None => draw_tool_fallback(ui, p, call_id, name, result),
+            }
         });
     });
     ui.add_space(8.0);
 }
 
-/// The collapsed row as one multi-coloured galley: status glyph, verb, then a
-/// dimmed summary and duration.
-///
-/// A `LayoutJob` rather than a `RichText`, because the parts are coloured
-/// differently — and still a `CollapsingHeader`, rather than a hand-built row,
-/// so the caret, the open/close animation and the accessibility node stay
-/// egui's problem.
-fn header_job(
+/// The stand-in for a tool card the renderer could not shape: a fold named after
+/// the tool, holding its raw output.
+fn draw_tool_fallback(
+    ui: &mut egui::Ui,
     p: &Palette,
+    call_id: &str,
     name: &str,
-    arguments: &Value,
     result: Option<&ToolResult>,
-    accent: Color32,
-) -> LayoutJob {
-    let font = FontId::proportional(theme::font(13.0));
-    // Dimmer than `text_muted`: the summary is a hint, not a label, and the row
-    // has to stay quiet next to the transcript's prose.
-    let dim = p.text_muted.gamma_multiply(0.72);
-    let mut job = LayoutJob::default();
-
+) {
+    let accent = match result {
+        None => p.text_muted,
+        Some(result) => outcome_colour(result.outcome),
+    };
     let glyph = match result {
         None => icons::SPINNER_GAP,
         Some(result) => outcome_icon(result.outcome),
     };
+    let font = FontId::proportional(theme::font(13.0));
+    let mut job = LayoutJob::default();
     append_run(&mut job, &format!("{glyph}  "), &font, accent);
-    append_run(&mut job, code_view::tool_label(name), &font, p.text_muted);
-    if let Some(summary) = summarize(name, arguments) {
-        append_run(&mut job, "  ", &font, dim);
-        append_run(&mut job, &shorten(&summary, 64), &font, dim);
-    }
-    if let Some(result) = result {
-        append_run(
-            &mut job,
-            &format!("  ·  {} ms", result.duration_ms),
-            &font,
-            dim,
-        );
-    }
+    append_run(&mut job, name, &font, p.text_muted);
 
-    job
+    egui::CollapsingHeader::new(job)
+        .id_salt(call_id)
+        .default_open(false)
+        .show_background(false)
+        .show(ui, |ui| match result {
+            Some(result) if !result.output.is_empty() => selectable_code(ui, &result.output),
+            Some(_) => {
+                ui.label(
+                    RichText::new("（无输出）")
+                        .size(theme::font(12.0))
+                        .color(p.text_muted),
+                );
+            }
+            None => {
+                ui.label(
+                    RichText::new("运行中…")
+                        .size(theme::font(12.0))
+                        .color(p.text_muted),
+                );
+            }
+        });
 }
 
 fn append_run(job: &mut LayoutJob, text: &str, font: &FontId, colour: Color32) {
@@ -2465,102 +2584,11 @@ fn append_run(job: &mut LayoutJob, text: &str, font: &FontId, colour: Color32) {
     );
 }
 
-/// Shapes the expanded body for the tool that produced it.
-///
-/// Known tools do not repeat their arguments: a patch's are the diff, an
-/// `exec`'s are the prompt line. `draw_tool_card` keeps the raw JSON for the
-/// tools that fall through to the last arm.
-fn tool_panel(
-    name: &str,
-    arguments: &Value,
-    result: Option<&ToolResult>,
-    accent: Color32,
-) -> code_view::PanelSpec {
-    let running = result.is_none();
-    let output = result
-        .map(|result| result.output.as_str())
-        .unwrap_or_default();
-    let icon = code_view::tool_icon(name);
-
-    match name {
-        "apply_patch" => {
-            let patch = arguments
-                .get("patch")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let (added, removed) = code_view::patch_stats(patch);
-            // The numbers in `hunks` were resolved when the tool read the
-            // target file, so they are the file's real line numbers. A result
-            // from before that field existed (or a still-running call) has
-            // none, and falls back to counting within the patch.
-            // One flat table across the whole patch: `hunks` records a section
-            // per file operation in the order the patch lists them, and the
-            // body's hunk lines draw from the table in that same order.
-            let numbers = result.map(|result| {
-                result
-                    .hunks
-                    .iter()
-                    .flat_map(|section| section.lines.iter().copied())
-                    .collect::<Vec<_>>()
-            });
-            let mut lines = code_view::patch_lines(patch, numbers.as_deref());
-            // The tool's own report names the paths it resolved, which the
-            // patch's relative paths do not, so it rides along as a footer
-            // rather than being dropped.
-            lines.extend(code_view::meta_lines(output));
-            code_view::PanelSpec {
-                title: shorten(&code_view::patch_title(patch), 80),
-                icon,
-                added,
-                removed,
-                lines,
-                copy: patch.to_string(),
-                accent,
-                running,
-            }
-        }
-        "exec" => {
-            let command = arguments
-                .get("command")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            code_view::PanelSpec {
-                title: "Shell".to_string(),
-                icon,
-                added: 0,
-                removed: 0,
-                lines: code_view::command_lines(command, output),
-                copy: output.to_string(),
-                accent,
-                running,
-            }
-        }
-        // `read_file`, `list_dir`, `read_image` — and any tool this build has
-        // never heard of, which then titles itself with its own name.
-        _ => {
-            let path = arguments
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or(name);
-            code_view::PanelSpec {
-                title: shorten(path, 80),
-                icon,
-                added: 0,
-                removed: 0,
-                lines: code_view::text_lines(output),
-                copy: output.to_string(),
-                accent,
-                running,
-            }
-        }
-    }
-}
-
 fn outcome_colour(outcome: AuditOutcome) -> Color32 {
     match outcome {
-        AuditOutcome::Executed => OK_GREEN,
-        AuditOutcome::Denied => WARN_AMBER,
-        AuditOutcome::Failed => BAD_RED,
+        AuditOutcome::Executed => theme::OK_GREEN,
+        AuditOutcome::Denied => theme::WARN_AMBER,
+        AuditOutcome::Failed => theme::BAD_RED,
     }
 }
 

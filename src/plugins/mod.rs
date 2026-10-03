@@ -5,16 +5,12 @@
 //! Every loaded plugin must declare a Wasmtime component. Tools, plugin events,
 //! and UI surfaces are implemented by Components using the same generic ABI; no
 //! non-Wasm plugin path is retained.
-pub mod agents;
 pub mod capabilities;
-pub mod commands;
 pub mod defaults;
-pub mod frontmatter;
 pub mod manifest;
 pub mod providers;
 pub mod runtime;
 pub mod settings;
-pub mod skills;
 pub mod ui_protocol;
 pub mod wasm;
 pub mod wasm_manifest;
@@ -23,20 +19,9 @@ pub mod wasm_runtime;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-pub use agents::AgentRole;
-pub use commands::Command;
 pub use manifest::PluginManifest;
 use settings::project_key;
 pub use settings::PluginSettings;
-pub use skills::Skill;
-
-/// A one-line summary is capped at this many characters.
-///
-/// `interface.shortDescription`, a skill's frontmatter and a command's
-/// frontmatter are each meant to be a subtitle, but nothing enforces that, and
-/// any of them is free to hold a paragraph. Shared by [`skills`] and
-/// [`commands`] so the two summaries the UI shows cannot drift apart.
-pub(crate) const MAX_DESCRIPTION_CHARS: usize = 200;
 
 /// Caps text on a character boundary, so a multi-byte character is never split.
 pub(crate) fn cap_chars(text: &str, max: usize) -> String {
@@ -46,19 +31,6 @@ pub(crate) fn cap_chars(text: &str, max: usize) -> String {
     let mut capped: String = text.chars().take(max).collect();
     capped.push('…');
     capped
-}
-
-/// The summary to show when a file's frontmatter carries none.
-///
-/// The first line of prose: headings are skipped because an opening heading
-/// names the thing rather than describing it, which is exactly what the name
-/// already does. Shared by [`commands`] and [`agents`], whose real files both
-/// omit the frontmatter entirely.
-pub(crate) fn first_prose_line(body: &str) -> Option<String> {
-    body.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| cap_chars(line, MAX_DESCRIPTION_CHARS))
 }
 
 /// Where a plugin came from, which decides where it applies.
@@ -130,17 +102,6 @@ pub struct LoadedPlugin {
     /// The plugin's directory, absolute.
     pub root: PathBuf,
     pub manifest: PluginManifest,
-    /// The skills this plugin contributes, sorted by name.
-    pub skills: Vec<Skill>,
-    /// The slash commands this plugin contributes, sorted by name.
-    ///
-    /// Unlike a skill, a command is invoked by the user rather than chosen by
-    /// the model, so this reaches the composer and never the system prompt.
-    pub commands: Vec<Command>,
-    /// The sub-agent roles this plugin contributes, sorted by name.
-    ///
-    /// Offered to the model through the `task` tool; see [`agents`].
-    pub agents: Vec<AgentRole>,
 }
 
 impl LoadedPlugin {
@@ -168,7 +129,7 @@ pub struct PluginCatalogue {
     /// Global plugins the user turned off but that are still installed.
     ///
     /// Resolved and read like the others, because the plugins window must show
-    /// what a disabled plugin *is* — its skills, its commands — and offer to
+    /// what a disabled plugin *is* — its roles and its runtime — and offer to
     /// turn it back on. They are kept apart from `global` rather than flagged
     /// on [`LoadedPlugin`], so nothing that consumes the catalogue for its
     /// actual work can reach a plugin the user disabled by forgetting a check:
@@ -395,9 +356,6 @@ pub fn discover(home: &Path, projects: &[PathBuf], settings: &PluginSettings) ->
             about = plugin.summary().unwrap_or(""),
             scope = %plugin.scope.label(),
             root = %plugin.root.display(),
-            skills = plugin.skills.len(),
-            commands = plugin.commands.len(),
-            agents = plugin.agents.len(),
             "loaded plugin"
         );
     }
@@ -535,26 +493,11 @@ fn load_from(root: &Path, id: &str, scope: Scope) -> Option<LoadedPlugin> {
         return None;
     };
 
-    let skills = skills::load(id, root, manifest.skills.as_deref());
-
-    // Commands are namespaced by the plugin's *short* name — `/figma:…` — so
-    // this takes `manifest.name` rather than the `name@marketplace` id the
-    // skills above are attributed by. A user types the short one.
-    let commands = commands::load(&manifest.name, root);
-
-    // Roles are attributed by the full `name@marketplace` id, like the skills:
-    // both are surfaced by the host rather than typed by the user, and with two
-    // marketplaces installed the short name alone is ambiguous.
-    let agents = agents::load(id, root);
-
     Some(LoadedPlugin {
         id: id.to_string(),
         scope,
         root: root.to_path_buf(),
         manifest,
-        skills,
-        commands,
-        agents,
     })
 }
 
@@ -692,8 +635,8 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// Scaffolds a plugin directory: a manifest plus one skill.
-    fn write_plugin(root: &Path, name: &str, skill: Option<&str>) {
+    /// Scaffolds a plugin directory: a manifest only.
+    fn write_plugin(root: &Path, name: &str) {
         fs::create_dir_all(root).unwrap();
         fs::write(
             root.join(manifest::MANIFEST_FILE),
@@ -705,16 +648,6 @@ mod tests {
             ),
         )
         .unwrap();
-
-        if let Some(skill) = skill {
-            let skill_dir = root.join("skills").join(skill);
-            fs::create_dir_all(&skill_dir).unwrap();
-            fs::write(
-                skill_dir.join("SKILL.md"),
-                format!("---\nname: {skill}\ndescription: The {skill} skill\n---\n\nBody.\n"),
-            )
-            .unwrap();
-        }
     }
 
     /// Writes a marketplace file at the standard location under `root`.
@@ -755,11 +688,7 @@ mod tests {
 
         // Personal (global): `figma` at `home/plugins/figma`.
         write_marketplace(home.path(), "personal", &[("figma", "./plugins/figma")]);
-        write_plugin(
-            &home.path().join("plugins/figma"),
-            "figma",
-            Some("figma-use"),
-        );
+        write_plugin(&home.path().join("plugins/figma"), "figma");
 
         // Bundled (global): `computer-use`.
         let bundle = bundled_marketplaces_root(home.path()).join("openai-bundled");
@@ -768,11 +697,7 @@ mod tests {
             "openai-bundled",
             &[("computer-use", "./plugins/computer-use")],
         );
-        write_plugin(
-            &bundle.join("plugins/computer-use"),
-            "computer-use",
-            Some("computer-use"),
-        );
+        write_plugin(&bundle.join("plugins/computer-use"), "computer-use");
 
         // The project's own marketplace, which resolves against the project root.
         write_marketplace(
@@ -780,11 +705,7 @@ mod tests {
             "my-team",
             &[("repo-triage", "./plugins/repo-triage")],
         );
-        write_plugin(
-            &project.path().join("plugins/repo-triage"),
-            "repo-triage",
-            Some("repo-triage"),
-        );
+        write_plugin(&project.path().join("plugins/repo-triage"), "repo-triage");
 
         Fixture {
             home,
@@ -1111,7 +1032,7 @@ mod tests {
         let fixture = fixture();
         // The same id in both scopes, but each marketplace points somewhere else.
         let project_plugin = fixture.project.path().join("plugins/pinned");
-        write_plugin(&project_plugin, "pinned", None);
+        write_plugin(&project_plugin, "pinned");
         write_marketplace(
             fixture.project.path(),
             "personal",
@@ -1152,7 +1073,6 @@ mod tests {
         write_plugin(
             &plugin_cache_root(home.path()).join("openai-curated/figma/1dc19589"),
             "figma",
-            Some("figma-use"),
         );
 
         let settings = PluginSettings {
@@ -1172,8 +1092,8 @@ mod tests {
     fn the_newest_cached_version_wins() {
         let home = tempfile::tempdir().unwrap();
         let cache = plugin_cache_root(home.path()).join("openai-bundled/computer-use");
-        write_plugin(&cache.join("26.616.51431"), "computer-use", None);
-        write_plugin(&cache.join("27.1.1"), "computer-use", None);
+        write_plugin(&cache.join("26.616.51431"), "computer-use");
+        write_plugin(&cache.join("27.1.1"), "computer-use");
 
         let settings = PluginSettings {
             plugins: settings::entries(&["computer-use@openai-bundled"]),
@@ -1195,7 +1115,6 @@ mod tests {
         write_plugin(
             &plugin_cache_root(fixture.home.path()).join("personal/figma/9.9.9"),
             "figma",
-            None,
         );
 
         let settings = PluginSettings {
@@ -1227,7 +1146,6 @@ mod tests {
         write_plugin(
             &plugin_cache_root(home.path()).join("personal/withdrawn/1.0.0"),
             "withdrawn",
-            None,
         );
 
         let settings = PluginSettings {
@@ -1238,24 +1156,6 @@ mod tests {
         let catalogue = discover(home.path(), &[], &settings);
 
         assert!(catalogue.for_project(Path::new("/any")).is_empty());
-    }
-
-    #[test]
-    fn skills_are_read_alongside_the_manifest() {
-        let fixture = fixture();
-        let settings = PluginSettings {
-            plugins: settings::entries(&["computer-use@openai-bundled"]),
-            projects: BTreeMap::new(),
-            disabled_projects: BTreeMap::new(),
-        };
-        let catalogue = discover(fixture.home.path(), &[], &settings);
-
-        let plugin = catalogue.for_project(Path::new("/any"))[0];
-        assert_eq!(plugin.display_name(), "computer-use");
-        assert_eq!(plugin.summary(), Some("Does computer-use things"));
-        assert_eq!(plugin.skills.len(), 1);
-        assert_eq!(plugin.skills[0].name, "computer-use");
-        assert_eq!(plugin.skills[0].plugin, "computer-use@openai-bundled");
     }
 
     #[test]
@@ -1362,10 +1262,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["figma@personal"]
         );
-        assert_eq!(
-            catalogue.disabled()[0].skills.len(),
-            1,
-            "a disabled plugin is still read, so the window can describe what turning it on brings"
+        assert!(
+            catalogue.disabled()[0].manifest.wasm_runtime().is_some(),
+            "a disabled plugin is still resolved, so the window can describe what turning it on brings"
         );
     }
 

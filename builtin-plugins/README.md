@@ -1,8 +1,9 @@
 # Built-in Wasmtime plugins
 
 Each immediate subdirectory is one Wasmtime plugin package embedded into the
-application at build time. The repository currently ships separate `hooks`
-and `mcp` Components for those two responsibilities.
+application at build time. The repository ships `hooks` and `mcp` Components for
+those two responsibilities, plus `transcript-renderer`, which shapes messages
+and tool results into the transcript's display list.
 
 Required files:
 
@@ -11,6 +12,11 @@ builtin-plugins/<plugin>/
 ├── plugin.json
 └── plugin.wasm
 ```
+
+A package may also carry a sibling `README.md` for humans; `build.rs` ignores
+any plain file that is not `plugin.json` or `plugin.wasm` (it rejects
+subdirectories). See [`mcp/README.md`](mcp/README.md) and
+[`hooks/README.md`](hooks/README.md).
 
 For the MCP Component, the host binds the instance to the active global or
 project configuration root. The Component then requests its configuration

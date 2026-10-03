@@ -1,24 +1,12 @@
 //! Stable identifiers and small domain values used by the runtime boundary.
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 
 use crate::tools::ToolDescriptor;
 
 pub type RunId = u64;
 pub type CallId = String;
-pub type PluginId = String;
 pub type ToolName = String;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentRole {
-    pub name: ToolName,
-    pub description: Option<String>,
-    pub instructions: String,
-    pub plugin: PluginId,
-    pub path: PathBuf,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -55,21 +43,6 @@ pub struct HunkLines {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PromptSkill {
-    pub name: String,
-    pub description: Option<String>,
-    pub path: PathBuf,
-    pub plugin: PluginId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PromptAgent {
-    pub name: ToolName,
-    pub description: Option<String>,
-    pub plugin: PluginId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectInstruction {
     pub path: String,
     pub content: String,
@@ -78,7 +51,9 @@ pub struct ProjectInstruction {
 #[derive(Debug, Clone)]
 pub struct PromptContext {
     pub tools: Vec<ToolDescriptor>,
-    pub skills: Vec<PromptSkill>,
-    pub agents: Vec<PromptAgent>,
+    /// Prompt text contributed by Components, in the order they were asked.
+    /// Each entry is appended to the system prompt verbatim: the host does not
+    /// parse it, so it stays ignorant of what any plugin chose to say.
+    pub plugin_sections: Vec<String>,
     pub project_instructions: Vec<ProjectInstruction>,
 }

@@ -12,12 +12,10 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
-use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::attachments::{self, ImageRef};
-use crate::code_view;
 use crate::config::{Config, API_KEY_ENV};
 use crate::image_ops;
 use crate::ipc::{Cmd, Event, JobState, JobView, LlmSettings, RunId, RunState, SecretValue};
@@ -29,6 +27,7 @@ mod controller;
 mod events;
 mod intents;
 mod plugin_ui;
+mod render_cache;
 mod resources;
 mod state;
 mod ui;
@@ -159,8 +158,6 @@ impl App {
             search: String::new(),
             context_limit_text: String::new(),
             max_output_tokens_text: String::new(),
-            command_highlight: 0,
-            command_picker_dismissed: None,
             expanded_reasoning: HashSet::new(),
             stick_to_bottom: true,
             jobs: Vec::new(),
@@ -176,6 +173,8 @@ impl App {
             settings_error: None,
             plugins_error: None,
             sidebar_error: None,
+            render_cache: render_cache::RenderCache::default(),
+            renderer_available: true,
         }
     }
 
@@ -374,6 +373,45 @@ impl App {
                 self.apply_subagent(&job_id, *event);
                 return;
             }
+            // Render results are not tied to a run: they land in the cache and
+            // the draw loop picks them up by key.
+            Event::MessageRendered {
+                key,
+                revision,
+                nodes,
+            }
+            | Event::ToolRendered {
+                key,
+                revision,
+                nodes,
+            } => {
+                self.render_cache.store(&key, revision, nodes);
+                return;
+            }
+            Event::RenderFailed {
+                key,
+                revision,
+                kind,
+                message,
+            } => {
+                tracing::warn!(?kind, %message, "renderer request failed");
+                self.render_cache.fail(&key, revision);
+                return;
+            }
+            Event::RendererAvailability { available } => {
+                if available && !self.renderer_available {
+                    // Failed renders are never retried by `collect_rendered`, so
+                    // a renderer that comes back would otherwise leave the
+                    // transcript stuck on the fallback. Dropping the cache makes
+                    // every visible step ask again.
+                    self.render_cache.clear();
+                }
+                if !available {
+                    tracing::warn!("transcript renderer unavailable; drawing plain text");
+                }
+                self.renderer_available = available;
+                return;
+            }
             other => other,
         };
 
@@ -543,7 +581,11 @@ impl App {
             | Event::PluginUiUpdated { .. }
             | Event::PluginUiClosed { .. }
             | Event::PluginUiFailed { .. }
-            | Event::PluginOperationFailed { .. } => {}
+            | Event::PluginOperationFailed { .. }
+            | Event::MessageRendered { .. }
+            | Event::ToolRendered { .. }
+            | Event::RenderFailed { .. }
+            | Event::RendererAvailability { .. } => {}
         }
 
         // A terminal event is also the last event its run can emit, so the run
@@ -712,7 +754,7 @@ impl App {
     ///
     /// The open conversation's own project, or — with no conversation open —
     /// the one the sidebar points at. This is the same lookup `start_run` uses
-    /// to pick the session it appends to, so the command list and the run
+    /// to pick the session it appends to, so the recorded turn and the run
     /// cannot disagree about which project they are in.
     fn sending_project(&self) -> String {
         self.selected
@@ -768,16 +810,6 @@ impl App {
         None
     }
 
-    /// The prompt as it should actually be sent, with a leading `/name`
-    /// expanded into that command's template.
-    ///
-    /// `None` when the text is not a command invocation — a leading `/` is
-    /// usually just a path, and reporting that as an unknown command would be
-    /// worse than passing it through.
-    fn expanded_command(&self, text: &str, project: &str) -> Option<String> {
-        plugins::commands::expand(text, &commands_for(&self.catalogue, project))
-    }
-
     /// Turns the composer's contents into a dispatched run.
     ///
     /// Continues the open session when there is one and starts a fresh session
@@ -794,20 +826,15 @@ impl App {
             }
         }
 
-        // Which project this send belongs to, resolved before the text is
-        // expanded because the command list is per project. It is the same
-        // answer the match below needs, so it is worked out once here and
-        // handed to it rather than derived twice and left to drift.
+        // Which project this send belongs to. The match below needs the same
+        // answer, so it is worked out once here and handed to it rather than
+        // derived twice and left to drift.
         let project = self.sending_project();
 
         let text = self.prompt.trim().to_string();
         if text.is_empty() && self.pending_images.is_empty() {
             return;
         }
-        // A `/name` the catalogue knows becomes its template before the turn
-        // exists, so what the transcript records is the prompt the model was
-        // actually given rather than the shorthand that produced it.
-        let text = self.expanded_command(&text, &project).unwrap_or(text);
         // The turn is built once here so the one recorded in the transcript and
         // the one sent to the worker cannot drift apart.
         let turn = UserTurn {
@@ -924,6 +951,10 @@ impl App {
     /// Removes a session and its transcript from the store.
     fn delete_session(&mut self, id: Uuid) {
         self.sessions.retain(|session| session.id != id);
+        // The render cache is keyed by session, so a deleted session's entries
+        // would otherwise stay resident for the life of the process.
+        let live: HashSet<Uuid> = self.sessions.iter().map(|session| session.id).collect();
+        self.render_cache.retain_sessions(&live);
         if self.selected == Some(id) {
             self.selected = None;
         }
@@ -1460,7 +1491,11 @@ fn event_run_id(event: &Event) -> RunId {
         | Event::PluginUiUpdated { .. }
         | Event::PluginUiClosed { .. }
         | Event::PluginUiFailed { .. }
-        | Event::PluginOperationFailed { .. } => 0,
+        | Event::PluginOperationFailed { .. }
+        | Event::MessageRendered { .. }
+        | Event::ToolRendered { .. }
+        | Event::RenderFailed { .. }
+        | Event::RendererAvailability { .. } => 0,
     }
 }
 
@@ -1494,71 +1529,6 @@ fn format_elapsed(started_ms: u128) -> String {
     }
 }
 
-/// Every slash command the plugins in effect for `project` contribute, sorted
-/// by name.
-///
-/// Resolved on demand rather than cached at startup: the answer depends on which
-/// conversation is open, so switching sessions legitimately changes the list, and
-/// a stale cache would offer another project's commands.
-///
-/// A free function rather than a method on [`App`] because both the expansion
-/// and the composer's picker need it, and the picker has to stop borrowing the
-/// catalogue before the input row takes `self` mutably.
-fn commands_for<'a>(catalogue: &'a PluginCatalogue, project: &str) -> Vec<&'a plugins::Command> {
-    let mut commands: Vec<&plugins::Command> = catalogue
-        .for_project(Path::new(project))
-        .into_iter()
-        .flat_map(|plugin| plugin.commands.iter())
-        .collect();
-    commands.sort_by(|a, b| a.name.cmp(&b.name));
-    commands
-}
-
-/// The commands whose names contain `query`, in name order.
-///
-/// A case-insensitive substring match rather than a prefix, because the
-/// distinctive part of a name is usually near the end — `figma:implement-from-figma`
-/// is reached by typing `impl` — and a plugin ships few enough commands that the
-/// wider match is help rather than noise. An empty query matches everything,
-/// which is what makes typing a bare `/` list the lot.
-fn matching_commands<'a>(
-    catalogue: &'a PluginCatalogue,
-    project: &str,
-    query: &str,
-) -> Vec<&'a plugins::Command> {
-    let needle = query.to_ascii_lowercase();
-    commands_for(catalogue, project)
-        .into_iter()
-        .filter(|command| command.name.to_ascii_lowercase().contains(&needle))
-        .collect()
-}
-
-/// The `/name` the composer is part-way through typing.
-///
-/// `None` unless the whole prompt is a single `/`-prefixed token. A space means
-/// the user has moved on to arguments and the picker should be out of the way;
-/// a leading `/` that names no command is filtered out later, by matching
-/// nothing rather than by being refused here.
-fn command_query(prompt: &str) -> Option<&str> {
-    let rest = prompt.strip_prefix('/')?;
-    if rest.contains(char::is_whitespace) {
-        return None;
-    }
-    Some(rest)
-}
-
-/// Replaces the half-typed `/name` with the finished `/name `.
-///
-/// The picker only appears while the prompt is one `/`-prefixed token, so
-/// rewriting the buffer is exactly the edit the user was making — and it leaves
-/// the caret ready for arguments rather than making them type the space.
-fn apply_command_choice(prompt: &mut String, name: &str) {
-    prompt.clear();
-    prompt.push('/');
-    prompt.push_str(name);
-    prompt.push(' ');
-}
-
 /// What a thumbnail or a chip says when hovered.
 fn attachment_caption(image: &ImageRef) -> String {
     let label = image.name.clone().unwrap_or_else(|| "图片".into());
@@ -1568,32 +1538,6 @@ fn attachment_caption(image: &ImageRef) -> String {
         image.height,
         image.bytes / 1024
     )
-}
-
-/// The one-line gist of a call, which is what the collapsed card shows.
-fn summarize(name: &str, arguments: &Value) -> Option<String> {
-    let text = match name {
-        "exec" => arguments
-            .get("command")
-            .and_then(Value::as_str)
-            .map(|command| format!("$ {command}")),
-        "read_file" | "list_dir" => arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        // The patch's second line is `*** Update File: <path>`, whose marker is
-        // pure noise in a row this narrow — name the file instead.
-        "apply_patch" => arguments
-            .get("patch")
-            .and_then(Value::as_str)
-            .map(code_view::patch_title),
-        _ => None,
-    };
-    text.map(|text| shorten(&text, 200))
-}
-
-fn pretty(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 /// The last path component, for the project list.
@@ -1692,8 +1636,10 @@ mod tests {
     // Only the tests below need these: the production code in this module no
     // longer touches egui's layout or the theme's palette.
     use egui::Align;
+    use serde_json::Value;
 
     use crate::ipc::AuditOutcome;
+    use crate::renderer::protocol::{ColorRole, Node, RenderKey, RenderKind, Run};
     use crate::theme::{self, ThemeChoice};
 
     /// The bubble must hug the *message column's* right edge, not the panel's.
@@ -1747,7 +1693,7 @@ mod tests {
         let mut output = ctx.run_ui(input, |ui| app.draw_transcript(ui, &p, &mut resources));
 
         // The bubble is the rect painted in the user's fill; the reply is
-        // plain Markdown, so the column's left edge is where its text starts.
+        // plain text, so the column's left edge is where its text starts.
         let bubble = output
             .shapes
             .iter()
@@ -1813,8 +1759,11 @@ mod tests {
             let short = ui::draw_bubble(
                 ui,
                 &p,
-                "继续",
-                (Uuid::nil(), 0),
+                ui::Message {
+                    text: "继续",
+                    nodes: None,
+                    salt: (Uuid::nil(), 0),
+                },
                 p.bubble_user,
                 Align::Max,
                 band,
@@ -1836,8 +1785,11 @@ mod tests {
             let wrapped = ui::draw_bubble(
                 ui,
                 &p,
-                long,
-                (Uuid::nil(), 1),
+                ui::Message {
+                    text: long,
+                    nodes: None,
+                    salt: (Uuid::nil(), 1),
+                },
                 p.bubble_user,
                 Align::Max,
                 band,
@@ -1871,6 +1823,125 @@ mod tests {
             &[],
             &plugins::PluginSettings::default(),
         ))
+    }
+
+    /// A failed render is remembered, so the item falls back to the native
+    /// parser instead of asking the renderer for the same input again.
+    #[test]
+    fn a_failed_render_is_remembered_and_never_served_from_the_cache() {
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            cmd_tx,
+            event_rx,
+            crate::config::Config::default(),
+            "key".into(),
+            Vec::new(),
+            no_plugins(),
+            test_paths(),
+        );
+
+        let key = RenderKey::Message {
+            session: Uuid::new_v4(),
+            step: 0,
+        };
+        let fingerprint = render_cache::fingerprint("hello");
+        app.render_cache.begin(&key, 1, fingerprint);
+        app.apply(Event::RenderFailed {
+            key: key.clone(),
+            revision: 1,
+            kind: RenderKind::Message,
+            message: "boom".into(),
+        });
+
+        assert_eq!(
+            app.render_cache.get(&key).expect("entry").status,
+            render_cache::RenderStatus::Failed,
+        );
+        assert!(
+            app.render_cache.rendered(&key, fingerprint).is_none(),
+            "a failed render must not be served from the cache",
+        );
+    }
+
+    /// A render result lands in the cache under its key; the draw loop picks it
+    /// up by key rather than through the run that produced the message.
+    #[test]
+    fn a_rendered_message_response_is_cached_by_key() {
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            cmd_tx,
+            event_rx,
+            crate::config::Config::default(),
+            "key".into(),
+            Vec::new(),
+            no_plugins(),
+            test_paths(),
+        );
+
+        let key = RenderKey::Message {
+            session: Uuid::new_v4(),
+            step: 0,
+        };
+        let fingerprint = render_cache::fingerprint("hi");
+        let nodes = Arc::new(vec![Node::Text {
+            runs: vec![Run::text("hi", 14.0, ColorRole::Text)],
+            wrap: true,
+            selectable: true,
+        }]);
+        app.render_cache.begin(&key, 1, fingerprint);
+        app.apply(Event::MessageRendered {
+            key: key.clone(),
+            revision: 1,
+            nodes,
+        });
+
+        let cached = app
+            .render_cache
+            .rendered(&key, fingerprint)
+            .expect("the response should be cached");
+        assert_eq!(cached.len(), 1);
+    }
+
+    /// Availability is tracked both ways, and coming back clears the cache so a
+    /// failed render is retried instead of staying on the plain-text fallback.
+    #[test]
+    fn renderer_availability_is_remembered_and_recovery_clears_the_cache() {
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            cmd_tx,
+            event_rx,
+            crate::config::Config::default(),
+            "key".into(),
+            Vec::new(),
+            no_plugins(),
+            test_paths(),
+        );
+
+        let key = RenderKey::Message {
+            session: Uuid::new_v4(),
+            step: 0,
+        };
+        let fingerprint = render_cache::fingerprint("hi");
+        app.render_cache.begin(&key, 1, fingerprint);
+        app.render_cache.fail(&key, 1);
+
+        assert!(app.renderer_available, "the renderer starts assumed loaded");
+        app.apply(Event::RendererAvailability { available: false });
+        assert!(!app.renderer_available);
+        assert!(
+            app.render_cache.get(&key).is_some(),
+            "going unavailable keeps what was already cached",
+        );
+
+        app.apply(Event::RendererAvailability { available: true });
+        assert!(app.renderer_available);
+        assert!(
+            app.render_cache.get(&key).is_none(),
+            "coming back drops the failed entries so they are requested again",
+        );
     }
 
     #[test]
@@ -1908,37 +1979,6 @@ mod tests {
         assert_eq!(parse_token_count("abc"), None);
         assert_eq!(parse_token_count("8GB"), None);
         assert_eq!(parse_token_count("1.5M"), None);
-    }
-
-    #[test]
-    fn summarize_knows_each_tool() {
-        assert_eq!(
-            summarize("exec", &serde_json::json!({ "command": "ls" })).as_deref(),
-            Some("$ ls")
-        );
-        assert_eq!(
-            summarize("read_file", &serde_json::json!({ "path": "/a/b.txt" })).as_deref(),
-            Some("/a/b.txt")
-        );
-        assert_eq!(summarize("list_dir", &serde_json::json!({})), None);
-        // A patch is summarised by the file it touches, not by its second line.
-        assert_eq!(
-            summarize(
-                "apply_patch",
-                &serde_json::json!({
-                    "patch": "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-x\n+y\n*** End Patch"
-                })
-            )
-            .as_deref(),
-            Some("src/a.rs")
-        );
-    }
-
-    #[test]
-    fn summarize_tolerates_arguments_that_are_not_an_object() {
-        // A call whose arguments failed to parse arrives as a bare string.
-        let arguments = Value::String("{\"path\":".into());
-        assert_eq!(summarize("read_file", &arguments), None);
     }
 
     #[test]
@@ -2697,80 +2737,6 @@ mod tests {
         );
     }
 
-    /// A catalogue holding one plugin that ships one slash command.
-    ///
-    /// The plugin tree is written under `scope_root` — the directory that
-    /// *contains* `.deluxe-agents` — because that is what decides the plugin's
-    /// scope: a fake home makes it global, a project makes it project-scoped.
-    /// Which enable list names it is what actually loads it, so `project` picks
-    /// both.
-    ///
-    /// Built by running discovery rather than assembling a `PluginCatalogue` by
-    /// hand, so the test takes the path the app takes, including the
-    /// `source.path` resolution that is easy to get wrong.
-    fn catalogue_with_one_command(
-        scope_root: &Path,
-        home: &Path,
-        project: Option<&Path>,
-    ) -> Arc<PluginCatalogue> {
-        let marketplace = scope_root.join(crate::plugins::HOME_DIR).join("plugins");
-        std::fs::create_dir_all(&marketplace).unwrap();
-        std::fs::write(
-            marketplace.join("marketplace.json"),
-            r#"{"name":"test","plugins":[{"name":"thing",
-                 "source":{"source":"local","path":"./plugins/thing"}}]}"#,
-        )
-        .unwrap();
-
-        // `source.path` resolves against the directory *containing* `.deluxe-agents`.
-        let plugin = scope_root.join("plugins").join("thing");
-        std::fs::create_dir_all(plugin.join("commands")).unwrap();
-        std::fs::write(
-            plugin.join("plugin.json"),
-            r#"{"name":"thing","version":"1.0.0","runtime":{
-                "module":"plugin.wasm",
-                "apiVersion":"deluxe.harness/plugin@0.1"}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            plugin.join("commands").join("hello.md"),
-            "---\ndescription: Say hello\n---\n\nSay hello to: $ARGUMENTS\n",
-        )
-        .unwrap();
-
-        // The `[plugins]` table is the global switch; a `projects` entry is what
-        // enables a plugin for one repository only.
-        let settings = match project {
-            Some(project) => plugins::PluginSettings {
-                plugins: Default::default(),
-                projects: [(
-                    project.display().to_string(),
-                    vec!["thing@test".to_string()],
-                )]
-                .into_iter()
-                .collect(),
-                disabled_projects: Default::default(),
-            },
-            None => {
-                let mut settings = plugins::PluginSettings::default();
-                settings.set_enabled("thing@test", true);
-                settings
-            }
-        };
-        let scanned: Vec<PathBuf> = project.map(Path::to_path_buf).into_iter().collect();
-        Arc::new(plugins::discover(home, &scanned, &settings))
-    }
-
-    /// An app whose catalogue holds the one-command plugin, rooted at `/p`.
-    ///
-    /// The marketplace sits under the fake home, so the plugin is global and
-    /// applies to every project.
-    fn app_with_one_command() -> (App, mpsc::UnboundedReceiver<Cmd>) {
-        let home = tempfile::tempdir().unwrap();
-        let catalogue = catalogue_with_one_command(home.path(), home.path(), None);
-        app_at("/p", catalogue)
-    }
-
     #[test]
     fn opening_plugins_requests_a_worker_refresh_once() {
         let (mut app, mut cmd_rx) = app_at("/p", no_plugins());
@@ -3052,138 +3018,6 @@ mod tests {
             "the failure is reported in the plugins window, got: {:?}",
             app.plugins_error
         );
-    }
-
-    /// The prompt this send produced — checked to be the same text in the
-    /// transcript and in the payload, since those are what must not drift.
-    fn sent_prompt(app: &App, cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>) -> String {
-        let recorded = match &app.sessions.last().expect("a session was created").steps[0] {
-            Step::User { text, .. } => text.clone(),
-            other => panic!("expected a user step, got {other:?}"),
-        };
-        match cmd_rx.try_recv().expect("a run was sent") {
-            Cmd::Run { prompt, .. } => {
-                assert_eq!(prompt.text, recorded, "recorded and sent must not drift")
-            }
-            other => panic!("expected a run, got {other:?}"),
-        }
-        recorded
-    }
-
-    #[test]
-    fn a_slash_command_is_expanded_into_the_prompt_both_recorded_and_sent() {
-        let (mut app, mut cmd_rx) = app_with_one_command();
-
-        app.prompt = "/thing:hello the world".into();
-        app.start_run();
-
-        assert_eq!(
-            sent_prompt(&app, &mut cmd_rx),
-            "Say hello to: the world",
-            "the transcript holds the expanded prompt, not the shorthand"
-        );
-    }
-
-    #[test]
-    fn a_prompt_that_merely_starts_with_a_slash_is_left_alone() {
-        // `/usr/bin/env` is a path, and rewriting it — or refusing it as an
-        // unknown command — would be worse than passing it through.
-        let (mut app, mut cmd_rx) = app_with_one_command();
-
-        app.prompt = "/usr/bin/env python".into();
-        app.start_run();
-
-        assert_eq!(sent_prompt(&app, &mut cmd_rx), "/usr/bin/env python");
-    }
-
-    #[test]
-    fn a_project_scoped_command_reaches_its_own_project_and_no_other() {
-        // The whole point of the two-scope split, seen from the composer: a
-        // repository's command must not appear in an unrelated project.
-        let project_dir = tempfile::tempdir().unwrap();
-        let project = project_dir.path().display().to_string();
-        let home = tempfile::tempdir().unwrap();
-        let catalogue =
-            catalogue_with_one_command(project_dir.path(), home.path(), Some(project_dir.path()));
-
-        let (mut app, mut cmd_rx) = app_at(&project, catalogue);
-
-        // In the project that owns it, the command expands...
-        app.prompt = "/thing:hello the world".into();
-        app.start_run();
-        assert_eq!(sent_prompt(&app, &mut cmd_rx), "Say hello to: the world");
-
-        // ...and in any other project the same text is just text.
-        app.selected = None;
-        app.active_project = Some("/somewhere-else".into());
-        app.prompt = "/thing:hello the world".into();
-        app.start_run();
-        assert_eq!(sent_prompt(&app, &mut cmd_rx), "/thing:hello the world");
-    }
-
-    #[test]
-    fn a_command_query_is_only_a_single_slash_token() {
-        // The picker is for typing a name, not for composing arguments: the
-        // moment a space arrives the user has moved on and the list should
-        // stop covering the transcript.
-        assert_eq!(command_query("/"), Some(""));
-        assert_eq!(command_query("/thi"), Some("thi"));
-        assert_eq!(command_query("/thing:hello"), Some("thing:hello"));
-
-        // A space — or anything that is not the whole prompt — means there is
-        // no name to complete.
-        assert_eq!(command_query("/thing:hello the world"), None);
-        assert_eq!(command_query("/a b"), None);
-        assert_eq!(command_query("hello"), None);
-        assert_eq!(command_query(""), None);
-        // A slash mid-sentence is prose, not a command.
-        assert_eq!(command_query("run /thing:hello"), None);
-    }
-
-    #[test]
-    fn a_bare_slash_lists_every_command_and_a_substring_narrows_it() {
-        let home = tempfile::tempdir().unwrap();
-        let catalogue = catalogue_with_one_command(home.path(), home.path(), None);
-
-        // `/` alone matches everything, which is what makes the empty query
-        // worth supporting rather than treating it as "nothing typed".
-        let names = |query: &str| -> Vec<String> {
-            matching_commands(&catalogue, "/p", query)
-                .into_iter()
-                .map(|command| command.name.clone())
-                .collect()
-        };
-        assert_eq!(names(""), vec!["thing:hello".to_string()]);
-
-        // The match is a case-insensitive substring, not a prefix: the part of
-        // `thing:hello` worth typing is the command name, not the plugin.
-        assert_eq!(names("HELLO"), vec!["thing:hello".to_string()]);
-        assert_eq!(names("ello"), vec!["thing:hello".to_string()]);
-
-        assert!(names("zzz").is_empty());
-    }
-
-    #[test]
-    fn the_picker_offers_a_projects_commands_only_in_that_project() {
-        // Same split the expansion tests cover, seen from the list: a command
-        // the repository owns must not be suggested in an unrelated project.
-        let project_dir = tempfile::tempdir().unwrap();
-        let project = project_dir.path().display().to_string();
-        let home = tempfile::tempdir().unwrap();
-        let catalogue =
-            catalogue_with_one_command(project_dir.path(), home.path(), Some(project_dir.path()));
-
-        assert_eq!(matching_commands(&catalogue, &project, "").len(), 1);
-        assert!(matching_commands(&catalogue, "/somewhere-else", "").is_empty());
-    }
-
-    #[test]
-    fn choosing_a_command_rewrites_the_half_typed_name_and_opens_the_arguments() {
-        let mut prompt = "/thi".to_string();
-        apply_command_choice(&mut prompt, "thing:hello");
-        // The trailing space is deliberate: the next keystroke is an argument,
-        // not a continuation of the name.
-        assert_eq!(prompt, "/thing:hello ");
     }
 
     #[test]
