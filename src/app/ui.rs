@@ -1444,11 +1444,10 @@ impl App {
 
     /// What is installed, as a window.
     ///
-    /// Discovery reads the personal marketplace and the ones bundled with Codex,
-    /// but the only other trace of the result on screen is a slash command's
-    /// name in the composer's picker — so a plugin whose commands you had not
-    /// typed a `/` for was invisible, and the log was the only place to find out
-    /// whether an id had resolved at all.
+    /// Discovery reads the managed plugin cache, but the log is the only other
+    /// trace of the result — so without this page a plugin that had failed to
+    /// resolve, or one that had been switched off, had no way to be seen or
+    /// turned back on.
     ///
     /// Lists the global plugins and the plugins assigned to the displayed
     /// project. Each row carries its exact scope so equal ids cannot operate on
@@ -1691,7 +1690,7 @@ fn draw_plugin_row(
                         *pending = None;
                     }
                 });
-                ui.weak("只删除 Codex 缓存里的副本；bundled 插件和本地工作副本不会被删。");
+                ui.weak("只删除托管缓存里的副本。");
             }
         });
 }

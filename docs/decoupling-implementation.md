@@ -895,7 +895,7 @@ pub struct PluginDescriptor {
     pub scope: PluginScope,
     pub display_name: String,
     pub version: Option<String>,
-    pub source: PluginSource,
+    pub namespace: String,
 }
 
 pub struct PluginSnapshot {

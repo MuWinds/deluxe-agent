@@ -374,7 +374,7 @@ mod tests {
         let forwarder = Arc::new(Forwarded::default());
         let sink = DelegationSink::new(Some(("subagent-1".into(), forwarder.clone())));
 
-        sink.announce("figma-implementation-agent", "do the thing");
+        sink.announce("example-agent", "do the thing");
         sink.emit(AgentEvent::AssistantDone {
             run_id: 0,
             content: "the answer".into(),
@@ -387,7 +387,7 @@ mod tests {
                 &events[0],
                 Event::SubagentStarted { job_id, agent, prompt }
                     if job_id == "subagent-1"
-                        && agent == "figma-implementation-agent"
+                        && agent == "example-agent"
                         && prompt == "do the thing"
             ),
             "{:?}",
@@ -415,7 +415,7 @@ mod tests {
         // A foreground delegation has no job and no row, so nothing is watching
         // it — but its answer is still the tool result.
         let sink = DelegationSink::new(None);
-        sink.announce("figma-implementation-agent", "do the thing");
+        sink.announce("example-agent", "do the thing");
         sink.emit(AgentEvent::AssistantDone {
             run_id: 0,
             content: "the answer".into(),

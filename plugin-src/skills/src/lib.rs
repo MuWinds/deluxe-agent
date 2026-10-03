@@ -217,7 +217,7 @@ impl Frontmatter {
                 return Self { fields };
             }
             // Split on the *first* colon: a description routinely contains one
-            // ("Control Windows apps: from Codex"), a key never does.
+            // ("Control Windows apps: a walkthrough"), a key never does.
             if let Some((key, value)) = line.split_once(':') {
                 let value = unquote(value.trim());
                 if !value.is_empty() {
@@ -282,32 +282,32 @@ export!(SkillsProvider);
 mod tests {
     use super::*;
 
-    /// A `SKILL.md` shaped exactly like the real `computer-use` one, CRLF and
-    /// all — the installs on this machine really do use Windows endings.
-    const COMPUTER_USE: &str = "---\r\nname: computer-use\r\ndescription: Control Windows apps from Codex\r\n---\r\n\r\n# Computer Use\r\n\r\nUse this skill to automate the UI of Microsoft Windows apps.\r\n";
+    /// A `SKILL.md` with CRLF line endings, which the files on this machine
+    /// really do use.
+    const DESKTOP_UI: &str = "---\r\nname: desktop-ui\r\ndescription: Automate desktop windows\r\n---\r\n\r\n# Desktop UI\r\n\r\nUse this skill to automate the UI of desktop applications.\r\n";
 
     #[test]
     fn the_standard_layout_names_a_skill_and_summarises_it() {
-        let skill = read_one(COMPUTER_USE, "skills/computer-use/SKILL.md", "computer-use");
+        let skill = read_one(DESKTOP_UI, "skills/desktop-ui/SKILL.md", "desktop-ui");
 
-        assert_eq!(skill.name, "computer-use");
+        assert_eq!(skill.name, "desktop-ui");
         assert_eq!(
             skill.description.as_deref(),
-            Some("Control Windows apps from Codex"),
+            Some("Automate desktop windows"),
             "the trailing carriage return must not survive into the value"
         );
-        assert_eq!(skill.path, "skills/computer-use/SKILL.md");
+        assert_eq!(skill.path, "skills/desktop-ui/SKILL.md");
     }
 
     #[test]
     fn a_skill_without_frontmatter_falls_back_to_its_directory_name() {
         let skill = read_one(
-            "# Repo Triage\n\nDo the thing.",
-            "skills/repo-triage/SKILL.md",
-            "repo-triage",
+            "# Deploy\n\nDo the thing.",
+            "skills/deploy/SKILL.md",
+            "deploy",
         );
 
-        assert_eq!(skill.name, "repo-triage");
+        assert_eq!(skill.name, "deploy");
         assert_eq!(skill.description, None);
     }
 
@@ -358,8 +358,8 @@ mod tests {
     #[test]
     fn only_skills_name_skill_md_at_the_top_level() {
         assert_eq!(
-            skill_directory("skills/computer-use/SKILL.md"),
-            Some("computer-use")
+            skill_directory("skills/desktop-ui/SKILL.md"),
+            Some("desktop-ui")
         );
         assert_eq!(skill_directory("skills/SKILL.md"), None, "one level too few");
         assert_eq!(

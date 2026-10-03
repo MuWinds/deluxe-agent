@@ -115,7 +115,7 @@ Wasm 插件只能在 worker 侧运行。GUI 不得直接加载、实例化或调
 | `src/context.rs::summarize` | 使用 LLM 生成摘要 | `ContextCompactor` 或 `ContextPolicy` 的默认实现 |
 | `src/session.rs` | 会话模型、transcript、JSON 持久化 | `SessionStore` |
 | `src/tools/jobs.rs::JobRegistry` | 后台任务、取消、通知 | `JobRuntime` |
-| `src/plugins/mod.rs` | Codex 插件发现、scope、启停 | `PluginManager` |
+| `src/plugins/mod.rs` | Wasmtime 插件发现、scope、启停 | `PluginManager` |
 | `src/plugins/providers.rs` | Wasm tool、plugin event adapter | `ToolProvider`、`PluginEventRuntime` |
 | `src/plugins/capabilities.rs` | 显式授权的 tool/process/HTTP raw capability | `CapabilityHub` |
 | `wit/deluxe-harness.wit` | Wasm host capability 与 provider ABI | 版本化 Component ABI |
@@ -771,7 +771,7 @@ example-plugin/
 字段规则：
 
 - `name`：插件的短 id；完整运行时 id 仍是
-  `name@marketplace`；
+  `name@namespace`，namespace 是缓存目录名；
 - `version`：插件自己的 SemVer；
 - `runtime.module`：相对插件 root 的 Component 文件；
 - `runtime.apiVersion`：WIT ABI 版本；
@@ -788,14 +788,13 @@ Component 通过 `read-plugin-file(".mcp.json")` 从当前 configuration root
 `read-plugin-file(".hooks.json")` 从当前 configuration root 读取。这些文件是
 global/project scope 的宿主配置资源，不属于插件包，也不需要重复写入 manifest。
 
-scope 仍由 marketplace 和 `PluginSettings` 决定，不由 Wasm manifest 自己声明。
-global marketplace 的插件会进入所有适用项目的 catalogue；project-scoped
-marketplace 的插件只会进入对应 project 的 catalogue。`PluginCatalogue::for_project`
-先合并 global plugins，再合并该项目的 plugins，并按 id 让项目级插件覆盖同 id 的
-global plugin。宿主把 global Component 绑定到全局 configuration root（`~/.deluxe-agents`），
-把 project Component 绑定到项目 configuration root；disabled
-plugin 不会进入 runtime。项目级插件覆盖同 id 的全局插件时，使用项目实例对应的
-项目 scope 配置。
+scope 仍由 `PluginSettings` 决定，不由 Wasm manifest 自己声明。全局启用的插件会进入
+所有适用项目的 catalogue；project-scoped 的插件只会进入对应 project 的 catalogue。
+`PluginCatalogue::for_project` 先合并 global plugins，再合并该项目的 plugins，并按 id
+让项目级插件覆盖同 id 的 global plugin。宿主把 global Component 绑定到全局
+configuration root（`~/.deluxe-agents`），把 project Component 绑定到项目
+configuration root；disabled plugin 不会进入 runtime。项目级插件覆盖同 id 的全局插件
+时，使用项目实例对应的项目 scope 配置。
 
 manifest 解析采用当前 `src/plugins/manifest.rs` 的容错原则：
 
@@ -1121,7 +1120,7 @@ pub struct PluginDescriptor {
     pub version: Option<String>,
     pub scope: PluginScope,
     pub root: PathBuf,
-    pub source: PluginSource,
+    pub namespace: String,
     pub capabilities: Vec<CapabilityKind>,
 }
 
@@ -1352,11 +1351,12 @@ src/plugins/wasm_runtime.rs 底部
 
 构建产物也可以携带默认 Wasmtime 插件包。主程序通过 `include_bytes!` 嵌入
 Component 及其 manifest，首次启动时将它们写入普通的
-`.deluxe-agents/plugins/cache/<marketplace>/<plugin>/<version>/` 缓存目录，再沿用同一套
+`.deluxe-agents/plugins/cache/<namespace>/<plugin>/<version>/` 缓存目录，再沿用同一套
 discovery、scope、启停、UI 和卸载逻辑。当前预置的 MCP Component id 是
 `mcp@deluxe-defaults`；它不携带 `.mcp.json`，运行时从当前 global/project scope
 根目录主动请求配置。
-用户明确将该插件设为 `enabled = false` 后，后续启动不会重新安装或强制启用它。
+用户明确将该插件在 `[plugins]` 里设为 `"mcp@deluxe-defaults" = false` 后，后续启动
+不会重新安装或强制启用它。
 
 测试不能访问真实 home、keyring 或网络。fixture 的文件读取使用临时目录。
 

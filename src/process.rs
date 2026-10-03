@@ -11,8 +11,7 @@
 //! there: it has to be turned off on every spawn. `CREATE_NO_WINDOW` does that —
 //! the child still gets a console (so it can allocate one, and its own children
 //! inherit it rather than opening windows of their own), but the console is
-//! never shown. This is the same fix Codex's native binary applies to its
-//! PowerShell helper, and the reason Node's `child_process` grew
+//! never shown. It is the same reason Node's `child_process` grew
 //! `windowsHide: true`.
 //!
 //! The flag is meaningless off Windows, so the helper compiles to nothing there

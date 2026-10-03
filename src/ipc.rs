@@ -109,7 +109,6 @@ pub enum Cmd {
     /// Re-discovers global and project-scoped Wasmtime plugins for the page.
     RefreshPlugins {
         request_id: u64,
-        projects: Vec<PathBuf>,
         settings: PluginSettings,
     },
     Run {
@@ -388,7 +387,7 @@ pub enum Event {
     /// initial prompt.
     SubagentStarted {
         job_id: String,
-        /// The `task` role the sub-agent runs, e.g. `figma-implementation-agent`.
+        /// The `task` role the sub-agent runs, e.g. `example-agent`.
         agent: String,
         /// The brief, verbatim and untruncated.
         prompt: String,

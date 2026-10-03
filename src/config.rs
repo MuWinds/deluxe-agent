@@ -58,7 +58,7 @@ pub struct Config {
     /// *default* working directory instead, silently moving the user.
     #[serde(default)]
     pub projects: Vec<String>,
-    /// Which Codex plugins this agent loads, and where they apply.
+    /// Which Wasmtime plugins this agent loads, and where they apply.
     ///
     /// A table of per-plugin switches plus a per-project list, because plugins
     /// come in two scopes; see [`crate::plugins`]. This is also the trust
@@ -484,24 +484,24 @@ mod tests {
     #[test]
     fn the_plugins_section_round_trips_through_toml() {
         let mut config = Config::default();
-        config.plugins.set_enabled("figma@openai-curated", true);
-        config.plugins.set_enabled("chrome@openai-bundled", false);
+        config.plugins.set_enabled("notes@personal", true);
+        config.plugins.set_enabled("formatter@bundled", false);
         config
             .plugins
             .projects
-            .insert("/work/repo".into(), vec!["repo-triage@my-team".into()]);
+            .insert("/work/repo".into(), vec!["deploy@my-team".into()]);
 
         let text = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
 
-        assert!(parsed.plugins.plugins["figma@openai-curated"].enabled);
+        assert!(parsed.plugins.plugins["notes@personal"]);
         assert!(
-            !parsed.plugins.plugins["chrome@openai-bundled"].enabled,
+            !parsed.plugins.plugins["formatter@bundled"],
             "an off switch is a row, which is what makes it reversible"
         );
         assert_eq!(
             parsed.plugins.projects.get("/work/repo"),
-            Some(&vec!["repo-triage@my-team".to_string()])
+            Some(&vec!["deploy@my-team".to_string()])
         );
     }
 
@@ -509,30 +509,26 @@ mod tests {
     fn normalize_repairs_the_plugins_section() {
         // A hand-edited config is the normal way this section gets written, so
         // a stray space or a blank key must not survive into an unresolvable id.
-        let mut config: Config = toml::from_str(
-            "[plugins.\" figma@openai-curated \"]\nenabled = true\n\n[plugins.\"   \"]\nenabled = true\n",
-        )
-        .unwrap();
+        let mut config: Config =
+            toml::from_str("[plugins]\n\" notes@personal \" = true\n\"   \" = true\n").unwrap();
 
         config.normalize();
 
         assert_eq!(
             config.plugins.plugins.keys().collect::<Vec<_>>(),
-            vec!["figma@openai-curated"]
+            vec!["notes@personal"]
         );
     }
 
     #[test]
     fn the_documented_plugins_shape_loads() {
         let text = r#"
-            [plugins."computer-use@openai-bundled"]
-            enabled = true
-
-            [plugins."figma@openai-curated"]
-            enabled = true
+            [plugins]
+            "linter@bundled" = true
+            "notes@personal" = true
 
             [plugins.projects]
-            "/work/repo" = ["repo-triage@my-team"]
+            "/work/repo" = ["deploy@my-team"]
         "#;
         let mut config: Config = toml::from_str(text).unwrap();
         config.normalize();
@@ -540,11 +536,11 @@ mod tests {
         // The table and the project list stay apart here; what each scope
         // *reaches* is decided by `plugins::discover` and tested there.
         assert_eq!(config.plugins.plugins.len(), 2);
-        assert!(config.plugins.plugins["computer-use@openai-bundled"].enabled);
-        assert!(config.plugins.plugins["figma@openai-curated"].enabled);
+        assert!(config.plugins.plugins["linter@bundled"]);
+        assert!(config.plugins.plugins["notes@personal"]);
         assert_eq!(
             config.plugins.projects.get("/work/repo"),
-            Some(&vec!["repo-triage@my-team".to_string()])
+            Some(&vec!["deploy@my-team".to_string()])
         );
     }
 

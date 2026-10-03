@@ -1,29 +1,30 @@
 //! Which plugins to load, and where.
 //!
 //! Two things, because plugins come in two scopes. The table of per-plugin
-//! entries applies in every project; `projects` narrows an id to one project.
-//! Both name a plugin the same way — `name@marketplace` — which is the identity
-//! Codex itself uses.
+//! switches applies in every project; `projects` narrows an id to one project.
+//! Both name a plugin the same way — `name@namespace`, where the namespace is
+//! the cache directory the plugin was installed under.
 //!
 //! # Why a switch and not a list
 //!
-//! The entries are shaped after Codex's own config:
+//! A plugin id maps to a plain `bool`:
 //!
 //! ```toml
-//! [plugins."figma@openai-curated"]
-//! enabled = true
+//! [plugins]
+//! "mcp@deluxe-defaults" = true
+//! "transcript-renderer@deluxe-defaults" = false
 //! ```
 //!
-//! `enabled` is a switch rather than a membership test, and that is the whole
-//! point of the shape. With a bare list of enabled ids, "switched off" and
-//! "never installed" are the same absence — so switching a plugin off would be
-//! indistinguishable from deleting it, and nothing could offer it back.
+//! The switch, rather than membership in a list of enabled ids, is the whole
+//! point of the shape. With a bare list, "switched off" and "never installed"
+//! are the same absence — so switching a plugin off would be indistinguishable
+//! from deleting it, and nothing could offer it back.
 //!
 //! This file is the *only* place the load decision is made. In particular the
 //! decision is never read from a repository: a cloned repo can ship plugin
-//! *definitions* in `<repo>/.deluxe-agents/plugins/`. Executable behavior is still
-//! isolated behind the Wasm manifest and explicit capability permissions, so
-//! listing an id here is the act of trust and can only be performed by the
+//! *definitions* in `<repo>/.deluxe-agents/plugins/`. Executable behavior is
+//! still isolated behind the Wasm manifest and explicit capability permissions,
+//! so listing an id here is the act of trust and can only be performed by the
 //! person who owns this config.
 
 use std::collections::{BTreeMap, HashSet};
@@ -35,14 +36,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PluginSettings {
-    /// Every plugin this agent knows about, keyed by `name@marketplace`.
+    /// Every plugin this agent knows about, keyed by `name@namespace`, mapped to
+    /// whether it loads.
     ///
-    /// `projects` is the one reserved key in this table, and it cannot collide:
-    /// a plugin id always carries an `@`, which no bare TOML key can. serde
-    /// matches the named field first and hands it the rest, so `projects` lands
-    /// here as a field and never as a plugin nobody can resolve.
+    /// `projects` and `disabled_projects` are the two reserved keys in this
+    /// table, and neither can collide: a plugin id always carries an `@`, which
+    /// no bare TOML key can. serde matches the named fields first and hands them
+    /// the rest, so neither lands here as a plugin nobody can resolve.
     #[serde(flatten)]
-    pub plugins: BTreeMap<String, PluginEntry>,
+    pub plugins: BTreeMap<String, bool>,
     /// Plugin ids loaded only in the named project, keyed by the project root.
     ///
     /// The key must match the entry in `Config::projects` — the same directory
@@ -55,23 +57,18 @@ pub struct PluginSettings {
     pub disabled_projects: BTreeMap<String, Vec<String>>,
 }
 
-/// One plugin's row in the `[plugins]` table.
-///
-/// Unknown keys are dropped rather than fatal, the same rule the plugin manifest
-/// follows and for the same reason: this section mirrors Codex's, and Codex's is
-/// still growing.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PluginEntry {
-    /// Whether this agent loads the plugin.
-    ///
-    /// Absent means off. An id only reaches this table because something wrote
-    /// it there, and the switch is what says what that was meant to do — so a
-    /// table with nothing in it is not an instruction to load anything.
-    pub enabled: bool,
-}
-
 impl PluginSettings {
+    /// Whether one plugin is switched on.
+    ///
+    /// An id that is absent is off: a table with nothing in it is not an
+    /// instruction to load anything. Test-only: the load path walks the whole
+    /// table rather than asking about one id, so nothing in production needs
+    /// the single-id query.
+    #[cfg(test)]
+    pub fn is_enabled(&self, id: &str) -> bool {
+        self.plugins.get(id).copied().unwrap_or(false)
+    }
+
     /// Turns one plugin on or off, creating its row if it has none.
     ///
     /// The row is kept when switched off rather than removed: keeping "off" and
@@ -83,7 +80,7 @@ impl PluginSettings {
         if id.is_empty() {
             return;
         }
-        self.plugins.insert(id.to_string(), PluginEntry { enabled });
+        self.plugins.insert(id.to_string(), enabled);
     }
 
     /// Turns one plugin on or off only for `project`.
@@ -124,14 +121,14 @@ impl PluginSettings {
             .filter(|(id, _)| !id.trim().is_empty())
             // Store the trimmed form, so a stray space does not make an id
             // unresolvable.
-            .map(|(id, entry)| (id.trim().to_string(), entry))
+            .map(|(id, enabled)| (id.trim().to_string(), enabled))
             .collect();
 
-        let off: HashSet<&str> = self
+        let off: HashSet<String> = self
             .plugins
             .iter()
-            .filter(|(_, entry)| !entry.enabled)
-            .map(|(id, _)| id.as_str())
+            .filter(|(_, enabled)| !**enabled)
+            .map(|(id, _)| id.clone())
             .collect();
 
         let projects = std::mem::take(&mut self.projects);
@@ -143,7 +140,7 @@ impl PluginSettings {
                     return None;
                 }
                 dedup(&mut ids);
-                ids.retain(|id| !off.contains(id.as_str()));
+                ids.retain(|id| !off.contains(id));
                 Some((key, ids))
             })
             .collect();
@@ -158,7 +155,7 @@ impl PluginSettings {
                 }
                 dedup(&mut ids);
                 ids.retain(|id| {
-                    !off.contains(id.as_str())
+                    !off.contains(id)
                         && !self
                             .projects
                             .get(&key)
@@ -175,10 +172,8 @@ impl PluginSettings {
 /// Test-only: a test almost always wants "these plugins, all on", and spelling
 /// the map out at thirty call sites buries what each test is actually about.
 #[cfg(test)]
-pub fn entries(ids: &[&str]) -> BTreeMap<String, PluginEntry> {
-    ids.iter()
-        .map(|id| ((*id).to_string(), PluginEntry { enabled: true }))
-        .collect()
+pub fn entries(ids: &[&str]) -> BTreeMap<String, bool> {
+    ids.iter().map(|id| ((*id).to_string(), true)).collect()
 }
 
 /// The key a project is looked up under.
@@ -215,17 +210,13 @@ fn remove_id(ids: &mut Vec<String>, id: &str) {
 mod tests {
     use super::*;
 
-    fn off(id: &str) -> (String, PluginEntry) {
-        (id.to_string(), PluginEntry { enabled: false })
-    }
-
     #[test]
     fn normalize_trims_and_drops_blank_ids() {
         let mut settings = PluginSettings {
             plugins: BTreeMap::from([
-                (" a@m ".to_string(), PluginEntry { enabled: true }),
-                ("".to_string(), PluginEntry { enabled: true }),
-                ("   ".to_string(), PluginEntry { enabled: true }),
+                (" a@m ".to_string(), true),
+                ("".to_string(), true),
+                ("   ".to_string(), true),
             ]),
             projects: BTreeMap::from([(
                 "/work/repo/".to_string(),
@@ -265,15 +256,12 @@ mod tests {
         // plugins window lie about the switch it just showed the user.
         let mut settings = PluginSettings {
             plugins: BTreeMap::from([
-                off("figma@personal"),
-                (
-                    "repo-triage@my-team".to_string(),
-                    PluginEntry { enabled: true },
-                ),
+                ("notes@personal".to_string(), false),
+                ("deploy@my-team".to_string(), true),
             ]),
             projects: BTreeMap::from([(
                 "/work/repo".to_string(),
-                vec!["figma@personal".into(), "repo-triage@my-team".into()],
+                vec!["notes@personal".into(), "deploy@my-team".into()],
             )]),
             disabled_projects: BTreeMap::new(),
         };
@@ -282,7 +270,7 @@ mod tests {
 
         assert_eq!(
             settings.projects["/work/repo"],
-            vec!["repo-triage@my-team".to_string()]
+            vec!["deploy@my-team".to_string()]
         );
     }
 
@@ -305,15 +293,15 @@ mod tests {
         let key = project_key(project);
         let mut settings = PluginSettings::default();
 
-        settings.set_project_enabled(project, "repo-triage@team", false);
-        assert_eq!(settings.disabled_projects[&key], vec!["repo-triage@team"]);
+        settings.set_project_enabled(project, "deploy@team", false);
+        assert_eq!(settings.disabled_projects[&key], vec!["deploy@team"]);
         assert!(
             settings.projects.get(&key).is_none_or(Vec::is_empty),
             "disabling a project plugin must not create a global switch"
         );
 
-        settings.set_project_enabled(project, "repo-triage@team", true);
-        assert_eq!(settings.projects[&key], vec!["repo-triage@team"]);
+        settings.set_project_enabled(project, "deploy@team", true);
+        assert_eq!(settings.projects[&key], vec!["deploy@team"]);
         assert!(
             settings
                 .disabled_projects
@@ -329,25 +317,27 @@ mod tests {
         assert!(parsed.plugins.is_empty());
         assert!(parsed.projects.is_empty());
         assert!(parsed.disabled_projects.is_empty());
+        assert!(!parsed.is_enabled("notes@personal"));
     }
 
     #[test]
-    fn a_plugin_table_is_codexs_shape() {
+    fn a_flat_switch_table_parses() {
+        // The body of `[plugins]`: the section's own keys are the switches, and
+        // `projects` is a reserved nested table rather than a plugin. `Config`
+        // maps the `[plugins]` table onto this struct; the wrapper itself is
+        // covered in `config.rs`.
         let text = r#"
-            [ "figma@openai-curated" ]
-            enabled = true
-
-            [ "chrome@openai-bundled" ]
-            enabled = false
+            "notes@personal" = true
+            "formatter@bundled" = false
 
             [projects]
-            "C:\\work\\repo" = ["repo-triage@my-team"]
+            "C:\\work\\repo" = ["deploy@my-team"]
         "#;
         let parsed: PluginSettings = toml::from_str(text).unwrap();
 
-        assert!(parsed.plugins["figma@openai-curated"].enabled);
+        assert!(parsed.is_enabled("notes@personal"));
         assert!(
-            !parsed.plugins["chrome@openai-bundled"].enabled,
+            !parsed.is_enabled("formatter@bundled"),
             "a switch that is off is still a row, which is what makes it reversible"
         );
         assert_eq!(
@@ -358,27 +348,22 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_plugin_table_is_off() {
+    fn an_absent_id_is_off() {
         // An id only reaches the table because something wrote it there, and the
         // switch is what says what that was meant to do.
-        let parsed: PluginSettings = toml::from_str(r#"["figma@openai-curated"]"#).unwrap();
-        assert!(!parsed.plugins["figma@openai-curated"].enabled);
+        let parsed: PluginSettings = toml::from_str(r#""notes@personal" = false"#).unwrap();
+        assert!(!parsed.is_enabled("notes@personal"));
+        assert!(!parsed.is_enabled("never-written@nowhere"));
     }
 
     #[test]
     fn the_section_round_trips_through_toml() {
         let settings = PluginSettings {
             plugins: BTreeMap::from([
-                (
-                    "figma@openai-curated".to_string(),
-                    PluginEntry { enabled: true },
-                ),
-                off("chrome@openai-bundled"),
+                ("notes@personal".to_string(), true),
+                ("formatter@bundled".to_string(), false),
             ]),
-            projects: BTreeMap::from([(
-                "/work/repo".to_string(),
-                vec!["repo-triage@my-team".into()],
-            )]),
+            projects: BTreeMap::from([("/work/repo".to_string(), vec!["deploy@my-team".into()])]),
             disabled_projects: BTreeMap::new(),
         };
 

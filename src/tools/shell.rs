@@ -1,14 +1,13 @@
 //! `exec` — run a command and capture its output.
 //!
-//! Ported from `local-tool-bridge` (`core/src/tools/shell.rs`). This module adds
-//! resource limits (timeout, output cap) and environment hygiene; the one guard
-//! left is the destructive-command denylist in [`ToolSettings`], which is
-//! checked by the agent loop before a call ever reaches here.
+//! This module adds resource limits (timeout, output cap) and environment
+//! hygiene; the one guard left is the destructive-command denylist in
+//! [`ToolSettings`], which is checked by the agent loop before a call ever
+//! reaches here.
 //!
-//! One deliberate deviation from the reference: the argument is `command`
-//! rather than Codex's `cmd`. This agent is not an MCP bridge for Codex, so
-//! there is no schema to stay compatible with, and `command` is the name a
-//! model reaches for unaided.
+//! The argument is named `command` rather than the terser `cmd`: there is no
+//! external schema to stay compatible with, and `command` is the name a model
+//! reaches for unaided.
 //!
 //! # The command is a job
 //!

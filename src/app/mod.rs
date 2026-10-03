@@ -1115,7 +1115,7 @@ impl App {
     ///
     /// Discovery is cheap and pure, so a change simply re-derives the whole
     /// catalogue rather than patching the one entry that moved — the catalogue
-    /// is a function of the config and the marketplaces on disk, and re-deriving
+    /// is a function of the config and the plugin cache on disk, and re-deriving
     /// it is what keeps the two from drifting. The worker is told too, because
     /// every cached agent baked the old catalogue into its system prompt and
     /// tool registry.
@@ -1148,12 +1148,10 @@ impl App {
         let request_id = self.next_config_request_id;
         self.next_config_request_id = self.next_config_request_id.wrapping_add(1);
         self.pending_plugin_request = Some(request_id);
-        let projects = self.config.projects.iter().map(PathBuf::from).collect();
         if self
             .cmd_tx
             .send(Cmd::RefreshPlugins {
                 request_id,
-                projects,
                 settings: self.config.plugins.clone(),
             })
             .is_err()
@@ -1220,11 +1218,9 @@ impl App {
 
     /// Removes a plugin's installed copy and switches it off.
     ///
-    /// Only the copy Codex cached is deleted. A bundled marketplace's copy
-    /// ships with Codex and a local source is a developer's working tree, so
-    /// removing either would destroy something the user never asked us to
-    /// touch; those are switched off and left in place, with the path reported
-    /// so the user can remove it themselves.
+    /// The managed cache is the only place an installed plugin lives, so the
+    /// cached copy is what gets deleted; the switch is cleared in the same
+    /// pass so a re-import starts from a clean row.
     fn uninstall_plugin(&mut self, id: &str, scope: &plugins::Scope) {
         self.close_plugin_surface();
         match scope {
@@ -1820,7 +1816,6 @@ mod tests {
     fn no_plugins() -> Arc<PluginCatalogue> {
         Arc::new(plugins::discover(
             &test_home(),
-            &[],
             &plugins::PluginSettings::default(),
         ))
     }
@@ -2339,7 +2334,7 @@ mod tests {
         event_tx
             .send(Event::SubagentStarted {
                 job_id: "subagent-1".into(),
-                agent: "figma-implementation-agent".into(),
+                agent: "example-agent".into(),
                 prompt: "do the thing".into(),
             })
             .expect("the app is still listening");
@@ -2380,7 +2375,7 @@ mod tests {
             .iter()
             .find(|run| run.job_id == "subagent-1")
             .expect("the first sub-agent's transcript");
-        assert_eq!(first.agent, "figma-implementation-agent");
+        assert_eq!(first.agent, "example-agent");
         assert!(
             matches!(&first.steps[0], Step::User { text, .. } if text == "do the thing"),
             "the brief opens the transcript: {:?}",
@@ -2748,10 +2743,7 @@ mod tests {
             "opening the rail entry shows the plugin page"
         );
         match cmd_rx.try_recv() {
-            Ok(Cmd::RefreshPlugins {
-                projects, settings, ..
-            }) => {
-                assert_eq!(projects, vec![PathBuf::from("/p")]);
+            Ok(Cmd::RefreshPlugins { settings, .. }) => {
                 assert!(
                     settings.plugins.is_empty(),
                     "the current trust settings cross IPC"
@@ -2831,24 +2823,11 @@ mod tests {
         assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::Shutdown)));
     }
 
-    /// A home holding one global plugin, `thing@test`, plus a config that
-    /// enables it.
-    ///
-    /// The marketplace's source is a *local* directory, so the plugin resolves
-    /// to a working copy — the case an uninstall must not delete. Tests that
-    /// want the deletable case put a copy in the cache instead.
+    /// A home holding one installed global plugin, `thing@test`, plus a config
+    /// that enables it.
     fn plugin_fixture() -> (tempfile::TempDir, crate::config::Config) {
         let home = tempfile::tempdir().unwrap();
-        let marketplace = home.path().join(crate::plugins::HOME_DIR).join("plugins");
-        std::fs::create_dir_all(&marketplace).unwrap();
-        std::fs::write(
-            marketplace.join("marketplace.json"),
-            r#"{"name":"test","plugins":[{"name":"thing",
-               "source":{"source":"local","path":"./plugins/thing"}}]}"#,
-        )
-        .unwrap();
-
-        let plugin = home.path().join("plugins").join("thing");
+        let plugin = crate::plugins::plugin_cache_root(home.path()).join("test/thing/1.0.0");
         std::fs::create_dir_all(&plugin).unwrap();
         std::fs::write(
             plugin.join("plugin.json"),
@@ -2877,7 +2856,7 @@ mod tests {
     ) -> (App, mpsc::UnboundedReceiver<Cmd>) {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let catalogue = Arc::new(plugins::discover(home, &[], &config.plugins));
+        let catalogue = Arc::new(plugins::discover(home, &config.plugins));
         let app = App::new(
             cmd_tx,
             event_rx,
@@ -2903,11 +2882,10 @@ mod tests {
             other => panic!("expected a plugin refresh, got {other:?}"),
         };
         assert!(
-            !saved.plugins.plugins["thing@test"].enabled,
+            !saved.plugins.is_enabled("thing@test"),
             "the worker receives the disabled trust setting"
         );
-        let projects: Vec<PathBuf> = saved.projects.iter().map(PathBuf::from).collect();
-        let catalogue = Arc::new(plugins::discover(home.path(), &projects, &saved.plugins));
+        let catalogue = Arc::new(plugins::discover(home.path(), &saved.plugins));
         app.apply(Event::PluginsUpdated {
             request_id,
             catalogue,
@@ -2930,9 +2908,8 @@ mod tests {
             Ok(Cmd::ReloadPlugins { request_id, config }) => (request_id, config),
             other => panic!("expected a plugin refresh, got {other:?}"),
         };
-        assert!(saved.plugins.plugins["thing@test"].enabled);
-        let projects: Vec<PathBuf> = saved.projects.iter().map(PathBuf::from).collect();
-        let catalogue = Arc::new(plugins::discover(home.path(), &projects, &saved.plugins));
+        assert!(saved.plugins.is_enabled("thing@test"));
+        let catalogue = Arc::new(plugins::discover(home.path(), &saved.plugins));
         app.apply(Event::PluginsUpdated {
             request_id,
             catalogue,
@@ -2965,7 +2942,7 @@ mod tests {
         match cmd_rx.try_recv() {
             Ok(Cmd::UninstallPlugin { id, config, .. }) => {
                 assert_eq!(id, "thing@test");
-                assert!(!config.plugins.plugins["thing@test"].enabled);
+                assert!(!config.plugins.is_enabled("thing@test"));
             }
             other => panic!("expected an uninstall request, got {other:?}"),
         }
@@ -2973,24 +2950,6 @@ mod tests {
             cached.is_dir(),
             "the GUI leaves filesystem mutation to the worker adapter"
         );
-    }
-
-    #[test]
-    fn uninstalling_a_local_working_copy_keeps_its_files() {
-        // A marketplace's local source is somebody's working tree — the copy a
-        // developer is editing. It is switched off, never deleted.
-        let (home, config) = plugin_fixture();
-        let (mut app, mut cmd_rx) = plugin_app(home.path(), config);
-        let working_copy = home.path().join("plugins").join("thing");
-        assert!(working_copy.is_dir());
-
-        app.uninstall_plugin("thing@test", &plugins::Scope::Global);
-
-        assert!(working_copy.is_dir(), "a working copy must not be deleted");
-        assert!(matches!(
-            cmd_rx.try_recv(),
-            Ok(Cmd::UninstallPlugin { id, .. }) if id == "thing@test"
-        ));
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! `apply_patch` — create, update, delete, and move files with a patch.
 //!
-//! Ported from `local-tool-bridge` (`core/src/tools/codex.rs`). The patch parser
-//! is self-contained on purpose: patch semantics should not depend on shell
-//! quoting or on a platform-specific `patch` binary being installed.
+//! The patch parser is self-contained on purpose: patch semantics should not
+//! depend on shell quoting or on a platform-specific `patch` binary being
+//! installed.
 //!
 //! The line-ending handling is the part worth preserving. A patch applied to a
 //! CRLF file must write CRLF back, and a hunk must still match when the file's

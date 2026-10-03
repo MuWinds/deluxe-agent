@@ -179,17 +179,13 @@ impl NativePluginManager {
 
 #[async_trait]
 impl PluginManager for NativePluginManager {
-    async fn discover(
-        &self,
-        projects: Vec<std::path::PathBuf>,
-        settings: PluginSettings,
-    ) -> Result<Arc<PluginCatalogue>> {
+    async fn discover(&self, settings: PluginSettings) -> Result<Arc<PluginCatalogue>> {
         let home = self.home.clone();
-        tokio::task::spawn_blocking(move || {
-            Arc::new(plugins::discover(&home, &projects, &settings))
-        })
-        .await
-        .map_err(|error| AgentError::internal(format!("Plugin discovery worker failed: {error}")))
+        tokio::task::spawn_blocking(move || Arc::new(plugins::discover(&home, &settings)))
+            .await
+            .map_err(|error| {
+                AgentError::internal(format!("Plugin discovery worker failed: {error}"))
+            })
     }
 
     async fn ensure_bundled_defaults(&self, settings: PluginSettings) -> Result<PluginSettings> {
@@ -258,21 +254,17 @@ impl NativePluginManager {
     }
 }
 
-const LOCAL_MARKETPLACE: &str = "deluxe-local";
+const LOCAL_NAMESPACE: &str = "deluxe-local";
 
 fn ensure_bundled_defaults(home: &Path, mut settings: PluginSettings) -> Result<PluginSettings> {
     for package in plugins::defaults::PLUGINS {
-        let id = format!("{}@{}", package.name, plugins::defaults::MARKETPLACE);
-        if settings
-            .plugins
-            .get(&id)
-            .is_some_and(|entry| !entry.enabled)
-        {
+        let id = format!("{}@{}", package.name, plugins::defaults::NAMESPACE);
+        if settings.plugins.get(&id) == Some(&false) {
             continue;
         }
 
         let target = plugins::plugin_cache_root(home)
-            .join(plugins::defaults::MARKETPLACE)
+            .join(plugins::defaults::NAMESPACE)
             .join(package.name)
             .join(package.version);
         // The managed cache is host-owned and the embedded bytes are the source
@@ -389,7 +381,7 @@ fn install_local_plugin(home: &Path, selected_component: &Path) -> Result<Instal
 
     let cache = plugins::plugin_cache_root(home);
     let target = cache
-        .join(LOCAL_MARKETPLACE)
+        .join(LOCAL_NAMESPACE)
         .join(&manifest.name)
         .join(version);
     if !target.starts_with(&cache) {
@@ -404,7 +396,7 @@ fn install_local_plugin(home: &Path, selected_component: &Path) -> Result<Instal
         ));
     }
 
-    let id = format!("{}@{LOCAL_MARKETPLACE}", manifest.name);
+    let id = format!("{}@{LOCAL_NAMESPACE}", manifest.name);
     if target == source {
         return Ok(InstalledPlugin {
             id,
@@ -680,7 +672,7 @@ mod tests {
         .expect("the manifest is written");
         let mut settings = PluginSettings::default();
         settings.set_enabled("thing@test", true);
-        let catalogue = Arc::new(plugins::discover(home.path(), &[], &settings));
+        let catalogue = Arc::new(plugins::discover(home.path(), &settings));
         let manager = NativePluginManager::new(home.path().to_path_buf());
 
         manager
@@ -708,7 +700,7 @@ mod tests {
                 .join("0.1.0");
 
             assert!(
-                settings.plugins.get(&id).is_some_and(|entry| entry.enabled),
+                settings.is_enabled(&id),
                 "the first run enables the bundled `{name}` Component"
             );
             assert!(
@@ -725,7 +717,7 @@ mod tests {
             );
         }
 
-        let catalogue = plugins::discover(home.path(), &[], &settings);
+        let catalogue = plugins::discover(home.path(), &settings);
         for id in ["hooks@deluxe-defaults", "mcp@deluxe-defaults"] {
             assert!(
                 catalogue.global().iter().any(|plugin| plugin.id == id),
@@ -799,7 +791,7 @@ mod tests {
             "the stale bytes are overwritten with the embedded Component"
         );
         assert_eq!(
-            plugins::discover(home.path(), &[], &second)
+            plugins::discover(home.path(), &second)
                 .global()
                 .iter()
                 .filter(|plugin| plugin.id == "mcp@deluxe-defaults")
@@ -826,10 +818,7 @@ mod tests {
         // a whole-struct equality could never hold. What must not change is that
         // the user's explicit off switch survives.
         assert!(
-            returned
-                .plugins
-                .get("mcp@deluxe-defaults")
-                .is_some_and(|entry| !entry.enabled),
+            returned.plugins.get("mcp@deluxe-defaults") == Some(&false),
             "the startup default does not force-enable the MCP Component the user disabled"
         );
         assert!(
@@ -839,10 +828,7 @@ mod tests {
             "a disabled bundled MCP Component is not installed"
         );
         assert!(
-            returned
-                .plugins
-                .get("hooks@deluxe-defaults")
-                .is_some_and(|entry| entry.enabled),
+            returned.is_enabled("hooks@deluxe-defaults"),
             "disabling MCP does not disable the separate Hooks Component"
         );
     }
@@ -877,7 +863,7 @@ mod tests {
 
         let mut settings = PluginSettings::default();
         settings.set_enabled(&installed.id, true);
-        let catalogue = plugins::discover(home.path(), &[], &settings);
+        let catalogue = plugins::discover(home.path(), &settings);
         assert_eq!(
             catalogue.global()[0].root,
             installed.root,
@@ -913,38 +899,5 @@ mod tests {
             "the error explains how to declare the component: {}",
             error.message
         );
-    }
-
-    #[tokio::test]
-    async fn native_plugin_manager_preserves_local_working_copies() {
-        let home = tempfile::tempdir().expect("a temp directory is available");
-        let marketplace = home.path().join(plugins::HOME_DIR).join("plugins");
-        fs::create_dir_all(&marketplace).expect("the marketplace directory is created");
-        fs::write(
-            marketplace.join("marketplace.json"),
-            r#"{"name":"test","plugins":[{"name":"thing",
-                "source":{"source":"local","path":"./plugins/thing"}}]}"#,
-        )
-        .expect("the marketplace is written");
-        let working_copy = home.path().join("plugins/thing");
-        fs::create_dir_all(&working_copy).expect("the working plugin directory is writable");
-        fs::write(
-            working_copy.join("plugin.json"),
-            r#"{"name":"thing","version":"1.0.0","runtime":{
-                "module":"plugin.wasm",
-                "apiVersion":"deluxe.harness/plugin@0.1"}}"#,
-        )
-        .expect("the manifest is written");
-        let mut settings = PluginSettings::default();
-        settings.set_enabled("thing@test", true);
-        let catalogue = Arc::new(plugins::discover(home.path(), &[], &settings));
-        let manager = NativePluginManager::new(home.path().to_path_buf());
-
-        manager
-            .uninstall("thing@test", &Scope::Global, catalogue)
-            .await
-            .expect("the working copy is simply disabled by its caller");
-
-        assert!(working_copy.is_dir(), "developer files are left untouched");
     }
 }

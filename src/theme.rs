@@ -1,4 +1,4 @@
-//! The colour scheme, modelled on Codex Desktop's dark theme.
+//! The window's dark colour scheme.
 //!
 //! egui ships a usable default palette, but a "dark theme" is not one colour —
 //! it is a set of near-identical greys whose relationships carry the layout. So

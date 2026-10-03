@@ -4,7 +4,7 @@
 //! is intentionally not represented here: Components request their own files
 //! through the generic host file capability.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Deserialize;
 
@@ -78,74 +78,6 @@ pub struct PluginInterface {
     pub short_description: Option<String>,
 }
 
-/// `marketplace.json` — a catalogue of plugins and where to find them.
-#[derive(Debug, Clone, Deserialize)]
-pub struct MarketplaceManifest {
-    pub name: String,
-    #[serde(default)]
-    pub plugins: Vec<MarketplaceEntry>,
-}
-
-/// One plugin offered by a marketplace.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketplaceEntry {
-    pub name: String,
-    pub source: PluginSource,
-    #[serde(default)]
-    pub policy: Option<MarketplacePolicy>,
-}
-
-impl MarketplaceEntry {
-    /// Whether this marketplace actually offers the plugin.
-    ///
-    /// `NOT_AVAILABLE` means the marketplace lists the entry but withholds it.
-    /// Honouring that matters because it is the marketplace's only way to
-    /// withdraw a plugin without deleting the entry.
-    pub fn is_offered(&self) -> bool {
-        !matches!(
-            self.policy
-                .as_ref()
-                .and_then(|policy| policy.installation.as_deref()),
-            Some("NOT_AVAILABLE")
-        )
-    }
-}
-
-/// Where a marketplace entry's plugin lives.
-///
-/// `source` stays a [`String`] rather than an enum on purpose: this agent only
-/// resolves `local` sources (a remote source is Codex's job to fetch into the
-/// cache — see [`crate::plugins`]), and a strict enum would make one entry with
-/// an unknown future source type fail the *whole* marketplace instead of being
-/// skipped on its own.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PluginSource {
-    pub source: String,
-    #[serde(default)]
-    pub path: Option<String>,
-}
-
-impl PluginSource {
-    pub const LOCAL: &'static str = "local";
-
-    /// Whether the source points at a local directory (a working copy) rather
-    /// than a fetched/cached copy. Decides whether an uninstall may delete it.
-    pub fn is_local(&self) -> bool {
-        self.source == Self::LOCAL
-    }
-}
-
-/// The marketplace's installation policy for one entry.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MarketplacePolicy {
-    /// `NOT_AVAILABLE` | `AVAILABLE` | `INSTALLED_BY_DEFAULT`.
-    #[serde(default)]
-    pub installation: Option<String>,
-}
-
 /// The manifest file at the root of a Wasmtime plugin.
 pub const MANIFEST_FILE: &str = "plugin.json";
 /// Reads and parses a plugin manifest from a plugin root.
@@ -166,72 +98,37 @@ fn parse_plugin(text: &str, path: &Path) -> Result<PluginManifest> {
     })
 }
 
-/// Reads and parses a `marketplace.json`.
-pub fn read_marketplace(path: &Path) -> Result<MarketplaceManifest> {
-    let text = std::fs::read_to_string(path).map_err(|error| {
-        AgentError::from_io(&format!("Failed to read {}", path.display()), error)
-    })?;
-    serde_json::from_str(&text).map_err(|error| {
-        AgentError::internal(format!(
-            "{} is not a valid marketplace manifest: {error}",
-            path.display()
-        ))
-    })
-}
-
-/// The relative path a marketplace's `source.path` is resolved against.
-///
-/// The format puts `marketplace.json` at
-/// `<root>/.deluxe-agents/plugins/marketplace.json` and resolves `./plugins/foo`
-/// against `<root>` — the directory that *contains* `.deluxe-agents/`, not the
-/// directory the file sits in and not `.deluxe-agents/plugins/`. For example,
-/// `~/.deluxe-agents/plugins/marketplace.json` naming `./plugins/computer-use-local`
-/// resolves to `~/plugins/computer-use-local`.
-///
-/// Returns `None` when `path` is not shaped like a marketplace file, which the
-/// caller reports rather than guessing at.
-pub fn marketplace_root(path: &Path) -> Option<PathBuf> {
-    // <root>/.deluxe-agents/plugins/marketplace.json
-    let plugins = path.parent()?; // …/plugins
-    let home_dir = plugins.parent()?; // …/.deluxe-agents
-    let root = home_dir.parent()?; // <root>
-    if home_dir.file_name()? != super::HOME_DIR || plugins.file_name()? != "plugins" {
-        return None;
-    }
-    Some(root.to_path_buf())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A manifest shaped exactly like the real `figma` plugin's, presentation
-    /// block and all — including the fields this agent does not read, because
-    /// tolerating them is the property under test.
+    /// A manifest carrying far more than this agent reads — a presentation
+    /// block, brand colours, icons, screenshots — because tolerating all those
+    /// unknown fields is the property under test.
     ///
     /// `r##"…"##` rather than `r#"…"#`, because the brand colour is a hex string
     /// and its `"#` would close the shorter delimiter.
-    const FIGMA: &str = r##"{
-      "name": "figma",
+    const SAMPLE: &str = r##"{
+      "name": "sample",
       "version": "2.0.20",
-      "description": "Figma workflows for design implementation.",
-      "author": { "name": "Figma", "url": "https://www.figma.com" },
-      "homepage": "https://www.figma.com",
-      "repository": "https://github.com/openai/plugins",
-      "license": "LicenseRef-Figma-Developer-Terms",
-      "keywords": ["figma", "design"],
+      "description": "Sample workflows for this agent.",
+      "author": { "name": "Example", "url": "https://example.com" },
+      "homepage": "https://example.com",
+      "repository": "https://github.com/example/plugins",
+      "license": "LicenseRef-Example",
+      "keywords": ["sample", "example"],
       "apps": "./.app.json",
       "interface": {
-        "displayName": "Figma",
-        "shortDescription": "Figma design-to-code workflows",
+        "displayName": "Sample",
+        "shortDescription": "Sample workflows for this agent",
         "longDescription": "Longer prose for a details page.",
-        "developerName": "Figma",
-        "category": "Creativity",
+        "developerName": "Example",
+        "category": "Productivity",
         "capabilities": ["Interactive", "Read", "Write"],
-        "websiteURL": "https://www.figma.com",
-        "privacyPolicyURL": "https://www.figma.com/legal/privacy/",
-        "termsOfServiceURL": "https://www.figma.com/legal/developer-terms/",
-        "defaultPrompt": ["Inspect a Figma design and implement it in code"],
+        "websiteURL": "https://example.com",
+        "privacyPolicyURL": "https://example.com/legal/privacy/",
+        "termsOfServiceURL": "https://example.com/legal/terms/",
+        "defaultPrompt": ["Inspect a sample and act on it"],
         "brandColor": "#1ABCFE",
         "composerIcon": "./assets/logo-padded.png",
         "screenshots": []
@@ -239,21 +136,21 @@ mod tests {
     }"##;
 
     #[test]
-    fn a_real_manifest_parses() {
-        let manifest = parse_plugin(FIGMA, std::path::Path::new("plugin.json")).unwrap();
+    fn a_full_manifest_parses() {
+        let manifest = parse_plugin(SAMPLE, std::path::Path::new("plugin.json")).unwrap();
 
-        assert_eq!(manifest.name, "figma");
+        assert_eq!(manifest.name, "sample");
         assert_eq!(manifest.version.as_deref(), Some("2.0.20"));
     }
 
     #[test]
     fn the_display_name_and_summary_prefer_the_interface_block() {
-        let manifest = parse_plugin(FIGMA, std::path::Path::new("plugin.json")).unwrap();
+        let manifest = parse_plugin(SAMPLE, std::path::Path::new("plugin.json")).unwrap();
 
-        assert_eq!(manifest.display_name(), "Figma");
+        assert_eq!(manifest.display_name(), "Sample");
         assert_eq!(
             manifest.summary(),
-            Some("Figma design-to-code workflows"),
+            Some("Sample workflows for this agent"),
             "the short interface description reads better than the top-level one"
         );
     }
@@ -298,89 +195,5 @@ mod tests {
             "{}",
             error.message
         );
-    }
-
-    #[test]
-    fn a_marketplace_parses_with_all_three_source_kinds() {
-        let text = r#"{
-          "name": "openai-curated",
-          "interface": { "displayName": "Codex official" },
-          "plugins": [
-            { "name": "linear", "source": { "source": "local", "path": "./plugins/linear" },
-              "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
-              "category": "Productivity" },
-            { "name": "remote", "source": { "source": "git-subdir",
-              "url": "https://github.com/example/p.git", "path": "./plugins/remote", "ref": "main" } },
-            { "name": "packaged", "source": { "source": "npm" } }
-          ]
-        }"#;
-        let marketplace = serde_json::from_str::<MarketplaceManifest>(text).unwrap();
-
-        assert_eq!(marketplace.name, "openai-curated");
-        assert_eq!(marketplace.plugins.len(), 3);
-        assert!(marketplace.plugins[0].source.is_local());
-        assert_eq!(
-            marketplace.plugins[0].source.path.as_deref(),
-            Some("./plugins/linear")
-        );
-        assert!(!marketplace.plugins[1].source.is_local());
-        assert!(marketplace.plugins[1].policy.is_none());
-    }
-
-    #[test]
-    fn an_entry_the_marketplace_withholds_is_not_offered() {
-        let offered = |installation: &str| {
-            let text = format!(
-                r#"{{"name":"m","plugins":[{{"name":"p","source":{{"source":"local","path":"./p"}},
-                   "policy":{{"installation":"{installation}"}}}}]}}"#
-            );
-            let marketplace = serde_json::from_str::<MarketplaceManifest>(&text).unwrap();
-            marketplace.plugins[0].is_offered()
-        };
-
-        assert!(offered("AVAILABLE"));
-        assert!(offered("INSTALLED_BY_DEFAULT"));
-        assert!(
-            !offered("NOT_AVAILABLE"),
-            "withdrawn entries must be skipped"
-        );
-    }
-
-    #[test]
-    fn the_marketplace_root_is_the_directory_containing_deluxe_agents() {
-        // The layout, and the trap the format sets: `./plugins/foo` is
-        // resolved against the directory that *contains* `.deluxe-agents/`.
-        let root = marketplace_root(std::path::Path::new(
-            "/home/u/.deluxe-agents/plugins/marketplace.json",
-        ))
-        .unwrap();
-        assert_eq!(root, std::path::PathBuf::from("/home/u"));
-
-        // The documented resolution, spelled out.
-        assert_eq!(
-            root.join("plugins/computer-use-local"),
-            std::path::PathBuf::from("/home/u/plugins/computer-use-local")
-        );
-    }
-
-    #[test]
-    fn a_repo_marketplace_resolves_against_the_repo_root() {
-        let root = marketplace_root(std::path::Path::new(
-            "/work/repo/.deluxe-agents/plugins/marketplace.json",
-        ))
-        .unwrap();
-        assert_eq!(root, std::path::PathBuf::from("/work/repo"));
-    }
-
-    #[test]
-    fn a_file_that_is_not_a_marketplace_has_no_root() {
-        // Guessing here would silently point at the wrong directory, so the
-        // caller is told instead. Codex's old `.agents` name is not accepted.
-        assert!(marketplace_root(std::path::Path::new("/tmp/marketplace.json")).is_none());
-        assert!(marketplace_root(std::path::Path::new("/tmp/.agents/marketplace.json")).is_none());
-        assert!(marketplace_root(std::path::Path::new(
-            "/tmp/.agents/plugins/marketplace.json"
-        ))
-        .is_none());
     }
 }

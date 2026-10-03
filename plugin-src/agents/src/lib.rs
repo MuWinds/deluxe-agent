@@ -397,20 +397,20 @@ mod tests {
     /// A role shaped like the real ones: no frontmatter, the first line names
     /// the role, and the body is the whole system prompt. CRLF, as a
     /// Windows-authored file would be.
-    const FIGMA: &str = "You are the Figma Implementation Agent for this plugin.\r\n\r\nPurpose:\r\n- Translate a Figma node into production-ready code.\r\n";
+    const EXAMPLE_ROLE: &str = "You are the Example Agent for this plugin.\r\n\r\nPurpose:\r\n- Translate a request into production-ready code.\r\n";
 
     #[test]
     fn a_real_role_file_is_named_by_itself_and_its_body_is_the_prompt() {
-        let agent = read_one(FIGMA, "figma-implementation-agent").expect("the role parses");
+        let agent = read_one(EXAMPLE_ROLE, "example-agent").expect("the role parses");
 
-        assert_eq!(agent.name, "figma-implementation-agent");
+        assert_eq!(agent.name, "example-agent");
         assert_eq!(
             agent.description.as_deref(),
-            Some("You are the Figma Implementation Agent for this plugin."),
+            Some("You are the Example Agent for this plugin."),
             "with no frontmatter the first line of prose is the summary"
         );
         assert!(
-            agent.instructions.contains("Translate a Figma node"),
+            agent.instructions.contains("Translate a request"),
             "the body is carried whole, since it becomes the system prompt"
         );
     }
@@ -460,13 +460,13 @@ mod tests {
 
     #[test]
     fn only_agents_name_markdown_at_the_top_level() {
-        assert_eq!(agent_stem("agents/figma.md"), Some("figma"));
+        assert_eq!(agent_stem("agents/sample.md"), Some("sample"));
         assert_eq!(
             agent_stem("agents/_fragment.md"),
             None,
             "a fragment is not a role"
         );
-        assert_eq!(agent_stem("agents/openai.yaml"), None);
+        assert_eq!(agent_stem("agents/role.yaml"), None);
         assert_eq!(agent_stem("agents/nested/role.md"), None, "one level only");
         assert_eq!(agent_stem("agents/"), None);
         assert_eq!(agent_stem("other/role.md"), None);

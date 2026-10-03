@@ -114,7 +114,7 @@ fn main() -> eframe::Result<()> {
 
     // Plugins are discovered before the first frame so the first agent and the
     // first page have a catalogue immediately. The page can request another
-    // discovery later when Codex installs or updates a component.
+    // discovery later, after importing or removing a component.
     let home = directories::UserDirs::new()
         .map(|dirs| dirs.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
@@ -132,9 +132,7 @@ fn main() -> eframe::Result<()> {
         }
         Err(error) => tracing::warn!(%error, "failed to install bundled plugin defaults"),
     }
-    let projects: Vec<PathBuf> = config.projects.iter().map(PathBuf::from).collect();
-    let plugins = match runtime.block_on(plugin_manager.discover(projects, config.plugins.clone()))
-    {
+    let plugins = match runtime.block_on(plugin_manager.discover(config.plugins.clone())) {
         Ok(plugins) => plugins,
         Err(error) => {
             tracing::warn!(%error, "failed to discover plugins");
@@ -307,8 +305,8 @@ fn spawn_worker(
             Arc::new(sink.clone()),
             // A global Component's generic file capability is bound here, not to
             // the whole home directory: `~/.deluxe-agents` holds plugin
-            // configuration (`.mcp.json`, `.hooks.json`, the personal
-            // marketplace) and nothing a plugin has no business reading.
+            // configuration (`.mcp.json`, `.hooks.json`) and nothing a plugin
+            // has no business reading.
             plugins::global_configuration_root(&worker.home),
         );
         // The transcript renderer is an ordinary built-in plugin, loaded once
@@ -483,24 +481,19 @@ fn spawn_worker(
                             }
                         }
                         config.plugins.normalize();
-                        let projects: Vec<PathBuf> =
-                            config.projects.iter().map(PathBuf::from).collect();
-                        let plugins = match worker
-                            .plugin_manager
-                            .discover(projects, config.plugins.clone())
-                            .await
-                        {
-                            Ok(plugins) => plugins,
-                            Err(error) => {
-                                if installed.copied {
-                                    let _ = worker
-                                        .plugin_manager
-                                        .discard_install(installed.root.clone())
-                                        .await;
+                        let plugins =
+                            match worker.plugin_manager.discover(config.plugins.clone()).await {
+                                Ok(plugins) => plugins,
+                                Err(error) => {
+                                    if installed.copied {
+                                        let _ = worker
+                                            .plugin_manager
+                                            .discard_install(installed.root.clone())
+                                            .await;
+                                    }
+                                    return Err(error);
                                 }
-                                return Err(error);
-                            }
-                        };
+                            };
                         if let Err(error) = worker.config_store.save(&config).await {
                             if installed.copied {
                                 let _ = worker.plugin_manager.discard_install(installed.root).await;
@@ -530,10 +523,9 @@ fn spawn_worker(
                 }
                 Cmd::RefreshPlugins {
                     request_id,
-                    projects,
                     settings,
                 } => {
-                    let result = worker.plugin_manager.discover(projects, settings).await;
+                    let result = worker.plugin_manager.discover(settings).await;
                     match result {
                         Ok(plugins) => {
                             surfaces.clear();
@@ -617,12 +609,7 @@ fn spawn_worker(
                 Cmd::ReloadPlugins { request_id, config } => {
                     let result = async {
                         worker.config_store.save(&config).await?;
-                        let projects: Vec<PathBuf> =
-                            config.projects.iter().map(PathBuf::from).collect();
-                        worker
-                            .plugin_manager
-                            .discover(projects, config.plugins.clone())
-                            .await
+                        worker.plugin_manager.discover(config.plugins.clone()).await
                     }
                     .await;
                     match result {
@@ -666,12 +653,7 @@ fn spawn_worker(
                             .uninstall(&id, &scope, worker.plugins.clone())
                             .await?;
                         worker.config_store.save(&config).await?;
-                        let projects: Vec<PathBuf> =
-                            config.projects.iter().map(PathBuf::from).collect();
-                        worker
-                            .plugin_manager
-                            .discover(projects, config.plugins.clone())
-                            .await
+                        worker.plugin_manager.discover(config.plugins.clone()).await
                     }
                     .await;
 

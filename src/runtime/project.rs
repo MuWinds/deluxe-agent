@@ -495,11 +495,11 @@ mod tests {
     #[tokio::test]
     async fn the_bundled_prompt_provider_renders_its_scope() {
         let root = tempfile::tempdir().expect("a temporary scope root is available");
-        std::fs::create_dir_all(root.path().join("skills/computer-use"))
+        std::fs::create_dir_all(root.path().join("skills/desktop-ui"))
             .expect("the fixture is writable");
         std::fs::write(
-            root.path().join("skills/computer-use/SKILL.md"),
-            "---\nname: computer-use\ndescription: Control Windows apps\n---\n\nBody.\n",
+            root.path().join("skills/desktop-ui/SKILL.md"),
+            "---\nname: desktop-ui\ndescription: Control Windows apps\n---\n\nBody.\n",
         )
         .expect("the fixture is writable");
 
@@ -518,11 +518,11 @@ mod tests {
         // separator, so the path it prints is absolute and forward-slashed.
         let root_slash = root.path().to_string_lossy().replace('\\', "/");
         let expected = format!(
-            "{}/skills/computer-use/SKILL.md",
+            "{}/skills/desktop-ui/SKILL.md",
             root_slash.trim_end_matches('/')
         );
         assert!(text.contains("<skills>"), "{text}");
-        assert!(text.contains("`computer-use`"), "{text}");
+        assert!(text.contains("`desktop-ui`"), "{text}");
         assert!(text.contains("Control Windows apps"), "{text}");
         assert!(
             text.contains("do not act on a skill from its summary alone"),
@@ -600,8 +600,8 @@ mod tests {
         let root = tempfile::tempdir().expect("a temporary scope root is available");
         std::fs::create_dir_all(root.path().join("agents")).expect("the fixture is writable");
         std::fs::write(
-            root.path().join("agents/figma-implementation-agent.md"),
-            "You are the Figma Implementation Agent.\n\nTranslate a node into code.\n",
+            root.path().join("agents/example-agent.md"),
+            "You are the Example Agent.\n\nTranslate a node into code.\n",
         )
         .expect("the fixture is writable");
 
@@ -617,12 +617,9 @@ mod tests {
         assert_eq!(tools.len(), 1, "one `task` tool: {json}");
         assert_eq!(tools[0]["name"], "task");
         let description = tools[0]["description"].as_str().unwrap_or_default();
+        assert!(description.contains("`example-agent`"), "{description}");
         assert!(
-            description.contains("`figma-implementation-agent`"),
-            "{description}"
-        );
-        assert!(
-            description.contains("You are the Figma Implementation Agent."),
+            description.contains("You are the Example Agent."),
             "{description}"
         );
 
@@ -630,7 +627,7 @@ mod tests {
             .call(Operation::Execute {
                 name: "task".into(),
                 arguments: serde_json::json!({
-                    "agent": "figma-implementation-agent",
+                    "agent": "example-agent",
                     "prompt": "do it",
                 })
                 .to_string(),
@@ -643,14 +640,14 @@ mod tests {
 
         let requests = agent.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["name"], "figma-implementation-agent");
+        assert_eq!(requests[0]["name"], "example-agent");
         assert_eq!(requests[0]["prompt"], "do it");
         assert_eq!(requests[0]["background"], false);
         assert!(
             requests[0]["instructions"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("Figma Implementation Agent"),
+                .contains("Example Agent"),
             "the role body is carried whole: {}",
             requests[0]["instructions"]
         );

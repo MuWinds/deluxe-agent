@@ -5,8 +5,8 @@
 //! scope, enablement, UI, and uninstall use the same path as user-installed
 //! components.
 
-/// Marketplace namespace used for Components shipped by this application.
-pub const MARKETPLACE: &str = "deluxe-defaults";
+/// Cache namespace used for Components shipped by this application.
+pub const NAMESPACE: &str = "deluxe-defaults";
 
 /// One plugin package compiled into the application.
 #[derive(Debug, Clone, Copy)]

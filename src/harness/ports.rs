@@ -186,12 +186,8 @@ pub trait SecretStore: Send + Sync {
 
 #[async_trait]
 pub trait PluginManager: Send + Sync {
-    /// Discovers the catalogue for the supplied project and trust settings.
-    async fn discover(
-        &self,
-        projects: Vec<PathBuf>,
-        settings: PluginSettings,
-    ) -> Result<Arc<PluginCatalogue>>;
+    /// Discovers the catalogue for the supplied trust settings.
+    async fn discover(&self, settings: PluginSettings) -> Result<Arc<PluginCatalogue>>;
 
     /// Installs embedded defaults and returns the resulting plugin settings.
     async fn ensure_bundled_defaults(&self, settings: PluginSettings) -> Result<PluginSettings>;

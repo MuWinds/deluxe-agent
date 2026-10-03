@@ -43,6 +43,6 @@ To manage built-ins:
   installed, so the new build gets a new cache directory instead of replacing
   a user's existing cached files.
 
-The default plugin marketplace is `deluxe-defaults`. The package itself remains
-a Wasmtime plugin after first launch; the host does not interpret its MCP
+The default namespace is `deluxe-defaults`. The package itself remains a
+Wasmtime plugin after first launch; the host does not interpret its MCP
 behavior.

@@ -29,7 +29,7 @@ import, bound to the configuration root of its scope:
 | Scope | File |
 | --- | --- |
 | global (the bundled plugin) | `~/.deluxe-agents/.mcp.json` |
-| project (a plugin shipped in a repo's marketplace) | `<project>/.mcp.json` |
+| project (a plugin pinned to one repo) | `<project>/.mcp.json` |
 
 Most installs only ever have the global one. Either way the file is not part of
 this package — the host does not read, parse, or embed it.
