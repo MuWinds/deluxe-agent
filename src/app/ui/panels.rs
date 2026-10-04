@@ -199,7 +199,8 @@ impl App {
                 if sidebar_row(ui, p, icons::NOTE_PENCIL, "新聊天", false, false).clicked() {
                     intents.push(UiIntent::NewSession);
                 }
-                if sidebar_row(ui, p, icons::FOLDER_SIMPLE, "新增项目", false, false).clicked() {
+                if sidebar_row(ui, p, icons::FOLDER_SIMPLE, "新增项目", false, false).clicked()
+                {
                     intents.push(UiIntent::AddProject);
                 }
                 ui.add_space(12.0);

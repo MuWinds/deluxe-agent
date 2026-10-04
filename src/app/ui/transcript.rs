@@ -16,8 +16,7 @@ use super::super::{App, Cmd, GuiResources};
 use super::common::{render_metrics, tool_fingerprint, tool_result};
 use super::composer::COMPOSER_MAX_WIDTH;
 use super::messages::{
-    draw_agent_message, draw_bubble, draw_reasoning_block, draw_user_images, Message,
-    CHAT_MARGIN_X,
+    draw_agent_message, draw_bubble, draw_reasoning_block, draw_user_images, Message, CHAT_MARGIN_X,
 };
 use super::primitives::draw_empty_state;
 use super::tools::{draw_tool_card, ToolCard};

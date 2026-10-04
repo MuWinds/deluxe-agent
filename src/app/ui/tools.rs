@@ -1,8 +1,8 @@
 //! 工具卡片绘制
 
 use eframe::egui;
-use egui::{FontId, Frame, RichText};
 use egui::text::LayoutJob;
+use egui::{FontId, Frame, RichText};
 
 use crate::icons;
 use crate::renderer::present;
@@ -23,12 +23,7 @@ pub(super) struct ToolCard<'a> {
 }
 
 /// One tool call.
-pub(super) fn draw_tool_card(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    card: ToolCard<'_>,
-    max_width: f32,
-) {
+pub(super) fn draw_tool_card(ui: &mut egui::Ui, p: &Palette, card: ToolCard<'_>, max_width: f32) {
     let ToolCard {
         call_id,
         name,
