@@ -34,7 +34,7 @@ Hooks matcher 和 command 执行都由对应 Component 自己负责。
   provider 内完成；
 - Agent loop 不关心工具的实现来源，只通过统一的宿主服务接口调用；
 - Wasm 插件拥有独立的实例状态、取消和执行预算；
-- 插件崩溃、trap、out of fuel、非法返回值只影响当前插件调用，不拖垮 GUI 和其他 Agent；
+- 插件崩溃、trap、非法返回值只影响当前插件调用，不拖垮 GUI 和其他 Agent；
 - 插件 ABI 通过 WIT 版本化，不把 Rust 私有类型直接暴露给 Wasm；
 - 宿主仍然掌握文件、进程、网络、LLM、会话和事件能力，但插件只能通过
   `CapabilityHub` 获得它们；
@@ -903,7 +903,6 @@ WasmTool.execute
 - Component Model；
 - async support；
 - epoch interruption；
-- fuel consumption；
 - 序列化/反序列化策略；
 - debug/release 的日志差异。
 
@@ -918,21 +917,15 @@ wasmtime-wasi = "..."
 如果第一版不需要 WASI，则不要引入完整 WASI capability，只使用 component runtime
 和自定义 host imports。
 
-### 10.2 取消和 fuel 限制
+### 10.2 取消
 
-一次插件调用只有两层控制：
+一次插件调用只有一层控制：`CancellationToken`。
 
-1. `CancellationToken`；
-2. Wasmtime fuel。
+cancellation 响应用户取消和插件卸载，也结束正在等待的宿主 I/O。
 
-两者职责不同：
-
-- cancellation 响应用户取消和插件卸载，也结束正在等待的宿主 I/O；
-- fuel 终止纯 Wasm CPU 死循环，是唯一的执行预算。
-
-宿主没有 wall-clock 超时：一次调用能跑多久由调用方是否取消决定，而不是由固定秒数
-决定。插件调用宿主 `invoke-tool` 后，文件、进程、MCP 或 HTTP I/O 由宿主服务在取消
-信号下自行收尾。
+宿主没有 wall-clock 超时，也没有 fuel 或 epoch：一次调用能跑多久由调用方是否取消
+决定，而不是由固定秒数或执行预算决定。插件调用宿主 `invoke-tool` 后，文件、进程、
+MCP 或 HTTP I/O 由宿主服务在取消信号下自行收尾。
 
 取消路径：
 
@@ -949,12 +942,9 @@ wasmtime-wasi = "..."
 
 ### 10.3 执行预算
 
-插件实例只设置一个执行预算：
-
-- 单次调用的 Wasmtime fuel（`CALL_FUEL = 10_000_000`）。
-
-没有 linear memory、table、concurrent instances、payload、job 或 log 上限。fuel 耗尽
-统一返回 `plugin_resource_limit`，不允许转成宿主 panic。
+插件实例不设置执行预算：没有 fuel/epoch、linear memory、table、concurrent
+instances、payload、job 或 log 上限。一次调用直到返回、被取消或自身 trap 才结束；
+trap 统一返回 `plugin_trap`，不允许转成宿主 panic。
 
 ### 10.4 WASI 权限
 
@@ -983,7 +973,7 @@ Wasm sandbox。Wasm 插件文件访问必须增加独立的 capability 检查，
 
 ### 10.5 错误和 panic
 
-插件侧的 trap、invalid return、out of fuel 和资源限制全部映射为稳定错误码：
+插件侧的 trap、invalid return 和资源限制全部映射为稳定错误码：
 
 ```text
 plugin_load_failed
@@ -1249,7 +1239,7 @@ src/harness/runtime.rs
 5. 实现 `WasmPlugin::list_tools`；
 6. 实现 `WasmTool` adapter；
 7. 实现 `host.invoke-tool`；
-8. 实现 timeout、cancel、fuel/epoch、memory limit；
+8. 实现 cancel；
 9. 将 Wasm tools 注册进现有 `ToolRegistry`；
 10. 由 Hooks Component 解析 `.hooks.json` matcher 并执行 hook command；
 11. 由 MCP Component 解析 `.mcp.json`，实现 MCP loading、initialize、JSON-RPC、
@@ -1275,8 +1265,8 @@ MCP 已属于当前 Component ABI，不再恢复宿主内置的 Hooks/MCP execut
 - 插件不会在 GUI 主线程运行；
 - UI snapshot 只能作为 validated immutable document 进入 renderer。
 
-fuel、memory/table limits、trap、cancel 和重新实例化已经接入 runtime；对应的
-压力和故障 fixture 仍是后续测试工作。
+trap、cancel 和重新实例化已经接入 runtime；对应的压力和故障 fixture 仍是后续测试
+工作。
 
 ### Phase 4：Wasm prompt 和更广泛的 provider 能力
 
@@ -1342,8 +1332,7 @@ src/plugins/wasm_runtime.rs 底部
 3. `invoke-read-file`：请求宿主调用允许的 `read_file`；
 4. `invoke-denied-tool`：请求未授权工具；
 5. `large-output`：返回超过上限的内容；
-6. `trap`：主动 trap；
-7. `infinite-loop`：触发 fuel 限制。
+6. `trap`：主动 trap。
 
 当前仓库已提交离线 `echo` Component fixture；其 componentizer 与 guest 使用
 和 Wasmtime 37 兼容的 `wasmparser/wit-* 0.239` 工具链，避免生成运行时无法
@@ -1519,7 +1508,7 @@ Component 通过同一个通用 ABI 暴露 hooks/tools，并主动调用 `read-p
 
 仍需继续补齐的运行时压力测试和扩展：
 
-- [ ] timeout、cancel、fuel 和 memory/table limit 的专用 Wasm fixture；
+- [ ] timeout、cancel、memory/table limit 的专用 Wasm fixture；
 - [ ] trap 后重新实例化、reload cleanup 和并发插件隔离的专用测试；
 - [ ] prompt、event、plugin-created job ABI；
 - [x] `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings` 和
@@ -1533,7 +1522,7 @@ Component 通过同一个通用 ABI 暴露 hooks/tools，并主动调用 `read-p
 Component MVP 已经落地。
 后续工作按风险从运行时验证到 ABI 扩展推进：
 
-1. 增加专用 Wasm fixture，覆盖 timeout、cancel、fuel、memory/table limit、
+1. 增加专用 Wasm fixture，覆盖 timeout、cancel、memory/table limit、
    trap 后重新实例化和超大输出；
 2. 增加并发调用、插件 reload、项目切换和 runtime shutdown 测试，确认不同项目
    的 component actor、权限和 job 生命周期彼此隔离；

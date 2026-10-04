@@ -2,12 +2,23 @@
 
 use eframe::egui;
 
+use crate::app::parse_tokens;
 use crate::plugins::ui_protocol::{
-    PluginUiAction, PluginUiDocument, SurfaceRequest, TextEmphasis, UiNode, UiValue,
+    PluginUiAction, PluginUiDocument, SurfaceRequest, TextEmphasis, TextReader, UiNode, UiValue,
 };
 
 use super::intents::UiIntent;
 use super::App;
+
+/// Where a text input holds the text the user is typing.
+///
+/// A pure renderer cannot own edit state, and rebuilding the field from the
+/// snapshot on every commit is what made it impossible to finish a value: a
+/// snapshot answering an earlier keystroke arrives mid-word and overwrites it.
+/// The draft is the field's own memory between keystrokes.
+fn token_draft_key(control_id: &str) -> egui::Id {
+    egui::Id::new(("plugin-ui-token-draft", control_id))
+}
 
 pub(super) fn draw(ctx: &egui::Context, app: &App, intents: &mut Vec<UiIntent>) {
     let Some(surface) = &app.plugin_surface else {
@@ -130,27 +141,20 @@ pub(super) fn render_node(
             id,
             value,
             placeholder,
+            reader,
             action,
         } => {
-            let mut value = value.clone();
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut value)
-                        .id_salt(id)
-                        .desired_width(ui.available_width().min(320.0))
-                        .hint_text(placeholder.as_deref().unwrap_or_default()),
-                )
-                .changed()
-            {
-                push_action(
-                    intents,
-                    request,
-                    revision,
-                    id,
-                    action,
-                    Some(UiValue::String(value)),
-                );
-            }
+            text_input(
+                ui,
+                request,
+                revision,
+                id,
+                value,
+                placeholder.as_deref(),
+                *reader,
+                action,
+                intents,
+            );
         }
         UiNode::Checkbox {
             id,
@@ -226,4 +230,110 @@ fn push_action(
         action: action.into(),
         value,
     }));
+}
+
+/// Draws one text input and, on an edit worth committing, queues its action.
+///
+/// A plain input sends its text on every edit. A token input waits for the
+/// field to lose focus, because a half-typed count is not a value and because
+/// a snapshot answering an earlier keystroke would otherwise rewrite the field
+/// under the cursor; its draft also outlives that round trip, so typing `1M`
+/// can actually be finished.
+#[allow(clippy::too_many_arguments)]
+fn text_input(
+    ui: &mut egui::Ui,
+    request: &SurfaceRequest,
+    revision: u64,
+    control_id: &str,
+    value: &str,
+    placeholder: Option<&str>,
+    reader: TextReader,
+    action: &str,
+    intents: &mut Vec<UiIntent>,
+) {
+    let placeholder = placeholder.unwrap_or_default();
+    match reader {
+        TextReader::Text => {
+            let mut text = value.to_owned();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .id_salt(control_id)
+                    .desired_width(ui.available_width().min(320.0))
+                    .hint_text(placeholder),
+            );
+            if response.changed() {
+                push_action(
+                    intents,
+                    request,
+                    revision,
+                    control_id,
+                    action,
+                    Some(UiValue::String(text)),
+                );
+            }
+        }
+        TextReader::Tokens => {
+            // A committed change is sent on blur, not on each keystroke: a
+            // half-typed count is not a value, and a snapshot answering an
+            // earlier keystroke would otherwise rewrite the field under the
+            // cursor. While the field has focus the draft is authoritative, so
+            // it is kept the moment it gains focus and every frame thereafter;
+            // once it loses focus the committed value takes over again.
+            let draft_key = token_draft_key(control_id);
+            let field_id = ui.make_persistent_id(control_id);
+            let focused = ui.memory(|memory| memory.has_focus(field_id));
+            let stored = ui.ctx().data(|data| data.get_temp::<String>(draft_key));
+            let mut text = if focused {
+                stored.unwrap_or_else(|| format_tokens(value))
+            } else {
+                format_tokens(value)
+            };
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .id_salt(control_id)
+                    .desired_width(ui.available_width().min(320.0))
+                    .hint_text(placeholder),
+            );
+            if response.changed() {
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(draft_key, text.clone()));
+            }
+            if response.lost_focus() {
+                // An empty field commits an empty value, which is how an
+                // optional limit is cleared; a partial number keeps its draft
+                // and is not committed, so the user can come back and fix it.
+                let committed = if text.trim().is_empty() {
+                    Some(String::new())
+                } else {
+                    parse_tokens(&text).map(|tokens| tokens.to_string())
+                };
+                if let Some(value) = committed {
+                    ui.ctx().data_mut(|data| data.remove::<String>(draft_key));
+                    push_action(
+                        intents,
+                        request,
+                        revision,
+                        control_id,
+                        action,
+                        Some(UiValue::String(value)),
+                    );
+                }
+            } else if ui.memory(|memory| memory.has_focus(field_id)) {
+                // Keep the draft alive across idle frames, so the field never
+                // flashes the committed value under the cursor.
+                ui.ctx().data_mut(|data| data.insert_temp(draft_key, text));
+            }
+        }
+    }
+}
+
+/// Renders a token count the way the composer's gauge does.
+fn format_tokens(value: &str) -> String {
+    // An empty field is not a zero: it is an unset optional limit, and it has
+    // to stay visibly empty so it can be cleared.
+    if value.trim().is_empty() {
+        String::new()
+    } else {
+        crate::app::format_tokens(parse_tokens(value).unwrap_or(0))
+    }
 }

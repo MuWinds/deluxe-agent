@@ -55,6 +55,18 @@ pub enum TextEmphasis {
     Muted,
 }
 
+/// How a text input's text is turned into an action value.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextReader {
+    /// The text itself is the value.
+    #[default]
+    Text,
+    /// A count that may be written with a `k` / `M` suffix. The host commits
+    /// it as a bare number, so a plugin never has to parse the shorthand.
+    Tokens,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "type",
@@ -90,6 +102,8 @@ pub enum UiNode {
         value: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         placeholder: Option<String>,
+        #[serde(default)]
+        reader: TextReader,
         action: String,
     },
     Checkbox {
@@ -196,6 +210,7 @@ pub fn validate_document(
                 value,
                 placeholder,
                 action,
+                ..
             } => {
                 identity = Some((id, Some(action)));
                 texts.push(value);

@@ -107,7 +107,7 @@ fn composer_document(request: &Value, revision: u64) -> String {
             .map(|provider| {
                 json!({
                     "value": provider.id,
-                    "label": profile_label(provider),
+                    "label": model_label(provider),
                 })
             })
             .collect();
@@ -131,12 +131,23 @@ fn composer_document(request: &Value, revision: u64) -> String {
     .to_string()
 }
 
-/// A profile's dropdown label: `名称 · 模型`, degrading when the model is blank.
-fn profile_label(provider: &Provider) -> String {
-    if provider.model.trim().is_empty() {
-        provider.name.clone()
+/// The composer dropdown's label: the model name, falling back to the profile's
+/// name while it has no model.
+///
+/// The inline control is narrow and the model is what a switch is about, so the
+/// provider is left out: the account that owns it is visible in the settings
+/// surface, where the field can afford the room.
+fn model_label(provider: &Provider) -> String {
+    let model = provider.model.trim();
+    if !model.is_empty() {
+        model.to_string()
     } else {
-        format!("{} · {}", provider.name, provider.model)
+        let name = provider.name.trim();
+        if name.is_empty() {
+            provider.id.clone()
+        } else {
+            name.to_string()
+        }
     }
 }
 
@@ -173,28 +184,45 @@ fn provider_section(provider: &Provider, is_active: bool) -> Value {
             "options": protocol_options(),
             "action": "set_protocol"
         }),
-        field_row(provider, "name", "名称", &provider.name, "我的供应商"),
+        field_row(
+            provider,
+            "name",
+            "名称",
+            &provider.name,
+            "我的供应商",
+            FieldKind::Text,
+        ),
         field_row(
             provider,
             "baseUrl",
             "Base URL",
             &provider.base_url,
             "https://api.example.com/v1",
+            FieldKind::Text,
         ),
-        field_row(provider, "model", "模型", &provider.model, "模型名"),
+        field_row(
+            provider,
+            "model",
+            "模型",
+            &provider.model,
+            "模型名",
+            FieldKind::Text,
+        ),
         field_row(
             provider,
             "apiKey",
             "API Key",
             &provider.api_key,
             "留空则用 get-secret",
+            FieldKind::Text,
         ),
         field_row(
             provider,
             "contextLimit",
             "上下文长度",
             &provider.context_limit.to_string(),
-            "128000",
+            "128000 或 128k",
+            FieldKind::Tokens,
         ),
         field_row(
             provider,
@@ -202,6 +230,7 @@ fn provider_section(provider: &Provider, is_active: bool) -> Value {
             "最大输出",
             &max_output,
             "留空用供应商默认",
+            FieldKind::Tokens,
         ),
         json!({
             "type": "checkbox",
@@ -228,6 +257,13 @@ fn provider_section(provider: &Provider, is_active: bool) -> Value {
     })
 }
 
+/// Whether a field's text is a name or a token count.
+#[derive(Clone, Copy, PartialEq)]
+enum FieldKind {
+    Text,
+    Tokens,
+}
+
 /// A labelled text input bound to one profile field.
 fn field_row(
     provider: &Provider,
@@ -235,7 +271,12 @@ fn field_row(
     label: &str,
     value: &str,
     placeholder: &str,
+    kind: FieldKind,
 ) -> Value {
+    let reader = match kind {
+        FieldKind::Text => "text",
+        FieldKind::Tokens => "tokens",
+    };
     json!({
         "type": "row",
         "children": [
@@ -245,6 +286,7 @@ fn field_row(
                 "id": format!("field.{}.{}", provider.id, field),
                 "value": value,
                 "placeholder": placeholder,
+                "reader": reader,
                 "action": "set_field"
             }
         ]
@@ -412,19 +454,53 @@ fn apply_field(provider: &mut Provider, field: &str, value: &str) {
         "contextLimit" => {
             if trimmed.is_empty() {
                 provider.context_limit = 0;
-            } else if let Ok(parsed) = trimmed.parse::<u32>() {
-                provider.context_limit = parsed;
+            } else if let Some(parsed) = parse_token_count(trimmed) {
+                provider.context_limit = parsed.min(u32::MAX as u64) as u32;
             }
         }
         "maxOutputTokens" => {
             if trimmed.is_empty() {
                 provider.max_output_tokens = None;
-            } else if let Ok(parsed) = trimmed.parse::<u32>() {
-                provider.max_output_tokens = Some(parsed);
+            } else if let Some(parsed) = parse_token_count(trimmed) {
+                provider.max_output_tokens = Some(parsed.min(u32::MAX as u64) as u32);
             }
         }
         _ => {}
     }
+}
+
+/// Reads a token count that may carry a `k` / `M` suffix.
+///
+/// The host commits the shorthand as a bare number, but a text field can be
+/// edited and persisted by hand, so the shorthand is accepted on the way back
+/// in as well.
+fn parse_token_count(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let (digits, multiplier) = match text.as_bytes().last().copied() {
+        Some(b'k') | Some(b'K') => (&text[..text.len() - 1], 1_000u64),
+        Some(b'm') | Some(b'M') => (&text[..text.len() - 1], 1_000_000),
+        _ => (text, 1),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut seen_dot = false;
+    for character in digits.chars() {
+        match character {
+            '0'..='9' => {}
+            '.' if !seen_dot => seen_dot = true,
+            _ => return None,
+        }
+    }
+    let value: f64 = digits.parse().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
+    let tokens = value * multiplier as f64;
+    (tokens <= u64::MAX as f64).then_some(tokens.round() as u64)
 }
 
 /// The smallest unused `provider-N` id.
@@ -472,15 +548,20 @@ fn value_bool(action: &Value) -> Result<bool, String> {
 mod tests {
     use super::*;
 
-    /// A profile with no model name must still render a readable label, since
-    /// a freshly added profile starts blank until the user fills it in.
+    /// The inline control names the model, and falls back to something
+    /// readable before a model has been typed into a fresh profile.
     #[test]
-    fn a_blank_model_label_falls_back_to_the_profile_name() {
+    fn the_composer_label_is_the_model_name() {
         let mut provider = Provider::custom("provider-1".into());
         provider.name = "自定义".into();
-        assert_eq!(profile_label(&provider), "自定义");
+        assert_eq!(model_label(&provider), "自定义");
         provider.model = "deepseek-chat".into();
-        assert_eq!(profile_label(&provider), "自定义 · deepseek-chat");
+        assert_eq!(model_label(&provider), "deepseek-chat");
+        // A blank model with no name either still has to be selectable, so the
+        // stable id is the last resort.
+        provider.name = String::new();
+        provider.model = String::new();
+        assert_eq!(model_label(&provider), "provider-1");
     }
 
     /// The two cache-dependent cases live in one test because they mutate the
@@ -525,5 +606,36 @@ mod tests {
         let empty: Value = serde_json::from_str(&composer_document(&json!({}), 1))
             .expect("composer document is JSON");
         assert_eq!(empty["root"]["type"], "empty");
+    }
+
+    /// The token fields declare the shorthand reader and accept it on the way
+    /// back in, without which a hand-edited `128k` would silently not stick.
+    #[test]
+    fn token_fields_declare_the_reader_and_accept_the_shorthand() {
+        let provider = Provider::custom("provider-1".into());
+        let context = field_row(
+            &provider,
+            "contextLimit",
+            "上下文长度",
+            "128000",
+            "128k",
+            FieldKind::Tokens,
+        );
+        assert_eq!(context["children"][1]["reader"], "tokens");
+        assert_eq!(context["children"][1]["action"], "set_field");
+
+        let mut provider = Provider::custom("provider-1".into());
+        apply_field(&mut provider, "contextLimit", "128k");
+        assert_eq!(provider.context_limit, 128_000);
+        apply_field(&mut provider, "maxOutputTokens", "1.5k");
+        assert_eq!(provider.max_output_tokens, Some(1_500));
+
+        // A field left half-typed keeps the value it had.
+        apply_field(&mut provider, "contextLimit", "1M");
+        assert_eq!(provider.context_limit, 1_000_000);
+        apply_field(&mut provider, "contextLimit", "");
+        assert_eq!(provider.context_limit, 0);
+        apply_field(&mut provider, "maxOutputTokens", "nonsense");
+        assert_eq!(provider.max_output_tokens, Some(1_500));
     }
 }

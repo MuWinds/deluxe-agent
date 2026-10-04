@@ -81,6 +81,43 @@ fn format_tokens(tokens: u64) -> String {
     format!("{text}{unit}")
 }
 
+/// Parses a token count a person typed, allowing a `k` / `M` suffix.
+///
+/// `None` means the text is not a complete count — which is what keeps a
+/// half-typed `1M` in its field instead of turning it into an edit. Case is
+/// ignored, `1.5k` is accepted as 1500, and an empty string is refused rather
+/// than read as zero.
+pub(crate) fn parse_tokens(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let (digits, multiplier) = match text.as_bytes().last().copied() {
+        Some(b'k') | Some(b'K') => (&text[..text.len() - 1], 1_000u64),
+        Some(b'm') | Some(b'M') => (&text[..text.len() - 1], 1_000_000),
+        _ => (text, 1),
+    };
+    // A suffix stands in for a digit, so it cannot be the only character.
+    if digits.is_empty() {
+        return None;
+    }
+    // Reject a leading sign or a stray unit: a count is a plain positive number.
+    let mut seen_dot = false;
+    for character in digits.chars() {
+        match character {
+            '0'..='9' => {}
+            '.' if !seen_dot => seen_dot = true,
+            _ => return None,
+        }
+    }
+    let value: f64 = digits.parse().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
+    let tokens = value * multiplier as f64;
+    (tokens <= u64::MAX as f64).then_some(tokens.round() as u64)
+}
+
 impl App {
     /// Builds the window from the state `main` resolved before it opened.
     ///
@@ -1879,6 +1916,25 @@ mod tests {
         assert_eq!(format_tokens(131_072), "131.1k");
         assert_eq!(format_tokens(1_000_000), "1M");
         assert_eq!(format_tokens(1_234_567), "1.2M");
+    }
+
+    #[test]
+    fn token_counts_parse_from_plain_numbers_and_shorthand() {
+        assert_eq!(parse_tokens("128000"), Some(128_000));
+        assert_eq!(parse_tokens("  128000  "), Some(128_000));
+        assert_eq!(parse_tokens("128k"), Some(128_000));
+        assert_eq!(parse_tokens("128K"), Some(128_000));
+        assert_eq!(parse_tokens("1M"), Some(1_000_000));
+        assert_eq!(parse_tokens("1.5k"), Some(1_500));
+        assert_eq!(parse_tokens("1.25M"), Some(1_250_000));
+
+        // A partial or malformed count is not a value: the field keeps it as a
+        // draft instead of sending a zero-length edit.
+        assert_eq!(parse_tokens(""), None);
+        assert_eq!(parse_tokens("k"), None);
+        assert_eq!(parse_tokens("128x"), None);
+        assert_eq!(parse_tokens("-1"), None);
+        assert_eq!(parse_tokens("1.2.3"), None);
     }
 
     #[test]

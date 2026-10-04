@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use wasmtime::component::{Accessor, Component, HasData, Instance as ComponentInstance, Linker};
-use wasmtime::{Config, Engine, Store, Trap};
+use wasmtime::{Config, Engine, Store};
 
 use crate::error::{code, AgentError, Result};
 
@@ -58,8 +58,6 @@ mod llm_bindings {
     });
 }
 
-const CALL_FUEL: u64 = 10_000_000;
-
 /// Compiles a component file without instantiating it or granting capabilities.
 ///
 /// Returns `Err` when the file cannot be read or is not a valid Wasmtime
@@ -82,8 +80,7 @@ fn compile_component(bytes: &[u8]) -> Result<(Engine, Component)> {
         .wasm_component_model(true)
         .wasm_component_model_async(true)
         .wasm_component_model_async_stackful(true)
-        .async_support(true)
-        .consume_fuel(true);
+        .async_support(true);
     let engine = Engine::new(&config).map_err(load_error)?;
     let component = Component::from_binary(&engine, bytes).map_err(load_error)?;
     Ok((engine, component))
@@ -556,8 +553,8 @@ async fn instantiate(
     let mut linker = Linker::new(engine);
     bindings::HarnessPlugin::add_to_linker::<_, HostState>(&mut linker, |state| state)
         .map_err(load_error)?;
-    // Fuel is the only resource limit a Component gets: no memory, table, or
-    // instance caps, and no wall-clock deadline.
+    // No fuel or epoch: a Component runs until it returns or its own host calls
+    // yield. There is no memory, table, instance, or wall-clock limit either.
     let mut store = Store::new(
         engine,
         StoreState {
@@ -565,10 +562,6 @@ async fn instantiate(
             cancel: CancellationToken::new(),
         },
     );
-    store.set_fuel(CALL_FUEL).map_err(runtime_error)?;
-    store
-        .fuel_async_yield_interval(Some(50_000))
-        .map_err(runtime_error)?;
     let instance = linker
         .instantiate_async(&mut store, component)
         .await
@@ -591,7 +584,6 @@ async fn instantiate(
 
 async fn configure(instance: &mut Instance) -> Result<()> {
     let (store, bindings, _renderer, _prompt, _llm, component_instance) = instance;
-    store.set_fuel(CALL_FUEL).map_err(runtime_error)?;
     let plugin = bindings.deluxe_harness_plugin();
     component_instance
         .run_concurrent(&mut *store, async move |accessor| {
@@ -638,7 +630,6 @@ async fn call(
             "Component does not implement the llm ABI",
         ));
     }
-    store.set_fuel(CALL_FUEL).map_err(runtime_error)?;
     let plugin = bindings.deluxe_harness_plugin();
     let renderer = renderer
         .as_ref()
@@ -719,12 +710,7 @@ fn load_error(error: wasmtime::Error) -> AgentError {
 
 fn runtime_error(error: wasmtime::Error) -> AgentError {
     tracing::warn!(%error, "component call failed");
-    let code = if matches!(error.downcast_ref::<Trap>(), Some(Trap::OutOfFuel)) {
-        code::PLUGIN_RESOURCE_LIMIT
-    } else {
-        code::PLUGIN_TRAP
-    };
-    AgentError::new(code, "Component execution trapped or ran out of fuel")
+    AgentError::new(code::PLUGIN_TRAP, "Component execution trapped")
 }
 
 fn guest_error(message: String) -> AgentError {

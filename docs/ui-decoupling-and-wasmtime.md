@@ -604,7 +604,6 @@ Wasmtime 只应由 worker 层使用。
 - 最大 Wasm 内存
 - 最大表大小
 - 最大调用时间
-- fuel 或 epoch interruption
 - 最大 UI 节点数量
 - 最大树深度
 - 单个文本字段最大长度
@@ -791,8 +790,6 @@ GUI 层不应该出现 `wasmtime::Store`、`wasmtime::Instance` 或任何 Wasm �
 
 覆盖：
 
-- Wasm 无限循环会被终止。
-- 超出内存或 fuel 限制时返回错误。
 - 未授权能力调用被拒绝。
 - 插件不能访问其他插件的状态。
 - 插件不能绕过项目作用域访问其他项目。

@@ -372,13 +372,7 @@ WIT 的 `host` interface 提供以下能力：
 - 宿主不为 process/HTTP 的单次读写设置 payload 上限，插件应自行控制读取量；
 - 插件关闭或 reload 时，宿主会终止该实例创建的进程并释放 HTTP 响应。
 
-当前实现只保留 fuel 作为唯一的执行预算；内存、payload、wall-clock 超时和句柄数量上限均已移除。
-
-| 项目 | 上限 |
-| --- | ---: |
-| 单次 Component 调用 fuel | 10,000,000 |
-
-fuel 耗尽时，宿主会结束当前调用并把错误限制在该插件运行时；插件仍应在正常路径主动关闭 process 和 HTTP 句柄。
+当前实现不为插件调用设置执行预算：fuel、内存、payload、wall-clock 超时和句柄数量上限均已移除。一次调用能跑多久由调用方是否取消决定；插件仍应在正常路径主动关闭 process 和 HTTP 句柄。
 
 ## 8. 构建 Component
 

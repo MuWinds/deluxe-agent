@@ -63,7 +63,7 @@ Wasm 不能调用 egui：它拿不到字体、`Context`、`Painter`，也不能�
 - 工具卡的类型判断、patch 行解析、统计、标题、行号、命令输出的结构化与折叠
   结构由 guest 提供；
 - 宿主只按稳定 display-list 绘制，且宿主代码里不再出现 Markdown / code_view；
-- 调用具有独立的 timeout、fuel、内存与 payload 限制；
+- 调用可被取消，并对 request / response 与 display-list 规模设限；
 - 流式 assistant 文本不会因渲染请求乱序而显示旧结果；
 - 旧 session 可在不改存储格式的前提下重新生成渲染结果；
 - Renderer 未加载或失败时退回纯文本；
@@ -308,8 +308,8 @@ Operation::RenderTool(String)      // 工具请求 JSON → display-list JSON
 
 - 有界 mpsc（32）+ `oneshot` 回复；调用可被取消，但没有 wall-clock 超时；
 - `CancellationToken` 贯穿请求生命周期；
-- `CALL_FUEL = 10_000_000` 是唯一的执行预算：没有内存、table、instance 或 payload 上限；
-- guest 的 `Err(string)` 是正常控制流，Store 仍可用；trap / out of fuel / 取消会
+- 没有执行预算：fuel、内存、table、instance 与 payload 上限均未设置，调用可被取消；
+- guest 的 `Err(string)` 是正常控制流，Store 仍可用；trap / 取消会
   poison Store，之后重建 instance；
 - 渲染器实例是 **worker 全局单例**（纯计算、无 project 绑定）：启动时从
   `catalogue.global()` 找到 `transcript-renderer@deluxe-defaults` 并
@@ -443,7 +443,6 @@ Renderer 虽无 host capability，也不能假设它天然安全。宿主限制�
 
 - component 大小；
 - instance memory / table / instances；
-- fuel；
 - 单次调用时间；
 - request / response bytes；
 - queue 长度；
@@ -454,11 +453,11 @@ Renderer 虽无 host capability，也不能假设它天然安全。宿主限制�
 URL、表格行列数。工具请求使用专门投影，不把未经限制的 `serde_json::Value` 直接
 塞进请求。
 
-错误分类沿用插件平台的 `PLUGIN_*`（编译/实例化失败、trap、out of fuel、取消都由
+错误分类沿用插件平台的 `PLUGIN_*`（编译/实例化失败、trap、取消都由
 `ComponentActor` 归类），只有 display-list 自身的契约错误由宿主另起一码：
 
 ```text
-PLUGIN_*               加载、trap、out of fuel、取消（插件平台通用）
+PLUGIN_*               加载、trap、取消（插件平台通用）
 RENDER_INVALID_OUTPUT  display-list 协议解析或校验失败（`protocol.rs` 专用）
 ```
 

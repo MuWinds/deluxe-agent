@@ -712,8 +712,7 @@ impl CapabilityHub {
 
 /// Converts a transport read size, refusing only a zero-byte request.
 ///
-/// There is no upper bound: a plugin's transport reads are limited by nothing
-/// but its own fuel budget.
+/// There is no upper bound: the caller picks the read size.
 fn read_size(max_bytes: u32) -> Result<usize> {
     let max_bytes = usize::try_from(max_bytes)
         .map_err(|_| AgentError::invalid_params("Read size is invalid"))?;
