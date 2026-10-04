@@ -8,8 +8,7 @@ mod sidebar;
 mod widgets;
 
 // 主实现文件，包含 impl App 的所有 UI 方法
-#[path = "impl.rs"]
-mod ui_impl;
+mod impl_ui;
 
 // 重新导出主实现中的所有内容
-pub use ui_impl::*;
+pub use impl_ui::*;

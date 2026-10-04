@@ -11,37 +11,43 @@
 //! area sizes itself from what is left; drawn the other way round the two
 //! overlap.
 
-use super::super::*;
+use super::super::{App, Cmd, UiIntent};
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use eframe::egui;
 use egui::text::LayoutJob;
 use egui::{
-    Align, Color32, ColorImage, CornerRadius, FontId, Frame, Layout, Margin, Pos2, RichText,
-    Stroke, TextFormat, TextureHandle, TextureOptions, Vec2,
+    Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, Pos2, RichText,
+    Stroke, TextureHandle, Vec2,
 };
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::attachments::{self, ImageRef};
+use crate::attachments::ImageRef;
 use crate::config::InputModality;
 use crate::icons;
-use crate::image_ops;
-use crate::ipc::{AuditOutcome, JobState, JobView, RunState};
+use crate::ipc::{JobState, JobView, RunState};
 use crate::llm::ThinkingLevel;
 use crate::plugins::{self};
 use crate::renderer::present;
 use crate::renderer::protocol::{
-    HunkLines, Node, RenderKey, RenderMetrics, ToolRenderRequest, ToolRenderResult,
+    Node, RenderKey, RenderMetrics, ToolRenderRequest,
 };
 use crate::session::{self, Session, Step, ToolResult};
 use crate::theme::{self, Palette, ThemeChoice};
 
 use super::super::render_cache;
+
+// Import functions from submodules
+use super::common::{
+    render_metrics, tool_fingerprint, tool_result, outcome_colour, outcome_icon,
+    job_status_text, shorten,
+};
+use super::widgets::{append_run, transcript_thumb};
 
 /// Width of the far-left icon rail.
 const RAIL_WIDTH: f32 = 52.0;
@@ -2009,64 +2015,8 @@ enum PendingRender {
 ///
 /// `width` is the message column before clamping; `char_width` is measured from
 /// the body font so the guest's width arithmetic tracks the host's type scale.
-fn render_metrics(ui: &egui::Ui, width: f32) -> RenderMetrics {
-    let font = FontId::proportional(theme::font(14.0));
-    let char_width = ui
-        .painter()
-        .layout_no_wrap("0".to_string(), font, Color32::PLACEHOLDER)
-        .size()
-        .x;
-    // A non-finite width would serialize as `null` and the guest would reject
-    // the request; fall back to the column's own maximum instead.
-    let width = if width.is_finite() {
-        width
-    } else {
-        COMPOSER_MAX_WIDTH
-    };
-    RenderMetrics {
-        available_width: width.clamp(0.0, COMPOSER_MAX_WIDTH),
-        char_width: char_width.max(1.0),
-        column_gap: 12.0,
-    }
-}
 
 /// Hashes a tool call's panel-relevant input.
-fn tool_fingerprint(name: &str, arguments: &Value, result: Option<&ToolResult>) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut hasher);
-    arguments.to_string().hash(&mut hasher);
-    if let Some(result) = result {
-        serde_json::to_string(result)
-            .unwrap_or_default()
-            .hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-/// Projects a host tool result onto the wire, dropping images.
-fn tool_result(result: Option<ToolResult>) -> Option<ToolRenderResult> {
-    result.map(|result| ToolRenderResult {
-        outcome: outcome_code(result.outcome).to_string(),
-        output: result.output,
-        hunks: result
-            .hunks
-            .into_iter()
-            .map(|section| HunkLines {
-                path: section.path,
-                lines: section.lines,
-            })
-            .collect(),
-        duration_ms: result.duration_ms,
-    })
-}
-
-fn outcome_code(outcome: AuditOutcome) -> &'static str {
-    match outcome {
-        AuditOutcome::Executed => "executed",
-        AuditOutcome::Denied => "denied",
-        AuditOutcome::Failed => "failed",
-    }
-}
 
 /// Renders one transcript step.
 ///
@@ -2216,34 +2166,6 @@ fn draw_user_images(
 /// URI, while the bytes here come from the attachment store. `load_texture`
 /// allocates a fresh texture on every call, so the map on `App` is what keeps
 /// the decode to once per image per process. The entries live as long as the
-/// window does — thumbnails are small, and a session that scrolled away costs
-/// nothing until it is drawn again.
-fn transcript_thumb(
-    thumbs: &mut HashMap<String, TextureHandle>,
-    ctx: &egui::Context,
-    image: &ImageRef,
-) -> Option<TextureHandle> {
-    if let Some(cached) = thumbs.get(&image.id) {
-        return Some(cached.clone());
-    }
-
-    let bytes = attachments::load_bytes(image).ok()?;
-    let raster = if image.media_type == "image/jpeg" {
-        image_ops::decode_jpeg(&bytes).ok()?
-    } else {
-        image_ops::decode_png(&bytes).ok()?
-    };
-    let texture = ctx.load_texture(
-        format!("thumb://{}", image.id),
-        ColorImage::from_rgba_unmultiplied(
-            [raster.width as usize, raster.height as usize],
-            &raster.rgba,
-        ),
-        TextureOptions::default(),
-    );
-    thumbs.insert(image.id.clone(), texture.clone());
-    Some(texture)
-}
 
 /// The model's chain of thought, collapsed until clicked.
 ///
@@ -2571,33 +2493,6 @@ fn draw_tool_fallback(
         });
 }
 
-fn append_run(job: &mut LayoutJob, text: &str, font: &FontId, colour: Color32) {
-    job.append(
-        text,
-        0.0,
-        TextFormat {
-            font_id: font.clone(),
-            color: colour,
-            ..Default::default()
-        },
-    );
-}
-
-fn outcome_colour(outcome: AuditOutcome) -> Color32 {
-    match outcome {
-        AuditOutcome::Executed => theme::OK_GREEN,
-        AuditOutcome::Denied => theme::WARN_AMBER,
-        AuditOutcome::Failed => theme::BAD_RED,
-    }
-}
-
-fn outcome_icon(outcome: AuditOutcome) -> &'static str {
-    match outcome {
-        AuditOutcome::Executed => crate::icons::CHECK_CIRCLE,
-        AuditOutcome::Denied => crate::icons::WARNING_CIRCLE,
-        AuditOutcome::Failed => crate::icons::X_CIRCLE,
-    }
-}
 
 /// Monospace text the user can select and copy, which is what makes a path or a
 /// stack trace in a tool result usable.

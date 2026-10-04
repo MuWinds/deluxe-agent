@@ -2,7 +2,7 @@
 
 use eframe::egui;
 use egui::{Align, Color32, CornerRadius, FontId, Frame, Margin, RichText, TextureHandle, Vec2};
-use egui::text::LayoutJob;
+use egui::text::{LayoutJob, TextFormat};
 
 use std::collections::HashMap;
 
@@ -120,7 +120,6 @@ fn chip_label(image: &ImageRef) -> String {
 
 /// LayoutJob 追加样式化文本。
 pub fn append_run(job: &mut LayoutJob, text: &str, font: &FontId, colour: Color32) {
-    use egui::TextFormat;
     job.append(
         text,
         0.0,
@@ -137,18 +136,15 @@ pub const TRANSCRIPT_THUMB: (f32, f32) = (180.0, 130.0);
 
 /// 将图片加载为缩略图纹理。
 pub fn transcript_thumb(
-    ctx: &egui::Context,
-    salt: (uuid::Uuid, usize),
-    image: &ImageRef,
     thumbs: &mut HashMap<String, TextureHandle>,
+    ctx: &egui::Context,
+    image: &ImageRef,
 ) -> Option<TextureHandle> {
     use crate::attachments;
     use crate::image_ops;
 
-    let key = format!("{}:{}", salt.0, image.id);
-
-    if let Some(handle) = thumbs.get(&key) {
-        return Some(handle.clone());
+    if let Some(cached) = thumbs.get(&image.id) {
+        return Some(cached.clone());
     }
 
     let bytes = attachments::load_bytes(image).ok()?;
@@ -157,15 +153,14 @@ pub fn transcript_thumb(
     } else {
         image_ops::decode_png(&bytes).ok()?
     };
-
-    let handle = ctx.load_texture(
-        &key,
+    let texture = ctx.load_texture(
+        format!("thumb://{}", image.id),
         egui::ColorImage::from_rgba_unmultiplied(
             [raster.width as usize, raster.height as usize],
             &raster.rgba,
         ),
-        egui::TextureOptions::LINEAR,
+        egui::TextureOptions::default(),
     );
-    thumbs.insert(key, handle.clone());
-    Some(handle)
+    thumbs.insert(image.id.clone(), texture.clone());
+    Some(texture)
 }
