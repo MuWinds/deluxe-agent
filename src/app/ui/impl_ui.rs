@@ -30,7 +30,7 @@ use uuid::Uuid;
 use crate::attachments::ImageRef;
 use crate::config::InputModality;
 use crate::icons;
-use crate::ipc::{JobState, JobView, RunState};
+use crate::ipc::RunState;
 use crate::llm::ThinkingLevel;
 use crate::plugins::{self};
 use crate::renderer::present;
@@ -44,11 +44,10 @@ use super::super::render_cache;
 
 // Import functions from submodules
 use super::common::{
-    render_metrics, tool_fingerprint, tool_result, outcome_colour, outcome_icon,
-    job_status_text, shorten,
+    render_metrics, tool_fingerprint, tool_result, outcome_colour, outcome_icon, shorten,
 };
 use super::widgets::{append_run, transcript_thumb};
-use super::jobs::{draw_job_row, job_button, job_colour, JobRowClick};
+use super::jobs::draw_job_row;
 
 /// Width of the far-left icon rail.
 const RAIL_WIDTH: f32 = 52.0;
