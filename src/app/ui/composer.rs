@@ -25,6 +25,9 @@ const CONTEXT_GAUGE_RESERVE: f32 = 64.0;
 /// Upper bound of the thinking picker on the composer's input row.
 const THINKING_PICKER_RESERVE: f32 = 84.0;
 
+/// Space reserved on the input row for a plugin-contributed composer control.
+const COMPOSER_CONTROL_RESERVE: f32 = 150.0;
+
 /// Straight-line segments used to draw the gauge ring.
 const SEGMENTS_PER_RING: usize = 24;
 
@@ -63,10 +66,16 @@ impl App {
                             ui.set_width(width);
 
                             ui.horizontal(|ui| {
+                                let composer_reserve = if self.composer.is_some() {
+                                    COMPOSER_CONTROL_RESERVE
+                                } else {
+                                    0.0
+                                };
                                 let editor_width = (ui.available_width()
                                     - CONTEXT_GAUGE_RESERVE
                                     - THINKING_PICKER_RESERVE
                                     - COMPOSER_BUTTON
+                                    - composer_reserve
                                     - 8.0)
                                     .max(120.0);
                                 let editor = ui.add(
@@ -84,6 +93,7 @@ impl App {
                                     intents.push(UiIntent::SendPrompt);
                                 }
 
+                                self.draw_composer_control(ui, intents);
                                 self.draw_thinking_picker(ui);
                                 self.draw_context_gauge(ui, p);
 
@@ -112,6 +122,28 @@ impl App {
                     self.draw_jobs(ui, p, intents);
                 });
             });
+    }
+
+    /// The plugin-contributed control on the input row, if one is loaded.
+    ///
+    /// It is drawn from the same validated snapshot the settings window would
+    /// show; the host knows nothing about what the control means.
+    fn draw_composer_control(&self, ui: &mut egui::Ui, intents: &mut Vec<UiIntent>) {
+        let Some(surface) = &self.composer else {
+            return;
+        };
+        let Some(document) = &surface.document else {
+            return;
+        };
+        ui.push_id(&surface.request, |ui| {
+            super::super::plugin_ui::render_node(
+                ui,
+                &document.root,
+                &surface.request,
+                document.revision,
+                intents,
+            );
+        });
     }
 
     /// The per-conversation reasoning-effort picker, drawn in the composer.
@@ -147,7 +179,9 @@ impl App {
         let measured = session
             .and_then(|session| session.context_measurement)
             .map(|(tokens, _)| tokens);
-        let limit = self.config.context.context_limit;
+        // The window is the provider Component's to declare; the host only
+        // knows the compaction share it applies to it.
+        let limit = self.llm_descriptor.context_tokens;
 
         let used = measured.unwrap_or(0);
         let ratio = if limit > 0 {
@@ -175,11 +209,11 @@ impl App {
                 ratio * 100.0
             ),
             (Some(tokens), false) => format!(
-                "上下文：已用 {} tokens；设置里未配置窗口大小",
+                "上下文：已用 {} tokens；供应商未报告窗口大小",
                 format_tokens(tokens)
             ),
             (None, true) => format!("上下文：窗口 {}，还没有用量数据", format_tokens(limit)),
-            (None, false) => "上下文：还没有用量数据；设置里未配置窗口大小".to_string(),
+            (None, false) => "上下文：还没有用量数据；供应商未报告窗口大小".to_string(),
         };
         if limit > 0 && ratio >= compaction && measured.is_some() {
             summary.push_str(" —— 达到压缩阈值，下一条消息会先压缩历史");

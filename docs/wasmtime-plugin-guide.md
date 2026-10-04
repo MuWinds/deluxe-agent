@@ -56,7 +56,6 @@ example-plugin/
     "permissions": {
       "invokeTools": ["read_file"],
       "processCommands": [],
-      "networkHosts": [],
       "writePluginFiles": false
     }
   }
@@ -357,8 +356,9 @@ WIT 的 `host` interface 提供以下能力：
 | `run-agent(request-json)` | 由宿主按需授予，不在 manifest 里声明 | 跑一次嵌套 Agent：请求带角色的名字、instructions、prompt 和是否后台；前台返回 `{"answer": ...}`，后台返回 `{"jobId": ...}`。宿主拥有模型循环、工具集和事件流。 |
 | `spawn-process(...)` | `processCommands` | 启动插件拥有的 transport 进程。 |
 | `process-write/read/close` | 对应已创建的句柄 | 进程的有界字节 I/O。 |
-| `http-request(...)` | `networkHosts` | 对声明过的 host 发起 HTTP(S) 请求。 |
+| `http-request(...)` | 无额外开关 | 发起 HTTP(S) 请求。请求由宿主发出，插件不持有 socket。 |
 | `http-read/close` | 对应已创建的句柄 | 读取和释放 HTTP 响应。 |
+| `get-secret(name)` | 无额外开关 | 按名字读取凭据：先查环境变量 `DELUXE_AGENT_SECRET_<NAME>`（名字大写、非字母数字映射为 `_`），再查操作系统凭据库；都没有时返回 `none`。 |
 
 文件能力的根目录不是 `plugin.wasm` 所在目录：
 全局级别的插件绑定到用户目录下的 `.deluxe-agents`，项目级别的插件绑定到项目范围的配置目录。
@@ -453,9 +453,7 @@ wasm-tools validate .\plugin.wasm
 
 ### `This host capability was not granted`
 
-这是预期的权限拒绝。把实际需要的工具名加入 `permissions.invokeTools`，命令名
-加入 `processCommands`，网络 URL 的 host 加入 `networkHosts`；不要直接扩大到
-`*`。
+这是预期的权限拒绝。把实际需要的工具名加入 `permissions.invokeTools`，命令名加入 `processCommands`；不要直接扩大到 `*`。
 
 ### `UI action targets a stale snapshot`
 

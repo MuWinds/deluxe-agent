@@ -12,9 +12,9 @@ pub mod types;
 
 pub use events::AgentEvent;
 pub use ports::{
-    AgentEventSink, AgentServices, ConfigStore, JobRuntime, LlmProvider, LlmStreamEvent,
-    LlmStreamSink, NestedAgentRuntime, PluginEvent, PluginEventRuntime, PluginManager, SecretStore,
-    SessionStore, EVENT_TOOL_FINISHED,
+    AgentEventSink, AgentServices, ConfigStore, JobRuntime, LlmStreamEvent, LlmStreamSink,
+    NestedAgentRuntime, PluginEvent, PluginEventRuntime, PluginManager, SessionStore,
+    EVENT_TOOL_FINISHED,
 };
-pub use services::{NativeConfigStore, NativeJobRuntime, NativePluginManager, NativeSecretStore};
+pub use services::{NativeConfigStore, NativeJobRuntime, NativePluginManager};
 pub use types::{AuditOutcome, HunkLines, ProjectInstruction, PromptContext, RunId, RunState};

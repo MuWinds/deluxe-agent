@@ -12,69 +12,25 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{self, Config};
 use crate::context::summarize;
 use crate::error::{AgentError, Result};
-use crate::llm::{AssistantTurn, LlmClient, Message, StreamFragment, ThinkingLevel, ToolCall};
+use crate::llm::{Message, ToolCall};
+use crate::plugins::llm::LlmProvider;
 use crate::plugins::{self, PluginCatalogue, PluginSettings, Scope};
 use crate::tools::jobs::{JobRegistry, JobSnapshot};
 use crate::tools::{validate_arguments, ToolDescriptor, ToolRegistry, ToolSettings};
 
 use super::ports::{
-    ConfigStore, ContextCompactor, InstalledPlugin, JobFactory, JobRuntime, LlmProvider,
-    LlmStreamEvent, LlmStreamSink, PluginEvent, PluginEventRuntime, PluginManager, PromptProvider,
-    SecretStore, ToolContext, ToolExecution, ToolRuntime,
+    ConfigStore, ContextCompactor, InstalledPlugin, JobFactory, JobRuntime, PluginEvent,
+    PluginEventRuntime, PluginManager, PromptProvider, ToolContext, ToolExecution, ToolRuntime,
 };
 use super::types::AuditOutcome;
 
-#[derive(Clone)]
-pub struct NativeLlmProvider {
-    client: LlmClient,
-}
-
-impl NativeLlmProvider {
-    /// Wraps the existing OpenAI-compatible client as a runtime provider.
-    pub fn new(client: LlmClient) -> Self {
-        Self { client }
-    }
-}
-
-#[async_trait]
-impl LlmProvider for NativeLlmProvider {
-    async fn stream_turn(
-        &self,
-        messages: &[Message],
-        tools: &Value,
-        thinking: Option<ThinkingLevel>,
-        cancel: &CancellationToken,
-        sink: &mut dyn LlmStreamSink,
-    ) -> Result<AssistantTurn> {
-        self.client
-            .stream_turn(messages, tools, thinking, cancel, |fragment| {
-                let event = match fragment {
-                    StreamFragment::Reset => LlmStreamEvent::Reset,
-                    StreamFragment::Reasoning(text) => LlmStreamEvent::Reasoning(text.to_string()),
-                    StreamFragment::Content(text) => LlmStreamEvent::Content(text.to_string()),
-                };
-                sink.push(event);
-            })
-            .await
-    }
-
-    async fn complete_turn(
-        &self,
-        messages: &[Message],
-        tools: &Value,
-        cancel: &CancellationToken,
-    ) -> Result<AssistantTurn> {
-        self.client.complete_turn(messages, tools, cancel).await
-    }
-}
-
 pub struct NativeContextCompactor {
-    llm: Arc<dyn LlmProvider>,
+    llm: Arc<LlmProvider>,
 }
 
 impl NativeContextCompactor {
     /// Creates a compactor backed by the same provider as the agent loop.
-    pub fn new(llm: Arc<dyn LlmProvider>) -> Self {
+    pub fn new(llm: Arc<LlmProvider>) -> Self {
         Self { llm }
     }
 }
@@ -144,25 +100,6 @@ impl ConfigStore for NativeConfigStore {
         tokio::task::spawn_blocking(move || config::save_to(&path, &config))
             .await
             .map_err(|error| AgentError::internal(format!("Config store worker failed: {error}")))?
-    }
-}
-
-pub struct NativeSecretStore;
-
-impl NativeSecretStore {
-    /// Creates a keyring-backed store for model credentials.
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[async_trait]
-impl SecretStore for NativeSecretStore {
-    async fn save_api_key(&self, api_key: &str) -> Result<()> {
-        let api_key = api_key.to_string();
-        tokio::task::spawn_blocking(move || config::store_api_key(&api_key))
-            .await
-            .map_err(|error| AgentError::internal(format!("Secret store worker failed: {error}")))?
     }
 }
 
@@ -605,13 +542,15 @@ impl PluginEventRuntime for EmptyPluginEventRuntime {
 }
 
 /// Builds host services for a registry and its model provider.
+///
+/// The provider is passed in rather than constructed here: it is the Wasmtime
+/// Component adapter, which the worker owns and shares across every project.
 pub fn native_services(
-    client: LlmClient,
+    llm: Arc<LlmProvider>,
     registry: Arc<ToolRegistry>,
     settings: Arc<RwLock<ToolSettings>>,
     prompts: Arc<dyn PromptProvider>,
 ) -> super::ports::AgentServices {
-    let llm: Arc<dyn LlmProvider> = Arc::new(NativeLlmProvider::new(client));
     let native_tools = Arc::new(RegistryToolRuntime::new(registry.clone(), settings));
     let tools: Arc<dyn ToolRuntime> = native_tools.clone();
     let jobs: Arc<dyn JobRuntime> = Arc::new(NativeJobRuntime::new(registry.jobs().clone()));

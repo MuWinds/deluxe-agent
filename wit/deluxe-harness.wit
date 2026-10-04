@@ -37,10 +37,24 @@ interface host {
     ) -> result<string, string>;
     http-read: async func(handle: u64, max-bytes: u32) -> result<list<u8>, string>;
     http-close: async func(handle: u64);
+    // Reads a credential by name: the environment first (an uppercased,
+    // underscore-mapped `DELUXE_AGENT_SECRET_<NAME>`), then the operating
+    // system's credential store. `none` means the name resolved to nothing.
+    get-secret: async func(name: string) -> result<option<string>, string>;
 }
 
 interface plugin {
     configure: async func() -> result<_, string>;
+    // The Component's own capability description, as a JSON object. It is the
+    // generic self-description every plugin answers; a model provider fills the
+    // capability keys the host reads before a run, a plugin with nothing to
+    // declare returns `{}`. Known keys:
+    // `{"ready":bool,"capabilities":{"imageInput":bool},"limits":{"contextTokens":u64}}`.
+    // `ready` is false when the plugin cannot serve requests yet (for a model
+    // provider, no profile is selected); `capabilities.imageInput` says whether
+    // the active model accepts images; `limits.contextTokens` is the active
+    // model's context window, or 0 when unknown.
+    describe: async func() -> result<string, string>;
     list-tools: async func() -> string;
     execute-tool: async func(name: string, arguments-json: string) -> result<string, string>;
     list-event-handlers: async func() -> string;
@@ -61,6 +75,27 @@ interface prompt {
     // host neither parses nor reorders it, so it never learns what the text
     // means. An empty string contributes nothing.
     prompt-sections: async func() -> result<string, string>;
+}
+
+// A model provider, split from its transport: the Component owns the wire
+// protocol (how a request is shaped and how a response stream is decoded),
+// while the host owns the socket, retries, cancellation, and byte pumping. The
+// Component therefore performs no I/O inside these calls beyond reading its own
+// configuration, and the host never learns SSE, tool-call deltas, or any
+// vendor's stop-reason vocabulary.
+interface llm {
+    // Shapes one turn into an HTTP request from a canonical, provider-neutral
+    // request JSON (`thinking`, `stream`, `toolChoice`, `messages`, `tools`).
+    // Returns `{"method","url","headers":{..},"body":"<json string>"}`.
+    build-request: async func(request-json: string) -> result<string, string>;
+    // Feeds one response chunk and returns the decoded events plus, when the
+    // stream is finished, the accumulated turn:
+    // `{"events":[...],"done":bool,"turn":<turn>|null}`. The Component owns the
+    // per-stream buffer and tool-call accumulators, keyed by `stream-id`.
+    parse-stream: async func(stream-id: string, chunk: list<u8>) -> result<string, string>;
+    close-stream: async func(stream-id: string);
+    // Decodes a non-streaming response body into a turn, for compaction.
+    parse-complete: async func(body: list<u8>) -> result<string, string>;
 }
 
 world harness-plugin {
@@ -97,4 +132,21 @@ world prompt-provider {
 // this, so a binding that fails here means "not a prompt provider".
 world prompt-plugin {
     export prompt;
+}
+
+// The model provider's own world. It needs the host's file capability (to read
+// and write its own provider profiles) and its credential lookup, and it
+// exports `plugin` so the plugin platform can load it: `describe` reports the
+// active profile's capabilities, and `open-surface` shows its `providers`
+// settings window (and its inline composer picker).
+world llm-provider {
+    import host;
+    export plugin;
+    export llm;
+}
+
+// The platform's optional view of a Component: only a model provider exports
+// this, so a binding that fails here means "not a model provider".
+world llm-provider-plugin {
+    export llm;
 }

@@ -103,6 +103,12 @@ impl PluginGuest for SkillsProvider {
         Ok(())
     }
 
+    async fn describe() -> Result<String, String> {
+        // A prompt provider contributes instructions, not model metadata; the
+        // host ignores every key this could carry.
+        Ok("{}".into())
+    }
+
     async fn list_tools() -> String {
         "[]".into()
     }
@@ -320,7 +326,10 @@ mod tests {
         );
 
         assert_eq!(skill.name, "a");
-        assert_eq!(skill.description.as_deref(), Some("Use when: the build fails"));
+        assert_eq!(
+            skill.description.as_deref(),
+            Some("Use when: the build fails")
+        );
     }
 
     #[test]
@@ -361,7 +370,11 @@ mod tests {
             skill_directory("skills/desktop-ui/SKILL.md"),
             Some("desktop-ui")
         );
-        assert_eq!(skill_directory("skills/SKILL.md"), None, "one level too few");
+        assert_eq!(
+            skill_directory("skills/SKILL.md"),
+            None,
+            "one level too few"
+        );
         assert_eq!(
             skill_directory("skills/real/references/notes.md"),
             None,

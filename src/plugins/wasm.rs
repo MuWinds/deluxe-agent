@@ -707,7 +707,6 @@ mod tests {
             "apiVersion": crate::plugins::wasm_manifest::API_VERSION,
             "permissions": {
                 "processCommands": ["*"],
-                "networkHosts": ["127.0.0.1"],
             }
         }))
         .expect("the dynamic MCP fixture manifest is valid");

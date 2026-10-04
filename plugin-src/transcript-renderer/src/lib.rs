@@ -49,6 +49,12 @@ impl PluginGuest for TranscriptRenderer {
         Ok(())
     }
 
+    async fn describe() -> Result<String, String> {
+        // A renderer contributes no model-facing capability, so it has nothing
+        // to describe; the host reads only the keys it knows and ignores these.
+        Ok("{}".into())
+    }
+
     async fn list_tools() -> String {
         "[]".into()
     }

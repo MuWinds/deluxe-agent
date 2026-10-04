@@ -29,6 +29,13 @@ pub struct UiManifest {
     pub surfaces: Vec<String>,
     #[serde(default)]
     pub actions: Vec<String>,
+    /// Whether this plugin contributes an inline control to the input row.
+    ///
+    /// The host opens a [`super::ui_protocol::COMPOSER_SURFACE_ID`] surface for
+    /// it and renders that snapshot inline. Kept separate from `surfaces`,
+    /// which lists the windows the user can open from the plugin panel.
+    #[serde(default)]
+    pub composer: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -38,8 +45,6 @@ pub struct Permissions {
     pub invoke_tools: Vec<String>,
     #[serde(default)]
     pub process_commands: Vec<String>,
-    #[serde(default)]
-    pub network_hosts: Vec<String>,
     /// Whether the Component may replace files inside its configuration root.
     ///
     /// Off unless declared: a Component that only *reads* `.mcp.json` or
@@ -79,34 +84,16 @@ impl WasmManifest {
                 ));
             }
         }
-        for ids in [
-            &self.permissions.process_commands,
-            &self.permissions.network_hosts,
-        ] {
-            let mut seen = HashSet::new();
-            if ids.len() > 128
-                || ids.iter().any(|id| {
-                    (id != "*"
-                        && (id.is_empty() || id.len() > 256 || id.bytes().any(|byte| byte == 0)))
-                        || !seen.insert(id)
-                })
-            {
-                return Err(AgentError::new(
-                    code::PLUGIN_LOAD_FAILED,
-                    "Invalid or duplicate process or network declarations",
-                ));
-            }
-        }
-        if self.permissions.network_hosts.len() > 64
-            || self
-                .permissions
-                .network_hosts
-                .iter()
-                .any(|host| host.is_empty() || host.len() > 255)
+        let mut seen = HashSet::new();
+        if self.permissions.process_commands.len() > 128
+            || self.permissions.process_commands.iter().any(|id| {
+                (id != "*" && (id.is_empty() || id.len() > 256 || id.bytes().any(|byte| byte == 0)))
+                    || !seen.insert(id)
+            })
         {
             return Err(AgentError::new(
                 code::PLUGIN_LOAD_FAILED,
-                "Invalid network host declarations",
+                "Invalid or duplicate process declarations",
             ));
         }
         let relative = Path::new(&self.module);
@@ -169,5 +156,23 @@ mod tests {
                 .code,
             code::PLUGIN_API_MISMATCH
         );
+    }
+
+    /// The composer is opt-in: a manifest that does not mention it contributes
+    /// no inline control, and one that does is recognized.
+    #[test]
+    fn the_inline_composer_is_opt_in() {
+        let plain: WasmManifest = serde_json::from_str(
+            r#"{"module":"plugin.wasm","apiVersion":"deluxe.harness/plugin@0.1"}"#,
+        )
+        .expect("valid manifest");
+        assert!(!plain.ui.composer);
+
+        let with_composer: WasmManifest = serde_json::from_str(
+            r#"{"module":"plugin.wasm","apiVersion":"deluxe.harness/plugin@0.1",
+                "ui":{"composer":true}}"#,
+        )
+        .expect("valid manifest");
+        assert!(with_composer.ui.composer);
     }
 }

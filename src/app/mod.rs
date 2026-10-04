@@ -19,12 +19,13 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::attachments::{self, ImageRef};
-use crate::config::{Config, API_KEY_ENV};
+use crate::config::Config;
 use crate::image_ops;
-use crate::ipc::{Cmd, Event, LlmSettings, RunId, RunState, SecretValue};
+use crate::ipc::{Cmd, Event, LlmSettings, RunId, RunState};
 #[cfg(test)]
 use crate::ipc::{JobState, JobView};
 use crate::llm::UserTurn;
+use crate::plugins::llm::LLM_PROVIDER_PLUGIN_ID;
 use crate::plugins::{self, PluginCatalogue};
 use crate::session::{self, Session, Step, ToolResult};
 
@@ -80,42 +81,6 @@ fn format_tokens(tokens: u64) -> String {
     format!("{text}{unit}")
 }
 
-/// Reads a token count a user typed, `1M` / `8k` / `8KiB` / `8192` alike.
-///
-/// The settings field is a text edit, so the shorthand people already use for
-/// context windows should parse rather than bounce off `f64::from_str`. `k`
-/// means 1024 and `M` means 1024², matching how a model's context window is
-/// conventionally quoted; `KiB` / `MiB` spellings are accepted as the same
-/// numbers. A plain integer is read as tokens, not kibibytes. The result is
-/// clamped to [`u64::MAX`] so an absurd figure saturates instead of erroring;
-/// `None` is left to the caller to interpret, which keeps this decoupled from
-/// any one field's idea of an empty value.
-fn parse_token_count(text: &str) -> Option<u64> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-
-    // Split at the first character that is not a digit — `find` + `split_at`
-    // rather than `split_once`, which treats the match as a delimiter and eats
-    // it: `"1M"` would come back as `("1", "")` and the unit would be lost,
-    // silently turning every shorthand into its bare number.
-    let split = text
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(text.len());
-    let (digits, unit) = text.split_at(split);
-    let unit = unit.trim();
-
-    let count: u64 = digits.parse().ok()?;
-    let multiplier = match unit.to_ascii_lowercase().as_str() {
-        "" => 1,
-        "k" | "kib" => 1024,
-        "m" | "mib" => 1024 * 1024,
-        _ => return None,
-    };
-    Some(count.saturating_mul(multiplier))
-}
-
 impl App {
     /// Builds the window from the state `main` resolved before it opened.
     ///
@@ -126,7 +91,6 @@ impl App {
         cmd_tx: mpsc::UnboundedSender<Cmd>,
         events: mpsc::UnboundedReceiver<Event>,
         config: Config,
-        api_key: String,
         sessions: Vec<Session>,
         catalogue: Arc<PluginCatalogue>,
         paths: Paths,
@@ -138,10 +102,20 @@ impl App {
 
         Self {
             plugin_surface: None,
+            composer: None,
             cmd_tx,
             events,
             config,
-            api_key,
+            // Optimistic until the worker reports: the same reasoning the
+            // renderer's availability uses. The first `PluginDescriptor`
+            // arrives within a frame of startup and replaces this, so a
+            // configured provider is never refused and a missing one is
+            // reported by the worker's own run failure.
+            llm_descriptor: crate::plugins::descriptor::PluginDescriptor {
+                ready: true,
+                ..Default::default()
+            },
+            llm_available: true,
             catalogue,
             paths,
             sessions,
@@ -155,14 +129,11 @@ impl App {
             next_config_request_id: 1,
             pending_config_saves: HashMap::new(),
             config_save_requests: HashMap::new(),
-            pending_api_key_save: None,
             pending_plugin_request: None,
             prompt: String::new(),
             pending_images: Vec::new(),
             thinking: None,
             search: String::new(),
-            context_limit_text: String::new(),
-            max_output_tokens_text: String::new(),
             expanded_reasoning: HashSet::new(),
             stick_to_bottom: true,
             jobs: Vec::new(),
@@ -256,21 +227,26 @@ impl App {
         // They belong to a job, not a session, so they fold into that job's
         // transcript instead.
         let event = match event {
-            Event::ApiKeySaved { request_id } => {
-                if self.pending_api_key_save == Some(request_id) {
-                    self.pending_api_key_save = None;
-                    self.settings_error = None;
-                    self.finish_save_settings();
+            Event::PluginAvailability {
+                plugin_id,
+                available,
+            } => {
+                // Only the model provider's availability gates a run; another
+                // plugin's is folded away.
+                if plugin_id == crate::plugins::llm::LLM_PROVIDER_PLUGIN_ID {
+                    if !available {
+                        tracing::warn!("model provider unavailable; no run can reach a model");
+                    }
+                    self.llm_available = available;
                 }
                 return;
             }
-            Event::ApiKeySaveFailed {
-                request_id,
-                message,
+            Event::PluginDescriptor {
+                plugin_id,
+                descriptor,
             } => {
-                if self.pending_api_key_save == Some(request_id) {
-                    self.pending_api_key_save = None;
-                    self.settings_error = Some(format!("存储 API Key 失败：{message}"));
+                if plugin_id == crate::plugins::llm::LLM_PROVIDER_PLUGIN_ID {
+                    self.llm_descriptor = descriptor;
                 }
                 return;
             }
@@ -577,8 +553,6 @@ impl App {
             | Event::Subagent { .. }
             | Event::SessionsSaved { .. }
             | Event::SessionSaveFailed { .. }
-            | Event::ApiKeySaved { .. }
-            | Event::ApiKeySaveFailed { .. }
             | Event::ConfigSaved { .. }
             | Event::ConfigSaveFailed { .. }
             | Event::PluginsUpdated { .. }
@@ -590,7 +564,9 @@ impl App {
             | Event::MessageRendered { .. }
             | Event::ToolRendered { .. }
             | Event::RenderFailed { .. }
-            | Event::RendererAvailability { .. } => {}
+            | Event::RendererAvailability { .. }
+            | Event::PluginAvailability { .. }
+            | Event::PluginDescriptor { .. } => {}
         }
 
         // A terminal event is also the last event its run can emit, so the run
@@ -846,11 +822,18 @@ impl App {
             text,
             images: std::mem::take(&mut self.pending_images),
         };
-        if self.api_key.trim().is_empty() {
-            self.show_settings = true;
+        if !self.llm_available {
+            self.notice_error(None, "LLM 供应商插件未启用，请在插件面板中启用它");
+            return;
+        }
+        // No active provider profile: send the user straight to the plugin
+        // surface that owns the provider configuration, rather than leaving the
+        // run to fail in the worker.
+        if !self.llm_descriptor.ready {
+            self.open_plugin_surface(LLM_PROVIDER_PLUGIN_ID.into(), "providers".into());
             self.notice_error(
                 None,
-                format!("请先在「设置」里填写 API Key，或设置环境变量 {API_KEY_ENV}"),
+                "尚未选择模型供应商，请在「LLM 供应商」里添加并启用一个",
             );
             return;
         }
@@ -1033,26 +1016,9 @@ impl App {
     /// Persists the settings and pushes them to the worker.
     ///
     /// A failed push means the worker is gone, which is reported on the settings
-    /// page rather than here.
+    /// page rather than here. The provider configuration is not touched: it
+    /// belongs to the plugin, which saves it through its own surface.
     fn save_settings(&mut self) {
-        if !self.api_key.trim().is_empty() {
-            let request_id = self.next_config_request_id;
-            self.next_config_request_id = self.next_config_request_id.wrapping_add(1);
-            self.pending_api_key_save = Some(request_id);
-            if self
-                .cmd_tx
-                .send(Cmd::SaveApiKey {
-                    request_id,
-                    api_key: SecretValue::new(self.api_key.clone()),
-                })
-                .is_err()
-            {
-                self.pending_api_key_save = None;
-                self.settings_error = Some("agent 线程已退出，API Key 未保存".into());
-            }
-            return;
-        }
-
         self.finish_save_settings();
     }
 
@@ -1069,20 +1035,15 @@ impl App {
             return;
         }
 
-        // The model settings are global worker state as well: the next run picks
-        // up a new base URL, model or key without a restart, and no session
-        // carries settings of its own.
+        // The retry policy and the compaction settings are the host's share of
+        // the model policy; the endpoint, model, and key live in the plugin, so
+        // they are not sent. No session carries settings of its own.
         if self
             .cmd_tx
             .send(Cmd::SetLlmSettings(Box::new(LlmSettings {
-                base_url: self.config.llm.base_url.clone(),
-                model: self.config.llm.model.clone(),
                 context: self.config.context,
-                max_output_tokens: self.config.llm.max_output_tokens,
                 retry_count: self.config.llm.retry_count,
                 retry_forever: self.config.llm.retry_forever,
-                input: self.config.llm.input.clone(),
-                api_key: self.api_key.clone(),
             })))
             .is_err()
         {
@@ -1284,13 +1245,6 @@ impl App {
                 UiIntent::RemoveProject(project) => self.remove_project(&project),
                 UiIntent::OpenSettings => {
                     self.show_settings = true;
-                    self.context_limit_text = self.config.context.context_limit.to_string();
-                    self.max_output_tokens_text = self
-                        .config
-                        .llm
-                        .max_output_tokens
-                        .map(|tokens| tokens.to_string())
-                        .unwrap_or_default();
                 }
                 UiIntent::OpenAbout => self.show_about = true,
                 UiIntent::OpenPlugins => {
@@ -1423,12 +1377,15 @@ impl App {
     /// only then store. Nothing is half-admitted — a refusal leaves the strip
     /// exactly as it was.
     fn intake_image_source(&mut self, source: ClipboardImage) {
-        // The model declares its input modalities, and a text-only one cannot
-        // take a picture. Refusing here — the way the Harness refuses with
-        // `does not support image input` — beats queueing an image that would
-        // later fail at the provider, mid-turn.
-        if !self.config.llm.supports_images() {
-            self.notice_error(None, "当前模型未开启图片输入；请在「设置」里勾选「图片」");
+        // The active provider profile declares its input modalities, and a
+        // text-only one cannot take a picture. Refusing here — the way the
+        // Harness refuses with `does not support image input` — beats queueing
+        // an image that would later fail at the provider, mid-turn.
+        if !self.llm_descriptor.image_input {
+            self.notice_error(
+                None,
+                "当前模型未开启图片输入；请在「LLM 供应商」里勾选「图片」",
+            );
             return;
         }
         let total: usize = self.pending_images.iter().map(|image| image.bytes).sum();
@@ -1483,8 +1440,6 @@ fn event_run_id(event: &Event) -> RunId {
         | Event::Subagent { .. }
         | Event::SessionsSaved { .. }
         | Event::SessionSaveFailed { .. }
-        | Event::ApiKeySaved { .. }
-        | Event::ApiKeySaveFailed { .. }
         | Event::ConfigSaved { .. }
         | Event::ConfigSaveFailed { .. }
         | Event::PluginsUpdated { .. }
@@ -1496,7 +1451,9 @@ fn event_run_id(event: &Event) -> RunId {
         | Event::MessageRendered { .. }
         | Event::ToolRendered { .. }
         | Event::RenderFailed { .. }
-        | Event::RendererAvailability { .. } => 0,
+        | Event::RendererAvailability { .. }
+        | Event::PluginAvailability { .. }
+        | Event::PluginDescriptor { .. } => 0,
     }
 }
 
@@ -1630,7 +1587,6 @@ mod tests {
             cmd_tx,
             event_rx,
             crate::config::Config::default(),
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -1806,7 +1762,6 @@ mod tests {
             cmd_tx,
             event_rx,
             crate::config::Config::default(),
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -1845,7 +1800,6 @@ mod tests {
             cmd_tx,
             event_rx,
             crate::config::Config::default(),
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -1885,7 +1839,6 @@ mod tests {
             cmd_tx,
             event_rx,
             crate::config::Config::default(),
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -1926,30 +1879,6 @@ mod tests {
         assert_eq!(format_tokens(131_072), "131.1k");
         assert_eq!(format_tokens(1_000_000), "1M");
         assert_eq!(format_tokens(1_234_567), "1.2M");
-    }
-
-    #[test]
-    fn token_counts_parse_from_the_shorthands_the_field_promises() {
-        // Plain integers stay tokens; k and M are the 1024-based powers a
-        // context window is conventionally quoted in, and the KiB spellings
-        // read as the same numbers.
-        assert_eq!(parse_token_count("8192"), Some(8_192));
-        assert_eq!(parse_token_count("1M"), Some(1_048_576));
-        assert_eq!(parse_token_count("8k"), Some(8_192));
-        assert_eq!(parse_token_count("128K"), Some(131_072));
-        assert_eq!(parse_token_count("8KiB"), Some(8_192));
-        assert_eq!(parse_token_count("2MiB"), Some(2_097_152));
-        assert_eq!(parse_token_count(" 1m "), Some(1_048_576));
-    }
-
-    #[test]
-    fn a_non_number_leaves_the_token_count_unparsed() {
-        // A unit the field does not promise is a typo, not a zero — leaving the
-        // value untouched is the honest reading of input the parser cannot own.
-        assert_eq!(parse_token_count(""), None);
-        assert_eq!(parse_token_count("abc"), None);
-        assert_eq!(parse_token_count("8GB"), None);
-        assert_eq!(parse_token_count("1.5M"), None);
     }
 
     #[test]
@@ -2036,7 +1965,6 @@ mod tests {
             cmd_tx,
             event_rx,
             crate::config::Config::default(),
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -2080,7 +2008,6 @@ mod tests {
             cmd_tx,
             event_rx,
             config,
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -2088,26 +2015,11 @@ mod tests {
 
         app.save_settings();
 
-        let key_request = match cmd_rx.try_recv() {
-            Ok(Cmd::SaveApiKey {
-                request_id,
-                api_key,
-            }) => {
-                assert_eq!(
-                    api_key.expose(),
-                    "key",
-                    "the credential is sent to the worker"
-                );
-                request_id
-            }
-            other => panic!("expected an API key save, got {other:?}"),
-        };
-        app.apply(Event::ApiKeySaved {
-            request_id: key_request,
-        });
+        // The provider is the plugin's; the host pushes only its own share —
+        // the tool policy, then the retry/compaction policy, then the file.
         assert!(
             matches!(cmd_rx.try_recv(), Ok(Cmd::SetToolSettings(_))),
-            "tool settings are sent after the credential is stored"
+            "tool settings are pushed first"
         );
         match cmd_rx.try_recv() {
             Ok(Cmd::SetLlmSettings(settings)) => {
@@ -2144,7 +2056,6 @@ mod tests {
             cmd_tx,
             event_rx,
             crate::config::Config::default(),
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -2205,7 +2116,6 @@ mod tests {
             cmd_tx,
             event_rx,
             crate::config::Config::default(),
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -2253,7 +2163,6 @@ mod tests {
             cmd_tx,
             event_rx,
             crate::config::Config::default(),
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -2296,7 +2205,6 @@ mod tests {
             cmd_tx,
             event_rx,
             crate::config::Config::default(),
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -2393,7 +2301,6 @@ mod tests {
             cmd_tx,
             event_rx,
             crate::config::Config::default(),
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -2433,7 +2340,6 @@ mod tests {
             cmd_tx,
             event_rx,
             crate::config::Config::default(),
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -2470,14 +2376,13 @@ mod tests {
     }
 
     #[test]
-    fn sending_without_an_api_key_reports_the_error_in_the_conversation() {
+    fn sending_without_a_configured_provider_reports_the_error_in_the_conversation() {
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             cmd_tx,
             event_rx,
             crate::config::Config::default(),
-            String::new(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -2487,20 +2392,19 @@ mod tests {
         let session_id = session.id;
         app.sessions.push(session);
         app.selected = Some(session_id);
+        // The worker would report this within a frame; the send gate must still
+        // refuse and explain.
+        app.llm_descriptor.ready = false;
 
         app.prompt = "你好".into();
         app.start_run();
 
-        assert!(
-            app.show_settings,
-            "the settings window opens for a missing key"
-        );
         let steps = &app
             .session(session_id)
             .expect("the session is still there")
             .steps;
         assert!(
-            matches!(steps.last(), Some(Step::Notice { text }) if text.contains("API Key")),
+            matches!(steps.last(), Some(Step::Notice { text }) if text.contains("供应商")),
             "the send-time error must land in the transcript, got: {steps:?}"
         );
     }
@@ -2515,7 +2419,6 @@ mod tests {
             cmd_tx,
             event_rx,
             crate::config::Config::default(),
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -2558,7 +2461,6 @@ mod tests {
             cmd_tx,
             event_rx,
             crate::config::Config::default(),
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -2594,7 +2496,6 @@ mod tests {
             cmd_tx,
             event_rx,
             crate::config::Config::default(),
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -2664,7 +2565,6 @@ mod tests {
             cmd_tx,
             event_rx,
             crate::config::Config::default(),
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
@@ -2748,7 +2648,6 @@ mod tests {
             cmd_tx,
             event_rx,
             config,
-            "key".into(),
             Vec::new(),
             catalogue,
             test_paths(),
@@ -2835,7 +2734,6 @@ mod tests {
             cmd_tx,
             event_rx,
             config,
-            "key".into(),
             Vec::new(),
             catalogue,
             test_paths(),
@@ -2965,12 +2863,12 @@ mod tests {
             cmd_tx,
             event_rx,
             config,
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
         );
         app.active_project = Some("/b".into());
+        app.llm_descriptor.ready = true;
 
         app.prompt = "你好".into();
         app.start_run();
@@ -2999,11 +2897,11 @@ mod tests {
             cmd_tx,
             event_rx,
             config,
-            "key".into(),
             Vec::new(),
             no_plugins(),
             test_paths(),
         );
+        app.llm_descriptor.ready = true;
 
         let mut session = Session::new("/a");
         session.state = RunState::Finished;

@@ -5,10 +5,13 @@
 //! executed against the real filesystem, fed back as a `tool` message, and that
 //! the run stops when the model answers without calling a tool.
 //!
-//! The server is a raw `TcpListener` rather than a mock of `LlmClient`, because
-//! the interesting failures — a fragmented `arguments` string, a body that
-//! arrives in several reads — only exist on the wire.
+//! The server is a raw `TcpListener` rather than a mock of the provider,
+//! because the interesting failures — a fragmented `arguments` string, a body
+//! that arrives in several reads — only exist on the wire. The provider is the
+//! real bundled Component: the tests load it and point its profile at the fake
+//! endpoint, so what is exercised is the same codec the application ships.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
@@ -21,14 +24,19 @@ use crate::agent::{Agent, RunRequest};
 use crate::attachments::ImageRef;
 use crate::context::ContextSettings;
 use crate::error::AgentError;
+use crate::harness::ports::{LlmStreamEvent, LlmStreamSink};
 use crate::harness::services::native_services;
 use crate::harness::{AgentEvent, AgentEventSink, PluginEventRuntime, PromptContext};
 use crate::ipc::{AuditOutcome, Event};
-use crate::llm::{LlmClient, Message};
+use crate::llm::Message;
 use crate::plugins::capabilities::CapabilityHub;
+use crate::plugins::llm::LlmProvider;
 use crate::plugins::providers::WasmEventRuntime;
 use crate::plugins::wasm_runtime::ComponentActor;
 use crate::tools::{to_openai_tools_from_descriptors, ToolRegistry, ToolSettings};
+
+/// The bundled model provider, embedded exactly as the application ships it.
+const LLM_PROVIDER_COMPONENT: &[u8] = include_bytes!("../builtin-plugins/llm-provider/plugin.wasm");
 
 /// Collects everything the agent emits, so a test can assert on the sequence.
 #[derive(Default)]
@@ -107,6 +115,20 @@ impl AgentEventSink for CollectingSink {
             .lock()
             .expect("the sink lock is not poisoned")
             .push(event.into());
+    }
+}
+
+/// Collects the fragments a streamed turn forwards, in order.
+#[derive(Default)]
+struct Fragments(Vec<String>);
+
+impl LlmStreamSink for Fragments {
+    fn push(&mut self, event: LlmStreamEvent) {
+        match event {
+            LlmStreamEvent::Reset => self.0.push("reset".to_string()),
+            LlmStreamEvent::Reasoning(text) => self.0.push(format!("reasoning:{text}")),
+            LlmStreamEvent::Content(text) => self.0.push(format!("content:{text}")),
+        }
     }
 }
 
@@ -293,42 +315,122 @@ fn two_turns(call: Value, answer: &str) -> Vec<String> {
     ]
 }
 
+/// Loads the bundled model provider Component, pointed at `base_url`.
+///
+/// The provider owns its own configuration, so the profile is written into a
+/// temp scope root that the Component reads at `configure` time — the same path
+/// the plugin platform uses. The guest re-reads its profile on every call (so a
+/// model switch made elsewhere takes effect mid-run), so the directory is kept
+/// alive for the whole test rather than deleted when this helper returns; the
+/// returned path is what keeps it on disk.
+async fn provider_actor_for(base_url: &str) -> (Arc<ComponentActor>, PathBuf) {
+    let root = tempfile::tempdir().expect("a temp config root is available");
+    let profile = json!({
+        "active": "provider-1",
+        "providers": [{
+            "id": "provider-1",
+            "name": "Test",
+            "protocol": "openai-chat",
+            "baseUrl": base_url,
+            "model": "test-model",
+            "apiKey": "test-key",
+            "contextLimit": 200000,
+        }],
+    });
+    std::fs::write(root.path().join("llm-provider.json"), profile.to_string())
+        .expect("the provider profile is writable");
+    let hub = CapabilityHub::new(
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+        Default::default(),
+        Arc::new(crate::harness::services::RegistryToolRuntime::new(
+            Arc::new(ToolRegistry::with_builtins()),
+            Arc::new(tokio::sync::RwLock::new(ToolSettings::default())),
+        )),
+    )
+    .expect("the provider scope host is valid");
+    let actor = ComponentActor::load_bytes(LLM_PROVIDER_COMPONENT, hub)
+        .await
+        .expect("the bundled model provider Component loads");
+    (actor, root.keep())
+}
+
+/// The same Component, wrapped as the host's model provider.
+async fn provider_for(base_url: &str, retry: Option<u32>) -> (LlmProvider, PathBuf) {
+    let (actor, root) = provider_actor_for(base_url).await;
+    let provider = LlmProvider::new(actor, retry).expect("the provider builds");
+    (provider, root)
+}
+
+/// The provider answers `plugin.describe` with its active profile's
+/// capabilities, which is what the host reads to gate image attachments and
+/// seed the context gauge.
+#[tokio::test]
+async fn the_provider_describes_its_active_profile() {
+    let (actor, _root) = provider_actor_for("http://127.0.0.1:1/v1").await;
+    let descriptor = crate::plugins::descriptor::describe(&actor)
+        .await
+        .expect("the provider describes itself");
+    assert!(descriptor.ready, "a complete profile is ready");
+    assert!(
+        !descriptor.image_input,
+        "the profile declares no image input"
+    );
+    assert_eq!(
+        descriptor.context_tokens, 200_000,
+        "the descriptor reports the profile's context window"
+    );
+}
+
 /// Builds an agent pointed at `server`, with tools rooted at `directory`.
 ///
-/// `context` enables the context-window manager; the tests that do not care
-/// pass the default, which is compaction off.
-fn agent_for_with_context(
+/// `context_limit` is the window the provider would have reported and
+/// `context` is the host's compaction policy; the tests that do not care pass
+/// a zero limit, which disables compaction.
+async fn agent_for_with_context(
     server: &FakeServer,
     directory: &std::path::Path,
+    context_limit: u64,
     context: ContextSettings,
 ) -> Agent {
-    agent_with_registry(ToolRegistry::with_builtins(), server, directory, context)
+    agent_with_registry(
+        ToolRegistry::with_builtins(),
+        server,
+        directory,
+        context_limit,
+        context,
+    )
+    .await
 }
 
 /// Builds an agent over an explicit registry, so a test can add `read_image`
 /// the way the worker does for a model that declares image input.
-fn agent_with_registry(
+async fn agent_with_registry(
     registry: ToolRegistry,
     server: &FakeServer,
     directory: &std::path::Path,
+    context_limit: u64,
     context: ContextSettings,
 ) -> Agent {
     agent_with_settings(
         registry,
         server,
         directory,
+        context_limit,
         context,
         ToolSettings {
             working_directory: directory.to_path_buf(),
             ..ToolSettings::default()
         },
     )
+    .await
 }
 
-fn agent_with_settings(
+async fn agent_with_settings(
     registry: ToolRegistry,
     server: &FakeServer,
     directory: &std::path::Path,
+    context_limit: u64,
     context: ContextSettings,
     settings: ToolSettings,
 ) -> Agent {
@@ -336,24 +438,26 @@ fn agent_with_settings(
         registry,
         server,
         directory,
+        context_limit,
         context,
         settings,
         Arc::new(WasmEventRuntime::empty()),
     )
+    .await
 }
 
-fn agent_with_settings_and_events(
+async fn agent_with_settings_and_events(
     registry: ToolRegistry,
     server: &FakeServer,
     directory: &std::path::Path,
+    context_limit: u64,
     context: ContextSettings,
     settings: ToolSettings,
     events: Arc<dyn PluginEventRuntime>,
 ) -> Agent {
-    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, Some(0))
-        .expect("the client builds");
+    let (provider, _root) = provider_for(&server.base_url, Some(0)).await;
     let mut native = native_services(
-        client,
+        Arc::new(provider),
         Arc::new(registry),
         Arc::new(tokio::sync::RwLock::new(settings)),
         Arc::new(crate::runtime::prompt::NativePromptProvider::new()),
@@ -369,11 +473,17 @@ fn agent_with_settings_and_events(
         .prompts
         .build_system_prompt(&prompt_context)
         .expect("the native prompt provider renders");
-    Agent::from_services(services, directory.to_path_buf(), context, system_prompt)
+    Agent::from_services(
+        services,
+        directory.to_path_buf(),
+        context_limit,
+        context,
+        system_prompt,
+    )
 }
 
-fn agent_for(server: &FakeServer, directory: &std::path::Path) -> Agent {
-    agent_for_with_context(server, directory, ContextSettings::default())
+async fn agent_for(server: &FakeServer, directory: &std::path::Path) -> Agent {
+    agent_for_with_context(server, directory, 0, ContextSettings::default()).await
 }
 
 async fn fixture_event_runtime(
@@ -440,10 +550,12 @@ async fn agent_with_fixture_events(
         registry,
         server,
         directory,
+        0,
         ContextSettings::default(),
         settings,
         events,
     )
+    .await
 }
 
 #[tokio::test]
@@ -472,12 +584,13 @@ async fn a_run_with_tool_calls_reports_each_turns_usage_as_it_lands() {
     let agent = agent_for_with_context(
         &server,
         directory.path(),
+        100_000,
         ContextSettings {
-            context_limit: 100_000,
             threshold_percent: 60,
             ..ContextSettings::default()
         },
-    );
+    )
+    .await;
     let sink = CollectingSink::default();
 
     let _ = agent
@@ -726,7 +839,7 @@ async fn the_system_prompt_carries_the_project_context() {
     ])])
     .await;
 
-    let agent = agent_for(&server, directory.path());
+    let agent = agent_for(&server, directory.path()).await;
     let sink = CollectingSink::default();
 
     let _ = agent
@@ -760,7 +873,7 @@ async fn the_system_prompt_carries_the_project_context() {
 async fn the_runtime_context_rides_as_a_message_and_is_not_repeated() {
     let directory = tempfile::tempdir().expect("a temp directory is available");
     let server = FakeServer::start(vec![answered(10, "ok"), answered(10, "again")]).await;
-    let agent = agent_for(&server, directory.path());
+    let agent = agent_for(&server, directory.path()).await;
 
     // First run: the history is empty, so the environment block is appended
     // after the prompt and recorded as a host message.
@@ -841,7 +954,7 @@ async fn a_chosen_thinking_level_reaches_the_request() {
     let directory = tempfile::tempdir().expect("a temp directory is available");
     let server = FakeServer::start(vec![answered(10, "ok")]).await;
 
-    let agent = agent_for(&server, directory.path());
+    let agent = agent_for(&server, directory.path()).await;
     let sink = CollectingSink::default();
 
     let _ = agent
@@ -871,7 +984,7 @@ async fn no_thinking_level_sends_no_reasoning_effort() {
     let directory = tempfile::tempdir().expect("a temp directory is available");
     let server = FakeServer::start(vec![answered(10, "ok")]).await;
 
-    let agent = agent_for(&server, directory.path());
+    let agent = agent_for(&server, directory.path()).await;
     let sink = CollectingSink::default();
 
     let _ = agent
@@ -923,10 +1036,9 @@ async fn a_completion_retries_provider_errors_and_returns_the_successful_answer(
     })
     .to_string();
     let server = FakeServer::start(vec![provider_error, answer]).await;
-    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, Some(1))
-        .expect("the client builds");
+    let (provider, _root) = provider_for(&server.base_url, Some(1)).await;
 
-    let turn = client
+    let turn = provider
         .complete_turn(
             &[Message::user("summarize")],
             &json!([]),
@@ -943,10 +1055,9 @@ async fn a_completion_retries_provider_errors_and_returns_the_successful_answer(
 async fn a_completion_stops_after_the_configured_number_of_retries() {
     let server = FakeServer::start(vec![String::new(), String::new(), String::new()]).await;
     server.fail(&[0, 1, 2]);
-    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, Some(2))
-        .expect("the client builds");
+    let (provider, _root) = provider_for(&server.base_url, Some(2)).await;
 
-    let result = client
+    let result = provider
         .complete_turn(
             &[Message::user("summarize")],
             &json!([]),
@@ -969,32 +1080,23 @@ async fn a_stream_retry_discards_partial_output_before_emitting_the_answer() {
         json!({ "choices": [{ "delta": { "content": "partial" } }] })
     );
     let server = FakeServer::start(vec![partial, answered(3, "complete")]).await;
-    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, Some(1))
-        .expect("the client builds");
-    let mut fragments = Vec::new();
+    let (provider, _root) = provider_for(&server.base_url, Some(1)).await;
+    let mut fragments = Fragments::default();
 
-    let turn = client
+    let turn = provider
         .stream_turn(
             &[Message::user("answer")],
             &json!([]),
             None,
             &CancellationToken::new(),
-            |fragment| match fragment {
-                crate::llm::StreamFragment::Reset => fragments.push("reset".to_string()),
-                crate::llm::StreamFragment::Reasoning(text) => {
-                    fragments.push(format!("reasoning:{text}"));
-                }
-                crate::llm::StreamFragment::Content(text) => {
-                    fragments.push(format!("content:{text}"));
-                }
-            },
+            &mut fragments,
         )
         .await
         .expect("the second stream completes");
 
     assert_eq!(turn.content, "complete");
     assert_eq!(
-        fragments,
+        fragments.0,
         vec!["content:partial", "reset", "content:complete"],
         "failed-attempt output is cleared before the retry's output"
     );
@@ -1012,10 +1114,9 @@ async fn an_unlimited_completion_keeps_retrying_past_the_default_limit() {
     })
     .to_string();
     let server = FakeServer::start(failures.chain([answer]).collect()).await;
-    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, None)
-        .expect("the client builds");
+    let (provider, _root) = provider_for(&server.base_url, None).await;
 
-    let turn = client
+    let turn = provider
         .complete_turn(
             &[Message::user("summarize")],
             &json!([]),
@@ -1036,12 +1137,11 @@ async fn an_unlimited_completion_keeps_retrying_past_the_default_limit() {
 async fn an_unlimited_completion_stops_retrying_when_cancelled() {
     let server = FakeServer::start(vec![String::new()]).await;
     server.fail(&[0]);
-    let client = LlmClient::new(&server.base_url, "test-model", "test-key", None, None)
-        .expect("the client builds");
+    let (provider, _root) = provider_for(&server.base_url, None).await;
     let cancel = CancellationToken::new();
     let request_cancel = cancel.clone();
     let request = tokio::spawn(async move {
-        client
+        provider
             .complete_turn(&[Message::user("summarize")], &json!([]), &request_cancel)
             .await
     });
@@ -1081,24 +1181,18 @@ async fn a_stream_waiting_for_response_headers_stops_when_cancelled() {
         let _ = accepted_tx.send(());
         let _ = release_rx.await;
     });
-    let client = LlmClient::new(
-        format!("http://127.0.0.1:{port}/v1"),
-        "test-model",
-        "test-key",
-        None,
-        None,
-    )
-    .expect("the client builds");
+    let (provider, _root) = provider_for(&format!("http://127.0.0.1:{port}/v1"), None).await;
     let cancel = CancellationToken::new();
     let request_cancel = cancel.clone();
     let request = tokio::spawn(async move {
-        client
+        let mut sink = Fragments::default();
+        provider
             .stream_turn(
                 &[Message::user("answer")],
                 &json!([]),
                 None,
                 &request_cancel,
-                |_| {},
+                &mut sink,
             )
             .await
     });
@@ -1146,12 +1240,13 @@ async fn crossing_the_threshold_compacts_the_history_before_the_next_turn() {
     let agent = agent_for_with_context(
         &server,
         directory.path(),
+        100,
         ContextSettings {
-            context_limit: 100,
             threshold_percent: 60,
             ..ContextSettings::default()
         },
-    );
+    )
+    .await;
 
     // Run one: a bare prompt. It hands back the measurement run two seeds its
     // window with — the window itself lives on the frame, so a fresh run
@@ -1265,12 +1360,13 @@ async fn a_failed_summary_request_still_lets_the_run_finish() {
     let agent = agent_for_with_context(
         &server,
         directory.path(),
+        100,
         ContextSettings {
-            context_limit: 100,
             threshold_percent: 60,
             ..ContextSettings::default()
         },
-    );
+    )
+    .await;
 
     let sink = CollectingSink::default();
     let carried = agent
@@ -1339,7 +1435,7 @@ async fn without_a_limit_the_history_is_never_touched() {
     ])
     .await;
 
-    let agent = agent_for(&server, directory.path());
+    let agent = agent_for(&server, directory.path()).await;
 
     let sink = CollectingSink::default();
     let carried = agent
@@ -1430,7 +1526,7 @@ async fn a_streamed_tool_call_is_executed_and_fed_back() {
     ])
     .await;
 
-    let agent = agent_for(&server, directory.path());
+    let agent = agent_for(&server, directory.path()).await;
     let sink = CollectingSink::default();
 
     let _ = agent
@@ -1474,7 +1570,7 @@ async fn a_refused_command_is_reported_as_a_refusal() {
     ))
     .await;
 
-    let agent = agent_for(&server, directory.path());
+    let agent = agent_for(&server, directory.path()).await;
     let sink = CollectingSink::default();
 
     let _ = agent
@@ -1530,9 +1626,11 @@ async fn turning_the_guard_off_lets_a_destructive_command_through() {
         ToolRegistry::with_builtins(),
         &server,
         directory.path(),
+        0,
         ContextSettings::default(),
         settings,
-    );
+    )
+    .await;
     let sink = CollectingSink::default();
 
     let _ = agent
@@ -1571,7 +1669,7 @@ async fn an_unknown_tool_is_a_failure_not_a_crash() {
     ))
     .await;
 
-    let agent = agent_for(&server, directory.path());
+    let agent = agent_for(&server, directory.path()).await;
     let sink = CollectingSink::default();
 
     let _ = agent
@@ -1611,7 +1709,7 @@ async fn malformed_arguments_are_reported_back_to_the_model() {
     ))
     .await;
 
-    let agent = agent_for(&server, directory.path());
+    let agent = agent_for(&server, directory.path()).await;
     let sink = CollectingSink::default();
 
     let _ = agent
@@ -1648,7 +1746,7 @@ async fn a_cancelled_run_stops_without_finishing() {
     })])])
     .await;
 
-    let agent = agent_for(&server, directory.path());
+    let agent = agent_for(&server, directory.path()).await;
     let sink = CollectingSink::default();
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -1690,7 +1788,7 @@ async fn a_follow_up_run_replays_the_conversation_it_continues() {
     ]);
     let server = FakeServer::start(vec![answer.clone(), answer]).await;
 
-    let agent = agent_for(&server, directory.path());
+    let agent = agent_for(&server, directory.path()).await;
 
     // Run one: a bare prompt, nothing to replay.
     let sink = CollectingSink::default();
@@ -1791,8 +1889,10 @@ async fn a_read_image_call_hands_the_picture_to_the_model() {
         ToolRegistry::with_image_input(),
         &server,
         directory.path(),
+        0,
         ContextSettings::default(),
-    );
+    )
+    .await;
     let sink = CollectingSink::default();
 
     let _ = agent
@@ -1838,5 +1938,96 @@ async fn a_read_image_call_hands_the_picture_to_the_model() {
     assert!(
         !sink.transcript().contains("base64"),
         "base64 must never reach the transcript"
+    );
+}
+
+/// A non-streaming completion body, as a provider answers a compaction request.
+///
+/// `complete_turn` sends `stream: false`, so the reply is a plain JSON object
+/// rather than an SSE stream.
+fn completion(content: &str) -> String {
+    json!({
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": content },
+            "finish_reason": "stop",
+        }],
+        "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 },
+    })
+    .to_string()
+}
+
+/// The summariser carries the conversation verbatim — system prompt included —
+/// so the provider serves it from the prefix cache, with the instruction as the
+/// only new turn.
+#[tokio::test]
+async fn the_summary_request_reuses_the_conversation_and_appends_the_instruction() {
+    let server = FakeServer::start(vec![completion("brief")]).await;
+    let (provider, _root) = provider_for(&server.base_url, Some(0)).await;
+    let tools = json!([{ "type": "function" }]);
+    let history = vec![
+        Message::system("you are a coding agent"),
+        Message::user("list the files"),
+        Message::assistant("looking…".into(), Vec::new()),
+        Message::tool("call_1", "the file says 42"),
+    ];
+
+    let summary = crate::context::summarize(&history, &tools, &provider, &CancellationToken::new())
+        .await
+        .expect("the summary request succeeds")
+        .expect("a brief comes back");
+    assert_eq!(summary, "brief");
+
+    let sent: Value =
+        serde_json::from_str(&server.request_body(0)).expect("the request body is JSON");
+    let sent_messages = sent["messages"]
+        .as_array()
+        .expect("the request carries the conversation");
+    assert_eq!(
+        sent_messages.len(),
+        history.len() + 1,
+        "the conversation plus the one instruction: {sent_messages:?}"
+    );
+    assert_eq!(
+        sent_messages[0]["role"], "system",
+        "the conversation prefix travels whole"
+    );
+    let last = sent_messages
+        .last()
+        .expect("the instruction is the last turn");
+    assert_eq!(last["role"], "user");
+    assert!(
+        last["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("continuation brief"),
+        "the instruction is the one new turn: {last}"
+    );
+    assert!(
+        sent["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "the tool schema travels with the request to keep the cached prefix"
+    );
+}
+
+/// A conversation with nothing but its system prompt has nothing to summarise,
+/// so no request is made at all.
+#[tokio::test]
+async fn a_history_of_nothing_but_the_system_prompt_is_not_summarised() {
+    let server = FakeServer::start(vec![completion("brief")]).await;
+    let (provider, _root) = provider_for(&server.base_url, Some(0)).await;
+    let history = vec![Message::system("you are a coding agent")];
+
+    let summary =
+        crate::context::summarize(&history, &json!([]), &provider, &CancellationToken::new())
+            .await
+            .expect("an empty conversation is not an error");
+
+    assert_eq!(summary, None);
+    assert_eq!(
+        server.request_count(),
+        0,
+        "no request is made when there is nothing to summarise"
     );
 }

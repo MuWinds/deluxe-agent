@@ -357,6 +357,22 @@ impl CapabilityHub {
         self.files.write(path, contents).await
     }
 
+    /// Reads a credential by name, from the environment or the OS credential
+    /// store.
+    ///
+    /// `Ok(None)` means the name resolved to nothing; the only `Err` is an
+    /// invalid name. A component that stores a secret inline in its own config
+    /// can use this to prefer the machine's credential store when one exists.
+    pub async fn get_secret(&self, name: &str) -> Result<Option<String>> {
+        if name.is_empty() || name.len() > 256 || name.bytes().any(|byte| byte == 0) {
+            return Err(AgentError::invalid_params("Secret name is invalid"));
+        }
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || crate::config::resolve_secret(&name))
+            .await
+            .map_err(|error| AgentError::internal(format!("Secret lookup worker failed: {error}")))
+    }
+
     /// Stops every process and releases every HTTP response owned by this component.
     pub async fn shutdown(&self) {
         let processes = std::mem::take(&mut *self.raw.processes.lock().await);
@@ -580,20 +596,6 @@ impl CapabilityHub {
                 "HTTP transport URL must use http or https",
             ));
         }
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| AgentError::invalid_params("HTTP transport URL has no host"))?;
-        if !self
-            .permissions
-            .network_hosts
-            .iter()
-            .any(|allowed| allowed == "*" || allowed == host)
-        {
-            return Err(AgentError::new(
-                code::PLUGIN_PERMISSION_DENIED,
-                "HTTP transport host was not granted",
-            ));
-        }
         let method = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|_| AgentError::invalid_params("HTTP method is invalid"))?;
         let headers: BTreeMap<String, String> = serde_json::from_str(headers_json)
@@ -779,7 +781,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlisted_tools_and_undeclared_transports_are_denied_before_dispatch() {
+    async fn unlisted_tools_and_undeclared_processes_are_denied_before_dispatch() {
         let runtime = Arc::new(FakeRuntime {
             calls: AtomicUsize::new(0),
             output: ToolOutput::text("unexpected"),
@@ -811,12 +813,6 @@ mod tests {
             .expect_err("an undeclared process transport is denied");
         assert_eq!(error.code, code::PLUGIN_PERMISSION_DENIED);
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
-
-        let error = hub
-            .http_request("POST", "https://mcp.example.test/mcp", "{}", "{}")
-            .await
-            .expect_err("an undeclared HTTP transport is denied");
-        assert_eq!(error.code, code::PLUGIN_PERMISSION_DENIED);
     }
 
     #[tokio::test]
@@ -922,10 +918,7 @@ mod tests {
         let hub = CapabilityHub::new(
             project.path().to_path_buf(),
             project.path().to_path_buf(),
-            Permissions {
-                network_hosts: vec!["127.0.0.1".into()],
-                ..Default::default()
-            },
+            Permissions::default(),
             Arc::new(FakeRuntime {
                 calls: AtomicUsize::new(0),
                 output: ToolOutput::text("unused"),
@@ -936,7 +929,7 @@ mod tests {
         let metadata = hub
             .http_request("POST", &url, r#"{"content-type":"application/json"}"#, "{}")
             .await
-            .expect("the declared HTTP transport starts");
+            .expect("the HTTP transport starts");
         let handle = serde_json::from_str::<Value>(&metadata)
             .expect("the response metadata is JSON")
             .get("handle")

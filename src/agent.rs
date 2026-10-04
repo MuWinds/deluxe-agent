@@ -88,9 +88,12 @@ pub struct Agent {
     tools_schema: Value,
     /// Built once at construction by the injected prompt provider.
     system_prompt: String,
-    /// The user's context-window configuration: the model's limit and the
-    /// share of it that triggers compaction. Read per run, which is when a
-    /// fresh measurement window is built from it.
+    /// The model's context window, in tokens, as the provider Component
+    /// reported it when this agent was built. Zero disables compaction.
+    context_limit: u64,
+    /// The host's compaction policy: the share of the window that triggers
+    /// compaction and how much of the tail survives it. Read per run, which is
+    /// when a fresh measurement window is built from it.
     context_settings: ContextSettings,
 }
 
@@ -149,6 +152,7 @@ impl Agent {
     pub fn from_services(
         services: Arc<AgentServices>,
         working_directory: PathBuf,
+        context_limit: u64,
         context_settings: ContextSettings,
         system_prompt: String,
     ) -> Self {
@@ -159,6 +163,7 @@ impl Agent {
             working_directory,
             tools_schema,
             system_prompt,
+            context_limit,
             context_settings,
         }
     }
@@ -210,7 +215,7 @@ impl Agent {
                 // The measurement belonged to the pre-compaction shape and no
                 // longer describes what will go out next; the turn that
                 // follows re-measures.
-                *context = ContextWindow::new(context.settings());
+                *context = ContextWindow::new(self.context_limit, context.settings());
                 // The gauge has to forget the old figure too, or it would sit
                 // there claiming a token count that describes a conversation
                 // which no longer exists.
@@ -326,7 +331,7 @@ impl Agent {
         // conversation measured: the window itself lives on the frame, so a
         // long session's very first request is already guarded instead of
         // waiting for one round-trip to discover it is too big.
-        let mut context = ContextWindow::new(self.context_settings);
+        let mut context = ContextWindow::new(self.context_limit, self.context_settings);
         context.restore(carried);
 
         // Deliberately uncapped. A long-horizon task can legitimately take

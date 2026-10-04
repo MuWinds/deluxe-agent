@@ -1,8 +1,10 @@
-//! Configuration and secret storage.
+//! Configuration and secret lookup.
 //!
-//! The API key never goes in the config file. It is read from the environment
-//! first, then from the OS credential store, and a key typed into the settings
-//! panel lives only in memory for that session.
+//! The host stores no model endpoint, no model name, and no API key: the whole
+//! provider model is owned by the `llm-provider` Component, which keeps it in
+//! its own configuration file and resolves credentials through the host's
+//! `get-secret` capability. What is left here is the retry policy and the
+//! generic credential lookup that capability is built on.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -15,20 +17,15 @@ use crate::plugins::PluginSettings;
 use crate::theme::ThemeChoice;
 use crate::tools::ToolSettings;
 
-/// Read before the credential store, so a shell export always wins.
-pub const API_KEY_ENV: &str = "DELUXE_AGENT_API_KEY";
-
-/// Overrides the config directory, so a shell export always wins — the same
-/// escape hatch [`API_KEY_ENV`] gives the key. A portable install, a second
-/// profile, or a test that must not touch the user's real state can point it
-/// somewhere else.
+/// Overrides the config directory, so a shell export always wins. A portable
+/// install, a second profile, or a test that must not touch the user's real
+/// state can point it somewhere else.
 pub const CONFIG_DIR_ENV: &str = "DELUXE_AGENT_CONFIG_DIR";
 
 /// The most additional model-request attempts a config may enable.
 pub const MAX_RETRY_COUNT: u32 = 10;
 
 const KEYRING_SERVICE: &str = "deluxe-agent";
-const KEYRING_ACCOUNT: &str = "llm-api-key";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -38,9 +35,9 @@ pub struct Config {
     pub tools: ToolSettings,
     /// Persisted so the 视图 menu's choice survives a restart.
     pub theme: ThemeChoice,
-    /// The model's context window and the share of it that triggers
-    /// compaction. Zero tokens disables compaction, which is what a config
-    /// written before the feature existed must mean.
+    /// When and how aggressively to compact. The window itself is not here:
+    /// it belongs to the model provider Component, which reports it through
+    /// `describe()`.
     #[serde(default)]
     pub context: ContextSettings,
     /// The projects the sidebar lists, most recently added first.
@@ -110,26 +107,14 @@ impl Config {
     }
 }
 
+/// The model retry policy the host still owns.
+///
+/// Everything else about reaching a model — the endpoint, the model name, the
+/// key, the context window — is owned by the `llm-provider` Component and lives
+/// in that plugin's own configuration file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct LlmConfig {
-    pub base_url: String,
-    pub model: String,
-    /// Which input modalities the configured model accepts.
-    ///
-    /// Defaults to text only, so a config written before the field existed
-    /// keeps `read_image` unregistered — the safe reading of "the user has not
-    /// said this model can see images".
-    #[serde(default = "default_input_modalities")]
-    pub input: Vec<InputModality>,
-    /// The `max_tokens` sent with every request, or `None` to leave the
-    /// provider's own ceiling in force.
-    ///
-    /// Omitted from the file when unset, so a config written before the field
-    /// existed — and one where the user never set a budget — carry no key at
-    /// all rather than a number a provider would read as a real one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_output_tokens: Option<u32>,
     /// Additional attempts made after a failed model request. Defaults to
     /// three and is bounded by [`MAX_RETRY_COUNT`].
     pub retry_count: u32,
@@ -137,38 +122,8 @@ pub struct LlmConfig {
     pub retry_forever: bool,
 }
 
-/// One input modality a model can accept.
-///
-/// The vocabulary is closed, mirroring the harness: a model accepts text, or
-/// text and images, and nothing else.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum InputModality {
-    Text,
-    Image,
-}
-
-fn default_input_modalities() -> Vec<InputModality> {
-    vec![InputModality::Text]
-}
-
 impl LlmConfig {
-    /// Whether the model declares image input.
-    ///
-    /// An empty list reads as "not declared", which is text-only: a model that
-    /// cannot see images must never be offered `read_image`.
-    pub fn supports_images(&self) -> bool {
-        self.input.contains(&InputModality::Image)
-    }
-
-    /// Drops an empty modality list back to text-only.
-    ///
-    /// A hand-edited config can leave `input = []`, which means the same thing
-    /// as text-only at runtime but would render as both boxes unticked.
     fn normalize(&mut self) {
-        if self.input.is_empty() {
-            self.input = default_input_modalities();
-        }
         self.retry_count = self.retry_count.min(MAX_RETRY_COUNT);
     }
 }
@@ -176,10 +131,6 @@ impl LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            base_url: "https://api.deepseek.com/v1".into(),
-            model: "deepseek-chat".into(),
-            input: default_input_modalities(),
-            max_output_tokens: None,
             retry_count: 3,
             retry_forever: false,
         }
@@ -254,34 +205,41 @@ pub fn save_to(path: &Path, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// The API key, from the environment or the OS credential store.
-pub fn resolve_api_key() -> Option<String> {
-    if let Ok(key) = std::env::var(API_KEY_ENV) {
-        if !key.trim().is_empty() {
-            return Some(key);
-        }
+/// Reads a credential by name, from the environment or the OS credential store.
+///
+/// The environment variable is `DELUXE_AGENT_SECRET_<NAME>`, where `<NAME>` is
+/// the uppercased name with every non-alphanumeric byte replaced by `_`. `None`
+/// means the name resolved to nothing — including an unavailable credential
+/// store, which is logged rather than surfaced so a missing keyring cannot fail
+/// a run. This backs the host's `get-secret` capability, which the model
+/// provider Component calls for a key it does not hold inline.
+pub fn resolve_secret(name: &str) -> Option<String> {
+    if let Some(value) = secret_from_env(name) {
+        return Some(value);
     }
-    load_api_key()
-}
-
-fn load_api_key() -> Option<String> {
-    match keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
-        .and_then(|entry| entry.get_password())
-    {
-        Ok(key) if !key.trim().is_empty() => Some(key),
+    match keyring::Entry::new(KEYRING_SERVICE, name).and_then(|entry| entry.get_password()) {
+        Ok(value) if !value.trim().is_empty() => Some(value),
         Ok(_) => None,
         Err(error) => {
-            tracing::debug!(%error, "no API key in the credential store");
+            tracing::debug!(%error, name, "no secret in the credential store");
             None
         }
     }
 }
 
-/// Stores the API key in the OS credential store.
-pub fn store_api_key(key: &str) -> Result<()> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
-        .and_then(|entry| entry.set_password(key))
-        .map_err(|error| AgentError::internal(format!("Failed to store the API key: {error}")))
+/// Maps a secret name onto its environment variable, or `None` when unset.
+fn secret_from_env(name: &str) -> Option<String> {
+    let mut variable = String::from("DELUXE_AGENT_SECRET_");
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            variable.push(byte.to_ascii_uppercase() as char);
+        } else {
+            variable.push('_');
+        }
+    }
+    std::env::var(variable)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -361,10 +319,8 @@ mod tests {
         let mut config = Config::default();
         config.tools.working_directory = PathBuf::from("/tmp/workspace");
         config.tools.block_destructive_commands = false;
-        config.llm.model = "some-model".into();
         config.llm.retry_count = 4;
         config.llm.retry_forever = true;
-        config.context.context_limit = 131_072;
         config.context.threshold_percent = 45;
         config.context.keep_recent_turns = 3;
 
@@ -376,10 +332,8 @@ mod tests {
             PathBuf::from("/tmp/workspace")
         );
         assert!(!parsed.tools.block_destructive_commands);
-        assert_eq!(parsed.llm.model, "some-model");
         assert_eq!(parsed.llm.retry_count, 4);
         assert!(parsed.llm.retry_forever);
-        assert_eq!(parsed.context.context_limit, 131_072);
         assert_eq!(parsed.context.threshold_percent, 45);
         assert_eq!(parsed.context.keep_recent_turns, 3);
     }
@@ -387,84 +341,47 @@ mod tests {
     #[test]
     fn an_empty_toml_falls_back_to_defaults() {
         let parsed: Config = toml::from_str("").unwrap();
-        assert_eq!(parsed.llm.base_url, LlmConfig::default().base_url);
         assert_eq!(
             parsed.tools.working_directory,
             ToolSettings::default().working_directory
         );
-        // No context section: compaction stays off until the user turns it on.
-        assert_eq!(parsed.context.context_limit, 0);
-        // A file without the field keeps a tail rather than folding everything.
+        // No context section: the compaction policy comes from defaults, and a
+        // file without the tail field keeps one rather than folding everything.
+        assert_eq!(parsed.context, ContextSettings::default());
         assert_eq!(parsed.context.keep_recent_turns, 2);
         assert_eq!(parsed.llm.retry_count, 3);
         assert!(!parsed.llm.retry_forever);
     }
 
     #[test]
-    fn a_config_written_before_the_context_section_existed_defaults_to_no_compaction() {
-        let parsed: Config = toml::from_str("[llm]\nmodel = \"m\"\n").unwrap();
+    fn a_config_written_before_the_context_section_existed_uses_the_default_policy() {
+        let parsed: Config = toml::from_str("[llm]\nretryCount = 2\n").unwrap();
         assert_eq!(parsed.context, ContextSettings::default());
-        assert_eq!(parsed.context.context_limit, 0);
     }
 
     #[test]
-    fn a_config_still_carrying_the_removed_reasoning_toggle_loads() {
-        // The toggle is gone — reasoning is always rendered — so an old file
-        // that still names it must load rather than fail on the stray key.
-        let parsed: Config =
-            toml::from_str("[llm]\nmodel = \"m\"\nshowReasoning = false\n").unwrap();
-        assert_eq!(parsed.llm.model, "m");
+    fn a_config_still_carrying_removed_llm_fields_loads() {
+        // The endpoint, model, modality list, and output budget all moved into
+        // the provider Component, so a file that still names them must load
+        // rather than fail on the stray keys.
+        let parsed: Config = toml::from_str(
+            "[llm]\nbaseUrl = \"https://example.com\"\nmodel = \"m\"\nmaxOutputTokens = 8192\ninput = [\"text\"]\nretryCount = 2\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.llm.retry_count, 2);
     }
 
     #[test]
     fn a_config_written_before_the_tools_section_existed_still_loads() {
         // Only `[llm]` is present, so `tools` must come entirely from defaults.
-        let parsed: Config = toml::from_str("[llm]\nmodel = \"m\"\n").unwrap();
-        assert_eq!(parsed.llm.model, "m");
+        let parsed: Config = toml::from_str("[llm]\nretryCount = 2\n").unwrap();
+        assert_eq!(parsed.llm.retry_count, 2);
         assert!(parsed.tools.block_destructive_commands);
     }
 
     #[test]
-    fn the_default_model_accepts_text_only() {
-        let config = Config::default();
-        assert_eq!(config.llm.input, vec![InputModality::Text]);
-        assert!(!config.llm.supports_images());
-    }
-
-    #[test]
-    fn image_input_round_trips_through_toml() {
-        let mut config = Config::default();
-        config.llm.input = vec![InputModality::Text, InputModality::Image];
-
-        let text = toml::to_string_pretty(&config).unwrap();
-        let parsed: Config = toml::from_str(&text).unwrap();
-
-        assert_eq!(
-            parsed.llm.input,
-            vec![InputModality::Text, InputModality::Image]
-        );
-        assert!(parsed.llm.supports_images());
-    }
-
-    #[test]
-    fn a_config_written_before_the_modalities_existed_is_text_only() {
-        // No `input` key: the model must not be handed `read_image`.
-        let parsed: Config = toml::from_str("[llm]\nmodel = \"m\"\n").unwrap();
-        assert_eq!(parsed.llm.input, vec![InputModality::Text]);
-        assert!(!parsed.llm.supports_images());
-    }
-
-    #[test]
-    fn an_empty_modality_list_normalises_back_to_text_only() {
-        let mut config: Config = toml::from_str("[llm]\nmodel = \"m\"\ninput = []\n").unwrap();
-        assert!(config.llm.input.is_empty());
-        config.llm.normalize();
-        assert_eq!(config.llm.input, vec![InputModality::Text]);
-    }
-
-    #[test]
     fn retry_count_is_bounded_when_loading_a_hand_edited_config() {
-        let mut config: Config = toml::from_str("[llm]\nmodel = \"m\"\nretryCount = 99\n").unwrap();
+        let mut config: Config = toml::from_str("[llm]\nretryCount = 99\n").unwrap();
 
         config.normalize();
 
@@ -551,13 +468,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("config.toml");
         let mut config = Config::default();
-        config.llm.model = "some-model".into();
+        config.llm.retry_count = 7;
 
         save_to(&path, &config).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
-        assert_eq!(parsed.llm.model, "some-model");
+        assert_eq!(parsed.llm.retry_count, 7);
         assert!(
             path.parent().unwrap().is_dir(),
             "the parent directory is created"

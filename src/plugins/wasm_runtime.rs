@@ -47,6 +47,17 @@ mod prompt_bindings {
     });
 }
 
+// A fourth optional view: only a model provider exports `llm`, so a binding
+// that fails here means "this Component is not a model provider".
+mod llm_bindings {
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "llm-provider-plugin",
+        imports: { default: async },
+        exports: { default: async },
+    });
+}
+
 const CALL_FUEL: u64 = 10_000_000;
 
 /// Compiles a component file without instantiating it or granting capabilities.
@@ -336,6 +347,25 @@ impl bindings::deluxe::harness::host::HostWithStore for HostState {
             capabilities.http_close(handle).await;
         }
     }
+
+    fn get_secret<T>(
+        accessor: &Accessor<T, Self>,
+        name: String,
+    ) -> impl Future<Output = std::result::Result<Option<String>, String>> + Send {
+        let (capabilities, cancel) = accessor.with(|mut access| {
+            let state: &mut StoreState = access.get();
+            (state.capabilities.clone(), state.cancel.clone())
+        });
+        async move {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err("capability call cancelled".into()),
+                result = capabilities.get_secret(&name) => {
+                    result.map_err(|error| format!("{}: {}", error.code, error.message))
+                }
+            }
+        }
+    }
 }
 
 pub enum Operation {
@@ -360,6 +390,21 @@ pub enum Operation {
     /// Asks the Component for the prompt text it contributes for its bound
     /// scope. Only a Component that exports the prompt interface can serve it.
     PromptSections,
+    /// Asks the Component for its generic self-description (`plugin.describe`).
+    /// Every Component answers it; a plugin with nothing to declare returns
+    /// `{}`.
+    Describe,
+    /// Shapes a canonical, provider-neutral request JSON into an HTTP request.
+    LlmBuildRequest(String),
+    /// Feeds one response chunk for a stream and returns the decoded events.
+    LlmParseStream {
+        stream_id: String,
+        chunk: Vec<u8>,
+    },
+    /// Releases the per-stream state a Component accumulated.
+    LlmCloseStream(String),
+    /// Decodes a non-streaming response body into a turn.
+    LlmParseComplete(Vec<u8>),
 }
 
 struct Request {
@@ -498,6 +543,8 @@ type Instance = (
     Option<renderer_bindings::RendererPlugin>,
     // Present only when the Component exports the prompt interface.
     Option<prompt_bindings::PromptPlugin>,
+    // Present only when the Component exports the llm interface.
+    Option<llm_bindings::LlmProviderPlugin>,
     ComponentInstance,
 );
 
@@ -534,13 +581,16 @@ async fn instantiate(
     // Same optional shape for the prompt provider: a failure only means this
     // Component contributes no prompt text.
     let prompt = prompt_bindings::PromptPlugin::new(&mut store, &instance).ok();
-    let mut instance = (store, bindings, renderer, prompt, instance);
+    // And for the model provider: a failure only means this Component is not a
+    // model provider.
+    let llm = llm_bindings::LlmProviderPlugin::new(&mut store, &instance).ok();
+    let mut instance = (store, bindings, renderer, prompt, llm, instance);
     configure(&mut instance).await?;
     Ok(instance)
 }
 
 async fn configure(instance: &mut Instance) -> Result<()> {
-    let (store, bindings, _renderer, _prompt, component_instance) = instance;
+    let (store, bindings, _renderer, _prompt, _llm, component_instance) = instance;
     store.set_fuel(CALL_FUEL).map_err(runtime_error)?;
     let plugin = bindings.deluxe_harness_plugin();
     component_instance
@@ -554,7 +604,7 @@ async fn configure(instance: &mut Instance) -> Result<()> {
 }
 
 async fn call(
-    (store, bindings, renderer, prompt, instance): &mut Instance,
+    (store, bindings, renderer, prompt, llm, instance): &mut Instance,
     operation: Operation,
 ) -> Result<String> {
     if renderer.is_none()
@@ -574,6 +624,20 @@ async fn call(
             "Component does not implement the prompt ABI",
         ));
     }
+    if llm.is_none()
+        && matches!(
+            operation,
+            Operation::LlmBuildRequest(_)
+                | Operation::LlmParseStream { .. }
+                | Operation::LlmCloseStream(_)
+                | Operation::LlmParseComplete(_)
+        )
+    {
+        return Err(AgentError::new(
+            code::PLUGIN_LOAD_FAILED,
+            "Component does not implement the llm ABI",
+        ));
+    }
     store.set_fuel(CALL_FUEL).map_err(runtime_error)?;
     let plugin = bindings.deluxe_harness_plugin();
     let renderer = renderer
@@ -582,6 +646,7 @@ async fn call(
     let prompt = prompt
         .as_ref()
         .map(|bindings| bindings.deluxe_harness_prompt());
+    let llm = llm.as_ref().map(|bindings| bindings.deluxe_harness_llm());
     let output = instance
         .run_concurrent(&mut *store, async move |accessor| match operation {
             Operation::ListTools => plugin
@@ -604,6 +669,7 @@ async fn call(
                 .call_close_surface(accessor, surface)
                 .await
                 .map(|_| Ok::<String, String>(String::new())),
+            Operation::Describe => plugin.call_describe(accessor).await,
             Operation::RenderMessage(request) => match renderer {
                 Some(renderer) => renderer.call_render_message(accessor, request).await,
                 None => Ok(Err("Component does not implement the renderer ABI".into())),
@@ -615,6 +681,25 @@ async fn call(
             Operation::PromptSections => match prompt {
                 Some(prompt) => prompt.call_prompt_sections(accessor).await,
                 None => Ok(Err("Component does not implement the prompt ABI".into())),
+            },
+            Operation::LlmBuildRequest(request) => match llm {
+                Some(llm) => llm.call_build_request(accessor, request).await,
+                None => Ok(Err("Component does not implement the llm ABI".into())),
+            },
+            Operation::LlmParseStream { stream_id, chunk } => match llm {
+                Some(llm) => llm.call_parse_stream(accessor, stream_id, chunk).await,
+                None => Ok(Err("Component does not implement the llm ABI".into())),
+            },
+            Operation::LlmCloseStream(stream_id) => match llm {
+                Some(llm) => llm
+                    .call_close_stream(accessor, stream_id)
+                    .await
+                    .map(|_| Ok::<String, String>(String::new())),
+                None => Ok(Err("Component does not implement the llm ABI".into())),
+            },
+            Operation::LlmParseComplete(body) => match llm {
+                Some(llm) => llm.call_parse_complete(accessor, body).await,
+                None => Ok(Err("Component does not implement the llm ABI".into())),
             },
         })
         .await

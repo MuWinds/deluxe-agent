@@ -62,7 +62,9 @@ pub enum Marker {
     Bullet,
     /// Carries the number the source wrote, so `3.` does not silently become
     /// `1.`.
-    Ordered { value: u64 },
+    Ordered {
+        value: u64,
+    },
 }
 
 /// A table column's alignment, from its delimiter row.
@@ -77,7 +79,11 @@ pub enum ColumnAlign {
 
 /// One block of a message body, tagged for the wire.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum Block {
     Heading {
         level: u8,
@@ -698,7 +704,11 @@ fn heading_size(level: u8) -> f32 {
 fn block_to_nodes(block: &Block, metrics: &Metrics) -> Vec<Node> {
     match block {
         Block::Heading { level, spans } => {
-            vec![Node::text(spans_to_runs(spans, heading_size(*level), ColorRole::Text))]
+            vec![Node::text(spans_to_runs(
+                spans,
+                heading_size(*level),
+                ColorRole::Text,
+            ))]
         }
         Block::Paragraph { spans } => {
             vec![Node::text(spans_to_runs(spans, BODY_SIZE, ColorRole::Text))]
@@ -715,7 +725,11 @@ fn block_to_nodes(block: &Block, metrics: &Metrics) -> Vec<Node> {
             let marker_box = Node::Align {
                 align: HorizontalAlign::Right,
                 width: Some(LIST_MARKER),
-                child: Box::new(Node::text(vec![Run::text(token, BODY_SIZE, ColorRole::Muted)])),
+                child: Box::new(Node::text(vec![Run::text(
+                    token,
+                    BODY_SIZE,
+                    ColorRole::Muted,
+                )])),
             };
             vec![Node::row(
                 vec![
@@ -938,17 +952,13 @@ fn measure_columns(
     for (column, cell) in header.iter().enumerate().take(columns) {
         let text = cell_text(cell);
         metrics[column].max = metrics[column].max.max(estimate(&text, char_width));
-        metrics[column].token = metrics[column]
-            .token
-            .max(longest_token(&text, char_width));
+        metrics[column].token = metrics[column].token.max(longest_token(&text, char_width));
     }
     for row in rows {
         for (column, cell) in row.iter().enumerate().take(columns) {
             let text = cell_text(cell);
             metrics[column].max = metrics[column].max.max(estimate(&text, char_width));
-            metrics[column].token = metrics[column]
-                .token
-                .max(longest_token(&text, char_width));
+            metrics[column].token = metrics[column].token.max(longest_token(&text, char_width));
         }
     }
     for (column, metric) in metrics.iter_mut().enumerate() {
@@ -1089,11 +1099,7 @@ fn should_render_records(
 }
 
 fn source_node(source: &str) -> Node {
-    Node::text(vec![Run::mono(
-        source,
-        TABLE_SIZE * 0.92,
-        ColorRole::Muted,
-    )])
+    Node::text(vec![Run::mono(source, TABLE_SIZE * 0.92, ColorRole::Muted)])
 }
 
 fn records_node(

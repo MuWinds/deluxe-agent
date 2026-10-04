@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::llm::{AssistantTurn, Message, ThinkingLevel, ToolCall};
+use crate::llm::{Message, ToolCall};
+use crate::plugins::llm::LlmProvider;
 use crate::plugins::{PluginCatalogue, PluginSettings, Scope};
 use crate::session::Session;
 use crate::tools::jobs::JobSnapshot;
@@ -31,30 +32,6 @@ pub enum LlmStreamEvent {
 pub trait LlmStreamSink: Send {
     /// Receives one provider stream event without performing blocking work.
     fn push(&mut self, event: LlmStreamEvent);
-}
-
-#[async_trait]
-pub trait LlmProvider: Send + Sync {
-    /// Streams one assistant turn and forwards provider fragments to `sink`.
-    async fn stream_turn(
-        &self,
-        messages: &[Message],
-        tools: &Value,
-        thinking: Option<ThinkingLevel>,
-        cancel: &CancellationToken,
-        sink: &mut dyn LlmStreamSink,
-    ) -> Result<AssistantTurn>;
-
-    /// Completes one non-streaming assistant turn.
-    ///
-    /// `tools` is the conversation's own schema, sent so a summarisation
-    /// request keeps the cached prefix it shares with the turns around it.
-    async fn complete_turn(
-        &self,
-        messages: &[Message],
-        tools: &Value,
-        cancel: &CancellationToken,
-    ) -> Result<AssistantTurn>;
 }
 
 #[derive(Debug, Clone)]
@@ -179,12 +156,6 @@ pub trait ConfigStore: Send + Sync {
 }
 
 #[async_trait]
-pub trait SecretStore: Send + Sync {
-    /// Persists the model credential in the operating system's secret store.
-    async fn save_api_key(&self, api_key: &str) -> Result<()>;
-}
-
-#[async_trait]
 pub trait PluginManager: Send + Sync {
     /// Discovers the catalogue for the supplied trust settings.
     async fn discover(&self, settings: PluginSettings) -> Result<Arc<PluginCatalogue>>;
@@ -220,7 +191,7 @@ pub trait AgentEventSink: Send + Sync {
 }
 
 pub struct AgentServices {
-    pub llm: Arc<dyn LlmProvider>,
+    pub llm: Arc<LlmProvider>,
     pub tools: Arc<dyn ToolRuntime>,
     pub context: Arc<dyn ContextCompactor>,
     pub prompts: Arc<dyn PromptProvider>,

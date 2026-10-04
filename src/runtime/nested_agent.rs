@@ -35,7 +35,8 @@ use crate::context::ContextSettings;
 use crate::error::{AgentError, Result};
 use crate::harness::services::native_services;
 use crate::harness::{AgentEvent, AgentEventSink, JobRuntime, NestedAgentRuntime};
-use crate::llm::{LlmClient, Message, UserTurn};
+use crate::llm::{Message, UserTurn};
+use crate::plugins::llm::LlmProvider;
 use crate::tools::{ToolRegistry, ToolSettings};
 
 use super::prompt::{build_role_prompt, NativePromptProvider};
@@ -58,9 +59,12 @@ struct AgentRequest {
 /// The native [`NestedAgentRuntime`]: the parent's model over the parent's
 /// tools, minus the delegating tool itself.
 pub struct NativeNestedAgent {
-    llm: LlmClient,
+    llm: Arc<LlmProvider>,
     registry: Arc<ToolRegistry>,
     settings: Arc<RwLock<ToolSettings>>,
+    /// The provider-reported context window, inherited from the parent so a
+    /// sub-agent compacts on the same terms.
+    context_limit: u64,
     context_settings: ContextSettings,
     project: PathBuf,
     jobs: Arc<dyn JobRuntime>,
@@ -70,10 +74,14 @@ pub struct NativeNestedAgent {
 
 impl NativeNestedAgent {
     /// Wires a nested-agent runner to the parent's model, tools, and jobs.
+    // The collaborators all arrive separately because this is assembled once,
+    // at project build time; bundling them would only move the list elsewhere.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        llm: LlmClient,
+        llm: Arc<LlmProvider>,
         registry: Arc<ToolRegistry>,
         settings: Arc<RwLock<ToolSettings>>,
+        context_limit: u64,
         context_settings: ContextSettings,
         project: PathBuf,
         jobs: Arc<dyn JobRuntime>,
@@ -83,6 +91,7 @@ impl NativeNestedAgent {
             llm,
             registry,
             settings,
+            context_limit,
             context_settings,
             project,
             jobs,
@@ -100,6 +109,7 @@ impl NativeNestedAgent {
         let llm = self.llm.clone();
         let registry = self.registry.clone();
         let settings = self.settings.clone();
+        let context_limit = self.context_limit;
         let context_settings = self.context_settings;
         let project = self.project.clone();
         let forwarder = self.sink.clone();
@@ -111,6 +121,7 @@ impl NativeNestedAgent {
                     llm,
                     registry,
                     settings,
+                    context_limit,
                     context_settings,
                     project,
                     request,
@@ -136,6 +147,7 @@ impl NestedAgentRuntime for NativeNestedAgent {
             self.llm.clone(),
             self.registry.clone(),
             self.settings.clone(),
+            self.context_limit,
             self.context_settings,
             self.project.clone(),
             request,
@@ -176,9 +188,10 @@ fn parse_request(request_json: &str) -> Result<AgentRequest> {
 /// it inline.
 #[allow(clippy::too_many_arguments)]
 async fn run_agent(
-    llm: LlmClient,
+    llm: Arc<LlmProvider>,
     registry: Arc<ToolRegistry>,
     settings: Arc<RwLock<ToolSettings>>,
+    context_limit: u64,
     context_settings: ContextSettings,
     project: PathBuf,
     request: AgentRequest,
@@ -199,7 +212,13 @@ async fn run_agent(
     ));
     let tools = services.tools.descriptors();
     let system_prompt = build_role_prompt(&request.instructions, &tools);
-    let agent = Agent::from_services(services, project, context_settings, system_prompt);
+    let agent = Agent::from_services(
+        services,
+        project,
+        context_limit,
+        context_settings,
+        system_prompt,
+    );
     let history: [Message; 0] = [];
     agent
         .run(

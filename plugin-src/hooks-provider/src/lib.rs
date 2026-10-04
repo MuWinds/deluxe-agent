@@ -103,7 +103,10 @@ fn matches_tool(spec: &HookSpec, tool: &str) -> bool {
 }
 
 fn event_field<'a>(event: &'a serde_json::Value, name: &str) -> &'a str {
-    event.get(name).and_then(serde_json::Value::as_str).unwrap_or("")
+    event
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
 }
 
 fn ui_document(request: &serde_json::Value) -> String {
@@ -147,6 +150,12 @@ impl Guest for HooksProvider {
             .map_err(|_| "hook state is poisoned")?
             .clone_from(&hooks);
         Ok(())
+    }
+
+    async fn describe() -> Result<String, String> {
+        // A hooks provider contributes event handlers, not model metadata; the
+        // host ignores every key this could carry.
+        Ok("{}".into())
     }
 
     async fn list_tools() -> String {

@@ -296,7 +296,9 @@ pub fn build_display(
     _metrics: &Metrics,
 ) -> Vec<Node> {
     let running = result.is_none();
-    let output = result.map(|result| result.output.as_str()).unwrap_or_default();
+    let output = result
+        .map(|result| result.output.as_str())
+        .unwrap_or_default();
     let icon = tool_icon(name);
 
     let (title, added, removed, copy, lines) = match name {
@@ -556,7 +558,11 @@ fn body_runs(lines: &[Line]) -> Vec<Run> {
             LineKind::Plain => (MARKER_WIDTH, ColorRole::Text, None),
         };
         if let Some(num) = line.num {
-            runs.push(Run::mono(format!("{num:>4}  "), CODE_SIZE, ColorRole::Muted));
+            runs.push(Run::mono(
+                format!("{num:>4}  "),
+                CODE_SIZE,
+                ColorRole::Muted,
+            ));
         }
         let mut run = Run::mono(format!("{marker}{}", line.text), CODE_SIZE, color);
         run.background = background;

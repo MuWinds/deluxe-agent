@@ -16,6 +16,7 @@ use crate::attachments::ImageRef;
 use crate::config::Config;
 use crate::ipc::{Cmd, Event, JobView, RunId};
 use crate::llm::ThinkingLevel;
+use crate::plugins::descriptor::PluginDescriptor;
 use crate::plugins::PluginCatalogue;
 use crate::session::{Session, Step};
 
@@ -64,11 +65,21 @@ pub struct Paths {
 /// Application state that can be folded and tested without a GUI context.
 pub struct App {
     pub(super) plugin_surface: Option<super::view_model::PluginSurfaceView>,
+    /// The plugin-contributed inline control on the composer row, if any. It is
+    /// adopted from the worker's snapshots rather than opened by the GUI, so it
+    /// has no separate request bookkeeping.
+    pub(super) composer: Option<super::view_model::PluginSurfaceView>,
     pub(super) cmd_tx: mpsc::UnboundedSender<Cmd>,
     pub(super) events: mpsc::UnboundedReceiver<Event>,
 
     pub(super) config: Config,
-    pub(super) api_key: String,
+    /// The model provider plugin's self-description, read from the plugin. The
+    /// host owns neither the model name nor the key, so the image entry is
+    /// gated on `image_input` and the context gauge reads `context_tokens`.
+    pub(super) llm_descriptor: PluginDescriptor,
+    /// Whether the model-provider plugin loaded. False means no run can reach a
+    /// model, and the composer says so instead of offering to send.
+    pub(super) llm_available: bool,
     pub(super) catalogue: Arc<PluginCatalogue>,
     pub(super) paths: Paths,
 
@@ -83,15 +94,12 @@ pub struct App {
     pub(super) next_config_request_id: u64,
     pub(super) pending_config_saves: HashMap<u64, ConfigSurface>,
     pub(super) config_save_requests: HashMap<ConfigSurface, u64>,
-    pub(super) pending_api_key_save: Option<u64>,
     pub(super) pending_plugin_request: Option<u64>,
 
     pub(super) prompt: String,
     pub(super) pending_images: Vec<ImageRef>,
     pub(super) thinking: Option<ThinkingLevel>,
     pub(super) search: String,
-    pub(super) context_limit_text: String,
-    pub(super) max_output_tokens_text: String,
     pub(super) expanded_reasoning: HashSet<Uuid>,
     pub(super) stick_to_bottom: bool,
     pub(super) jobs: Vec<JobView>,

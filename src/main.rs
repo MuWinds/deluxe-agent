@@ -25,13 +25,14 @@ use tokio_util::sync::CancellationToken;
 use agent::RunRequest;
 use app::{App, EventSink, GuiResources, Paths, RepaintSignal};
 use harness::{
-    AgentEvent, AgentEventSink, ConfigStore, NativeConfigStore, NativePluginManager,
-    NativeSecretStore, PluginManager, SecretStore, SessionStore,
+    AgentEvent, AgentEventSink, ConfigStore, NativeConfigStore, NativePluginManager, PluginManager,
+    SessionStore,
 };
 use ipc::{Cmd, Event, JobView, LlmSettings, RunId};
 use plugins::capabilities::CapabilityHub;
+use plugins::descriptor::PluginDescriptor;
 use plugins::runtime::{PluginUiEvent, PluginUiExecutor, SurfaceHandle};
-use plugins::ui_protocol::SurfaceRequest;
+use plugins::ui_protocol::{SurfaceRequest, COMPOSER_SURFACE_ID};
 use plugins::wasm_manifest::Permissions;
 use plugins::wasm_runtime::{ComponentActor, Operation};
 use plugins::PluginCatalogue;
@@ -99,7 +100,6 @@ fn main() -> eframe::Result<()> {
     // Resolved before the window exists and handed to it, so a save writes the
     // same file the load read rather than re-deriving it from the environment.
     let config_path = config::config_path();
-    let api_key = config::resolve_api_key().unwrap_or_default();
     // Read before the window exists, so the sidebar shows the previous run's
     // sessions on the very first frame rather than flashing empty.
     let session_store: Arc<dyn SessionStore> =
@@ -139,8 +139,6 @@ fn main() -> eframe::Result<()> {
             Arc::new(PluginCatalogue::default())
         }
     };
-    let secret_store: Arc<dyn SecretStore> = Arc::new(NativeSecretStore::new());
-
     let settings = Arc::new(RwLock::new(config.tools.clone()));
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
@@ -152,7 +150,6 @@ fn main() -> eframe::Result<()> {
         home: home.clone(),
         session_store,
         config_store,
-        secret_store,
         plugin_manager,
     };
 
@@ -189,14 +186,9 @@ fn main() -> eframe::Result<()> {
             // The model settings are global worker state, so they are pushed
             // once here; every session and every run uses whatever is current.
             let _ = cmd_tx.send(Cmd::SetLlmSettings(Box::new(LlmSettings {
-                base_url: config.llm.base_url.clone(),
-                model: config.llm.model.clone(),
                 context: config.context,
-                max_output_tokens: config.llm.max_output_tokens,
                 retry_count: config.llm.retry_count,
                 retry_forever: config.llm.retry_forever,
-                input: config.llm.input.clone(),
-                api_key: api_key.clone(),
             })));
 
             Ok(Box::new(AgentFrame {
@@ -204,7 +196,6 @@ fn main() -> eframe::Result<()> {
                     cmd_tx,
                     event_rx,
                     config,
-                    api_key,
                     sessions,
                     catalogue,
                     Paths { config_path },
@@ -227,7 +218,6 @@ struct Worker {
     plugins: Arc<PluginCatalogue>,
     session_store: Arc<dyn SessionStore>,
     config_store: Arc<dyn ConfigStore>,
-    secret_store: Arc<dyn SecretStore>,
     plugin_manager: Arc<dyn PluginManager>,
 }
 
@@ -270,6 +260,135 @@ async fn load_renderer(
             None
         }
     }
+}
+
+/// Loads the model provider's Component actor, if the plugin is enabled.
+///
+/// Returns `None` when the plugin is disabled or missing, or when its Component
+/// fails to load; the worker then reports the provider as unavailable and every
+/// run fails with a clear message instead of silently using no model. The hub
+/// is bound to the global configuration root, so the Component reads and writes
+/// its own provider file there.
+async fn load_llm(
+    catalogue: &PluginCatalogue,
+    factory: &ProjectRuntimeFactory,
+    home: &Path,
+) -> Option<Arc<ComponentActor>> {
+    let root = plugins::global_configuration_root(home);
+    let host = factory.host_capabilities(&root, false).runtime;
+    plugins::llm::load_llm_provider(catalogue, host, home).await
+}
+
+/// Reports a directly-loaded plugin's availability and self-description.
+///
+/// The host owns neither the endpoint nor the key, so it asks the Component
+/// what it declares and forwards that to the GUI — for the model provider, the
+/// image support that gates the attachment entry and the context window the
+/// gauge reads. Returns the descriptor so the worker loop can keep gating
+/// plugin surfaces on it.
+async fn emit_provider(
+    sink: &EventSink,
+    plugin_id: &str,
+    provider: Option<&Arc<ComponentActor>>,
+) -> PluginDescriptor {
+    sink.emit_ui(Event::PluginAvailability {
+        plugin_id: plugin_id.to_string(),
+        available: provider.is_some(),
+    });
+    let descriptor = match provider {
+        Some(actor) => plugins::descriptor::describe(actor)
+            .await
+            .unwrap_or_default(),
+        None => PluginDescriptor::default(),
+    };
+    sink.emit_ui(Event::PluginDescriptor {
+        plugin_id: plugin_id.to_string(),
+        descriptor: descriptor.clone(),
+    });
+    descriptor
+}
+
+/// Opens the inline composer surface for a plugin that declares one.
+///
+/// The composer is a global-scope surface bound to the global configuration
+/// root, so it is independent of the active project. It is spawned by the
+/// worker rather than opened from the GUI because its lifecycle follows the
+/// plugin's: `RefreshComposer` and every reload re-spawn it with a fresh
+/// `request_id`, and the GUI adopts whichever request the snapshots carry.
+///
+/// Returns `None` when the plugin is missing, disabled, or declares no
+/// composer. The provider actor is used to re-read the self-description after
+/// the composer changes the active model; `dirty` is set so the worker rebuilds
+/// its cached agents on the next run.
+fn spawn_composer(
+    catalogue: &PluginCatalogue,
+    factory: &ProjectRuntimeFactory,
+    sink: &EventSink,
+    home: &Path,
+    provider: Option<Arc<ComponentActor>>,
+    dirty: Arc<AtomicBool>,
+    request_id: u64,
+) -> Option<(SurfaceRequest, SurfaceHandle)> {
+    let plugin = catalogue
+        .global()
+        .iter()
+        .find(|plugin| plugin.id == plugins::llm::LLM_PROVIDER_PLUGIN_ID)?;
+    let manifest = plugin.manifest.wasm_runtime()?;
+    if !manifest.ui.composer {
+        return None;
+    }
+    let root = plugins::global_configuration_root(home);
+    let hub = CapabilityHub::new(
+        root.clone(),
+        root.clone(),
+        manifest.permissions.clone(),
+        factory.host_capabilities(&root, false).runtime,
+    )
+    .ok()?;
+    let request = SurfaceRequest {
+        plugin_id: plugin.id.clone(),
+        project: root,
+        surface_id: COMPOSER_SURFACE_ID.to_string(),
+        request_id,
+    };
+    let actions = manifest.ui.actions.clone();
+    let plugin_root = plugin.root.clone();
+    let load = async move {
+        let actor = ComponentActor::load(plugin_root, manifest, hub).await?;
+        Ok(Box::new(plugins::wasm::WasmUiExecutor::new(actor)) as Box<dyn PluginUiExecutor>)
+    };
+    let event_sink = sink.clone();
+    let acted = Arc::new(AtomicBool::new(false));
+    let emit = Arc::new(move |event: PluginUiEvent| {
+        // The first snapshot follows the surface opening; a later one follows a
+        // model switch, so the cached agents and the descriptor are refreshed.
+        if matches!(event, PluginUiEvent::Updated { .. }) && acted.swap(true, Ordering::SeqCst) {
+            dirty.store(true, Ordering::SeqCst);
+            if let Some(actor) = provider.clone() {
+                let sink = event_sink.clone();
+                tokio::spawn(async move {
+                    let descriptor = plugins::descriptor::describe(&actor)
+                        .await
+                        .unwrap_or_default();
+                    sink.emit_ui(Event::PluginDescriptor {
+                        plugin_id: plugins::llm::LLM_PROVIDER_PLUGIN_ID.to_string(),
+                        descriptor,
+                    });
+                });
+            }
+        }
+        event_sink.emit_ui(match event {
+            PluginUiEvent::Updated { request, document } => {
+                Event::PluginUiUpdated { request, document }
+            }
+            PluginUiEvent::Failed { request, message } => {
+                Event::PluginUiFailed { request, message }
+            }
+            PluginUiEvent::Closed { request } => Event::PluginUiClosed { request },
+        })
+    });
+    let handle = plugins::runtime::spawn_surface(request.clone(), actions, load, emit);
+    Some((request, handle))
 }
 
 fn spawn_worker(
@@ -317,6 +436,34 @@ fn spawn_worker(
         sink.emit_ui(Event::RendererAvailability {
             available: renderer.is_some(),
         });
+        // The model provider is an ordinary built-in plugin too, loaded once for
+        // the worker's life. It owns the whole provider configuration, so the
+        // host asks what the active profile declares and forwards that to the
+        // GUI; `llm_descriptor` is what gates image attachments and surfaces.
+        let mut llm_provider = load_llm(&worker.plugins, &factory, &worker.home).await;
+        let mut llm_descriptor = emit_provider(
+            &sink,
+            plugins::llm::LLM_PROVIDER_PLUGIN_ID,
+            llm_provider.as_ref(),
+        )
+        .await;
+        // The inline composer, when the provider plugin contributes one. It is
+        // re-spawned on every reload with a fresh id so a stale `Closed` from a
+        // replaced surface can never be mistaken for the current one.
+        let composer_dirty = Arc::new(AtomicBool::new(false));
+        let mut composer_seq: u64 = 0;
+        if let Some((request, handle)) = spawn_composer(
+            &worker.plugins,
+            &factory,
+            &sink,
+            &worker.home,
+            llm_provider.clone(),
+            composer_dirty.clone(),
+            composer_seq,
+        ) {
+            composer_seq = composer_seq.wrapping_add(1);
+            surfaces.insert(request, handle);
+        }
         // The model settings the GUI wants. Pushed before the first run and on
         // every settings save; `None` only until then.
         let mut llm_settings: Option<LlmSettings> = None;
@@ -377,12 +524,7 @@ fn spawn_worker(
                         .map(|runtime| runtime.host_tools.clone())
                         .unwrap_or_else(|| {
                             factory
-                                .host_capabilities(
-                                    &request.project,
-                                    llm_settings
-                                        .as_ref()
-                                        .is_some_and(LlmSettings::supports_images),
-                                )
+                                .host_capabilities(&request.project, llm_descriptor.image_input)
                                 .runtime
                         });
                     let hub = match plugins::capabilities::CapabilityHub::new(
@@ -460,6 +602,22 @@ fn spawn_worker(
                 }
                 Cmd::ClosePluginSurface(request) => {
                     surfaces.remove(&request);
+                }
+                Cmd::RefreshComposer => {
+                    if let Some((request, handle)) = spawn_composer(
+                        &worker.plugins,
+                        &factory,
+                        &sink,
+                        &worker.home,
+                        llm_provider.clone(),
+                        composer_dirty.clone(),
+                        composer_seq,
+                    ) {
+                        composer_seq = composer_seq.wrapping_add(1);
+                        // Replacing the entry drops the previous handle, which
+                        // cancels the surface being refreshed.
+                        surfaces.insert(request, handle);
+                    }
                 }
                 Cmd::InstallPlugin {
                     request_id,
@@ -541,6 +699,25 @@ fn spawn_worker(
                                     available: renderer.is_some(),
                                 });
                             }
+                            llm_provider = load_llm(&worker.plugins, &factory, &worker.home).await;
+                            llm_descriptor = emit_provider(
+                                &sink,
+                                plugins::llm::LLM_PROVIDER_PLUGIN_ID,
+                                llm_provider.as_ref(),
+                            )
+                            .await;
+                            if let Some((request, handle)) = spawn_composer(
+                                &worker.plugins,
+                                &factory,
+                                &sink,
+                                &worker.home,
+                                llm_provider.clone(),
+                                composer_dirty.clone(),
+                                composer_seq,
+                            ) {
+                                composer_seq = composer_seq.wrapping_add(1);
+                                surfaces.insert(request, handle);
+                            }
                             sink.emit_ui(Event::PluginsUpdated {
                                 request_id,
                                 catalogue: plugins,
@@ -592,20 +769,6 @@ fn spawn_worker(
                     sink.emit_ui(event);
                 }
 
-                Cmd::SaveApiKey {
-                    request_id,
-                    api_key,
-                } => {
-                    let event = match worker.secret_store.save_api_key(api_key.expose()).await {
-                        Ok(()) => Event::ApiKeySaved { request_id },
-                        Err(error) => Event::ApiKeySaveFailed {
-                            request_id,
-                            message: error.to_string(),
-                        },
-                    };
-                    sink.emit_ui(event);
-                }
-
                 Cmd::ReloadPlugins { request_id, config } => {
                     let result = async {
                         worker.config_store.save(&config).await?;
@@ -626,6 +789,25 @@ fn spawn_worker(
                                 sink.emit_ui(Event::RendererAvailability {
                                     available: renderer.is_some(),
                                 });
+                            }
+                            llm_provider = load_llm(&worker.plugins, &factory, &worker.home).await;
+                            llm_descriptor = emit_provider(
+                                &sink,
+                                plugins::llm::LLM_PROVIDER_PLUGIN_ID,
+                                llm_provider.as_ref(),
+                            )
+                            .await;
+                            if let Some((request, handle)) = spawn_composer(
+                                &worker.plugins,
+                                &factory,
+                                &sink,
+                                &worker.home,
+                                llm_provider.clone(),
+                                composer_dirty.clone(),
+                                composer_seq,
+                            ) {
+                                composer_seq = composer_seq.wrapping_add(1);
+                                surfaces.insert(request, handle);
                             }
                             sink.emit_ui(Event::PluginsUpdated {
                                 request_id,
@@ -816,7 +998,30 @@ fn spawn_worker(
                         });
                         continue;
                     };
+                    // The provider is a shared Component actor; without it no
+                    // run can reach a model. The GUI is told separately through
+                    // `PluginAvailability`, so this is the last line of defence
+                    // against a run that raced a plugin reload.
+                    let Some(provider) = llm_provider.clone() else {
+                        sink.emit(AgentEvent::RunFailed {
+                            run_id,
+                            message: "LLM 供应商插件未启用，请在插件面板中启用它".into(),
+                        });
+                        continue;
+                    };
                     activity.insert(project.clone(), Instant::now());
+
+                    // A model switch made in the inline composer changes what
+                    // every cached agent was built for — its image support and
+                    // context window — so each is rebuilt on its next run.
+                    // Unlike a settings change this does not cancel runs already
+                    // in flight.
+                    if composer_dirty.swap(false, Ordering::SeqCst) {
+                        let mut stale = stale_projects
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        stale.extend(runtimes.keys().cloned());
+                    }
 
                     // A plugin surface changed configuration since this
                     // project's agent was built. Rebuilding here — rather than
@@ -831,18 +1036,17 @@ fn spawn_worker(
                     let agent = match runtimes.get(&project) {
                         Some(runtime) if !stale => runtime.agent.clone(),
                         _ => {
+                            // The endpoint, the model, and the key live inside
+                            // the Component; the host only carries the retry
+                            // policy and the compaction settings.
                             let model = RuntimeModelSettings {
-                                base_url: settings.base_url.clone(),
-                                model: settings.model.clone(),
-                                api_key: settings.api_key.clone(),
+                                provider: provider.clone(),
                                 context: settings.context,
-                                max_output_tokens: settings.max_output_tokens,
                                 retry_count: if settings.retry_forever {
                                     None
                                 } else {
                                     Some(settings.retry_count)
                                 },
-                                supports_images: settings.supports_images(),
                             };
                             let runtime = match factory
                                 .build(&project, &model, worker.plugins.clone())

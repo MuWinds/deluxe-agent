@@ -10,7 +10,6 @@
     },
     "permissions": {
       "processCommands": ["*"],
-      "networkHosts": ["127.0.0.1"],
       "writePluginFiles": true
     }
   }

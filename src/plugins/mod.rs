@@ -6,6 +6,8 @@
 //! directly — there is no separate catalogue file to keep in sync.
 pub mod capabilities;
 pub mod defaults;
+pub mod descriptor;
+pub mod llm;
 pub mod manifest;
 pub mod providers;
 pub mod runtime;

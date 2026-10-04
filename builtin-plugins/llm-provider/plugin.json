@@ -1,0 +1,28 @@
+{
+  "name": "llm-provider",
+  "version": "0.1.0",
+  "interface": {
+    "displayName": "LLM 供应商",
+    "shortDescription": "多供应商、多协议的模型接入"
+  },
+  "runtime": {
+    "module": "plugin.wasm",
+    "apiVersion": "deluxe.harness/plugin@0.1",
+    "ui": {
+      "surfaces": ["providers"],
+      "composer": true,
+      "actions": [
+        "add_provider",
+        "select_active",
+        "delete_provider",
+        "set_protocol",
+        "set_field",
+        "toggle_images",
+        "select_model"
+      ]
+    },
+    "permissions": {
+      "writePluginFiles": true
+    }
+  }
+}

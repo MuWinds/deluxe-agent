@@ -1,10 +1,11 @@
 //! Context-window management.
 //!
-//! The model is configured with a *limit* and a *trigger share* in the
-//! settings panel. Once the measured prompt reaches `limit × share`, the whole
-//! conversation is handed to the model in a follow-up request and replaced by
-//! the continuation brief it writes back. Nothing is kept verbatim — the brief
-//! is what the run carries on from.
+//! The model's *limit* is the window the provider Component reports through
+//! `describe()`; the *trigger share* is the host's compaction policy. Once the
+//! measured prompt reaches `limit × share`, the whole conversation is handed
+//! to the model in a follow-up request and replaced by the continuation brief
+//! it writes back. Nothing is kept verbatim — the brief is what the run carries
+//! on from.
 //!
 //! What drives the check is the usage figure each assistant turn carries — the
 //! provider's own token count for the prompt it received — never a local
@@ -16,15 +17,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::harness::LlmProvider;
 use crate::llm::Message;
+use crate::plugins::llm::LlmProvider;
 use crate::runtime_context;
 
+/// The host's compaction policy.
+///
+/// The window itself is not here: it belongs to the model provider Component,
+/// which reports it through `describe()`. What the host still owns is when to
+/// act on it and how much of the conversation to keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextSettings {
-    /// The model's context window, in tokens. Zero disables compaction.
-    pub context_limit: u64,
     /// The share of the window at which compaction engages, in percent: once
     /// the measured prompt reaches this much of the limit, the oldest turns
     /// are summarised.
@@ -56,7 +60,6 @@ fn default_keep_recent_turns() -> u32 {
 impl Default for ContextSettings {
     fn default() -> Self {
         Self {
-            context_limit: 0,
             threshold_percent: 60,
             keep_recent_turns: default_keep_recent_turns(),
         }
@@ -64,17 +67,6 @@ impl Default for ContextSettings {
 }
 
 impl ContextSettings {
-    /// Whether compaction is configured at all. A zero limit or a zero
-    /// threshold turns the whole mechanism off rather than compacting always.
-    fn is_active(&self) -> bool {
-        self.context_limit > 0 && self.threshold_percent > 0
-    }
-
-    /// The prompt size, in tokens, at which compaction engages.
-    fn threshold(&self) -> u64 {
-        (self.context_limit as f32 * self.threshold_ratio()) as u64
-    }
-
     /// The trigger as a share of the window.
     ///
     /// The composer's context gauge colours its ring by the same line the
@@ -99,14 +91,21 @@ impl ContextSettings {
 /// long session is already guarded.
 #[derive(Debug, Default)]
 pub struct ContextWindow {
+    /// The model's context window, in tokens, as the provider reported it.
+    /// Zero disables compaction.
+    limit: u64,
     settings: ContextSettings,
     latest: Option<(u64, usize)>,
 }
 
 impl ContextWindow {
     /// A window with no measurement yet; the first request of a run seeds it.
-    pub fn new(settings: ContextSettings) -> Self {
+    ///
+    /// `limit` is the provider-reported context window; it is a parameter
+    /// rather than a field of `settings` because the Component owns it.
+    pub fn new(limit: u64, settings: ContextSettings) -> Self {
         Self {
+            limit,
             settings,
             latest: None,
         }
@@ -115,6 +114,17 @@ impl ContextWindow {
     /// The settings this window was built with.
     pub fn settings(&self) -> ContextSettings {
         self.settings
+    }
+
+    /// Whether compaction is configured at all. A zero window or a zero
+    /// threshold turns the whole mechanism off rather than compacting always.
+    fn is_active(&self) -> bool {
+        self.limit > 0 && self.settings.threshold_percent > 0
+    }
+
+    /// The prompt size, in tokens, at which compaction engages.
+    fn threshold(&self) -> u64 {
+        (self.limit as f32 * self.settings.threshold_ratio()) as u64
     }
 
     /// Restores a measurement carried over from an earlier run of the same
@@ -131,7 +141,7 @@ impl ContextWindow {
 
     /// Records what the provider said the last request cost.
     pub fn record_usage(&mut self, prompt_tokens: u64, message_count: usize) {
-        if self.settings.is_active() && prompt_tokens > 0 {
+        if self.is_active() && prompt_tokens > 0 {
             self.latest = Some((prompt_tokens, message_count));
         }
     }
@@ -158,11 +168,11 @@ impl ContextWindow {
     /// Whether a request carrying `messages` would cross the compaction
     /// threshold.
     pub fn should_compact(&self, messages: &[Message]) -> bool {
-        if !self.settings.is_active() {
+        if !self.is_active() {
             return false;
         }
         self.projected(messages.len())
-            .map(|tokens| tokens >= self.settings.threshold())
+            .map(|tokens| tokens >= self.threshold())
             .unwrap_or(false)
     }
 }
@@ -192,7 +202,7 @@ Two hundred words at most. Answer in the language the conversation used.";
 pub async fn summarize(
     history: &[Message],
     tools: &Value,
-    llm: &dyn LlmProvider,
+    llm: &LlmProvider,
     cancel: &CancellationToken,
 ) -> crate::error::Result<Option<String>> {
     // The system prompt is not conversation; a history of nothing but it has
@@ -275,7 +285,6 @@ pub fn compaction_split(messages: &[Message], keep_recent_turns: u32) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     fn user(text: &str) -> Message {
         Message::user(text)
@@ -285,16 +294,14 @@ mod tests {
         Message::assistant(text.to_string(), Vec::new())
     }
 
-    fn tool() -> Message {
-        Message::tool("call_1", "the file says 42")
-    }
-
     fn window(limit: u64, threshold_percent: u32) -> ContextWindow {
-        ContextWindow::new(ContextSettings {
-            context_limit: limit,
-            threshold_percent,
-            ..ContextSettings::default()
-        })
+        ContextWindow::new(
+            limit,
+            ContextSettings {
+                threshold_percent,
+                ..ContextSettings::default()
+            },
+        )
     }
 
     #[test]
@@ -376,9 +383,8 @@ mod tests {
     #[test]
     fn a_settings_round_trip_preserves_the_fields() {
         let settings = ContextSettings {
-            context_limit: 131_072,
             threshold_percent: 45,
-            ..ContextSettings::default()
+            keep_recent_turns: 3,
         };
         let text = toml::to_string(&settings).unwrap();
         let parsed: ContextSettings = toml::from_str(&text).unwrap();
@@ -389,7 +395,8 @@ mod tests {
     fn a_config_naming_the_old_field_still_loads_it() {
         // `keepPercent` used to mean the share kept *after* compaction. The
         // number is read as the trigger share now, but an old file must not
-        // silently fall back to the default.
+        // silently fall back to the default. A stale `contextLimit` — the
+        // window moved to the provider Component — is ignored.
         let parsed: ContextSettings =
             toml::from_str("contextLimit = 1000\nkeepPercent = 45\n").unwrap();
         assert_eq!(parsed.threshold_percent, 45);
@@ -400,12 +407,12 @@ mod tests {
         // The gauge reads this rather than a private constant; if the share
         // ever moves, the ring must move with it.
         let settings = ContextSettings {
-            context_limit: 100,
             threshold_percent: 45,
             ..ContextSettings::default()
         };
         assert_eq!(settings.threshold_ratio(), 0.45);
-        assert_eq!(settings.threshold(), 45);
+        let window = ContextWindow::new(100, settings);
+        assert_eq!(window.threshold(), 45);
     }
 
     #[test]
@@ -453,107 +460,5 @@ mod tests {
         // The real users sit at 1, 3 and 6; the block at 5 is skipped, so
         // keeping two still cuts at the second real turn.
         assert_eq!(compaction_split(&messages, 2), Some(3));
-    }
-
-    /// An `LlmProvider` that records what the summariser sent and returns a
-    /// fixed brief.
-    struct RecordingLlm {
-        seen: std::sync::Mutex<Vec<Message>>,
-        tools_seen: std::sync::Mutex<Option<Value>>,
-        reply: String,
-    }
-
-    #[async_trait::async_trait]
-    impl LlmProvider for RecordingLlm {
-        async fn stream_turn(
-            &self,
-            _messages: &[Message],
-            _tools: &Value,
-            _thinking: Option<crate::llm::ThinkingLevel>,
-            _cancel: &CancellationToken,
-            _sink: &mut dyn crate::harness::LlmStreamSink,
-        ) -> crate::error::Result<crate::llm::AssistantTurn> {
-            unreachable!("the summariser never streams a turn")
-        }
-
-        async fn complete_turn(
-            &self,
-            messages: &[Message],
-            tools: &Value,
-            _cancel: &CancellationToken,
-        ) -> crate::error::Result<crate::llm::AssistantTurn> {
-            *self.seen.lock().unwrap() = messages.to_vec();
-            *self.tools_seen.lock().unwrap() = Some(tools.clone());
-            Ok(crate::llm::AssistantTurn {
-                content: self.reply.clone(),
-                tool_calls: Vec::new(),
-                usage: None,
-                finish_reason: None,
-            })
-        }
-    }
-
-    fn recording_llm(reply: &str) -> RecordingLlm {
-        RecordingLlm {
-            seen: std::sync::Mutex::new(Vec::new()),
-            tools_seen: std::sync::Mutex::new(None),
-            reply: reply.into(),
-        }
-    }
-
-    #[tokio::test]
-    async fn the_summary_request_reuses_the_conversation_and_appends_the_instruction() {
-        // The point of the whole exercise: the request carries the conversation
-        // verbatim — system prompt included — so the provider serves it from
-        // the prefix cache, with the instruction as the only new turn.
-        let llm = recording_llm("brief");
-        let tools = json!([{ "type": "function" }]);
-        let history = vec![
-            Message::system("you are a coding agent"),
-            user("list the files"),
-            assistant("looking…"),
-            tool(),
-        ];
-
-        let summary = summarize(&history, &tools, &llm, &CancellationToken::new())
-            .await
-            .expect("the summary request succeeds")
-            .expect("a brief comes back");
-        assert_eq!(summary, "brief");
-
-        let sent = llm.seen.lock().unwrap();
-        // Compare the serialised bytes, which is what the cache keys on.
-        assert_eq!(
-            serde_json::to_string(&sent[..history.len()]).unwrap(),
-            serde_json::to_string(&history).unwrap(),
-            "the conversation prefix must be byte-identical"
-        );
-        assert_eq!(sent.len(), history.len() + 1);
-        assert_eq!(
-            sent.last().unwrap().text(),
-            SUMMARIZE_INSTRUCTION,
-            "the instruction is the one new turn"
-        );
-        assert_eq!(
-            llm.tools_seen.lock().unwrap().as_ref(),
-            Some(&tools),
-            "the tool schema travels with the request to keep the cached prefix"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_history_of_nothing_but_the_system_prompt_is_not_summarised() {
-        let llm = recording_llm("brief");
-        let history = vec![Message::system("you are a coding agent")];
-
-        let summary = summarize(&history, &json!([]), &llm, &CancellationToken::new())
-            .await
-            .expect("an empty conversation is not an error");
-
-        assert_eq!(summary, None);
-        assert!(
-            llm.seen.lock().unwrap().is_empty(),
-            "no request is made when there is nothing to summarise"
-        );
     }
 }

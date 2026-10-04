@@ -11,10 +11,11 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::attachments::ImageRef;
-use crate::config::{Config, InputModality};
+use crate::config::Config;
 use crate::context::ContextSettings;
 pub use crate::harness::{AuditOutcome, HunkLines, RunId, RunState};
 use crate::llm::{Message, ThinkingLevel, Usage, UserTurn};
+use crate::plugins::descriptor::PluginDescriptor;
 use crate::plugins::ui_protocol::{PluginUiAction, PluginUiDocument, SurfaceRequest};
 use crate::plugins::{PluginCatalogue, PluginSettings, Scope};
 use crate::renderer::protocol::{Node, RenderKey, RenderKind, RenderMetrics, ToolRenderRequest};
@@ -22,75 +23,20 @@ use crate::session::Session;
 use crate::tools::jobs::{JobSnapshot, JobStatus};
 use crate::tools::ToolSettings;
 
-/// Which model to talk to, and with what credentials.
+/// The host-side model policy the GUI pushes to the worker.
 ///
 /// Global worker state, not a per-run attachment: the GUI pushes it with
 /// [`Cmd::SetLlmSettings`] at startup and whenever the settings are saved, and
-/// every run uses whatever is current — so changing the key or the model takes
-/// effect on the next run instead of needing a restart.
-#[derive(Clone, PartialEq, Eq)]
+/// every run uses whatever is current. The endpoint, the model, and the key are
+/// absent because the `llm-provider` Component owns them; what is left is the
+/// retry policy and the compaction threshold the host still applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmSettings {
-    pub base_url: String,
-    pub model: String,
-    pub api_key: String,
     pub context: ContextSettings,
-    /// The `max_tokens` sent with every request, or `None` to leave the
-    /// provider's own ceiling in force.
-    pub max_output_tokens: Option<u32>,
     /// Additional attempts made after a failed model request.
     pub retry_count: u32,
     /// Keep retrying failed model requests until the run is cancelled.
     pub retry_forever: bool,
-    /// The model's input modalities. Part of the agent cache key because
-    /// `image` decides whether `read_image` is registered and therefore what
-    /// the system prompt advertises.
-    pub input: Vec<InputModality>,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct SecretValue(String);
-
-impl SecretValue {
-    /// Wraps a secret so protocol debug output cannot reveal its contents.
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-
-    /// Borrows the secret for the worker-side adapter.
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for SecretValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("\"<redacted>\"")
-    }
-}
-
-impl LlmSettings {
-    /// Whether the configured model declares image input, which is what decides
-    /// whether `read_image` is registered.
-    pub fn supports_images(&self) -> bool {
-        self.input.contains(&InputModality::Image)
-    }
-}
-
-/// Redacted by hand: the derived form would put the API key in any log line or
-/// panic message that happens to format a `Cmd`.
-impl std::fmt::Debug for LlmSettings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LlmSettings")
-            .field("base_url", &self.base_url)
-            .field("model", &self.model)
-            .field("context", &self.context)
-            .field("max_output_tokens", &self.max_output_tokens)
-            .field("retry_count", &self.retry_count)
-            .field("retry_forever", &self.retry_forever)
-            .field("input", &self.input)
-            .field("api_key", &"<redacted>")
-            .finish()
-    }
 }
 
 /// GUI → agent.
@@ -99,6 +45,12 @@ pub enum Cmd {
     OpenPluginSurface(SurfaceRequest),
     PluginUiAction(PluginUiAction),
     ClosePluginSurface(SurfaceRequest),
+    /// Reopens the inline composer surface so it re-reads plugin configuration.
+    ///
+    /// The composer's options live inside the contributing plugin; when another
+    /// surface of that plugin edits them, this refreshes the composer without
+    /// coupling the host to what changed.
+    RefreshComposer,
     /// Imports one Wasmtime plugin directory into the managed cache.
     InstallPlugin {
         request_id: u64,
@@ -152,11 +104,6 @@ pub enum Cmd {
     SaveConfig {
         request_id: u64,
         config: Box<Config>,
-    },
-    /// Persists a credential without blocking the GUI thread.
-    SaveApiKey {
-        request_id: u64,
-        api_key: SecretValue,
     },
     /// Persists config and refreshes the plugin catalogue in the worker.
     ReloadPlugins {
@@ -353,15 +300,6 @@ pub enum Event {
         request_id: u64,
         message: String,
     },
-    /// Confirms that an API credential reached the operating-system store.
-    ApiKeySaved {
-        request_id: u64,
-    },
-    /// Reports an operating-system credential-store failure.
-    ApiKeySaveFailed {
-        request_id: u64,
-        message: String,
-    },
     /// Replaces the GUI's plugin catalogue after a worker refresh.
     PluginsUpdated {
         request_id: u64,
@@ -428,6 +366,22 @@ pub enum Event {
     /// false the GUI draws every body as plain text.
     RendererAvailability {
         available: bool,
+    },
+    /// A plugin's availability changed. Emitted at worker start and whenever
+    /// the plugin catalogue is reloaded, once per plugin the host loads
+    /// directly. When `available` is false the plugin could not be loaded, and
+    /// the GUI says so instead of offering the feature it provides.
+    PluginAvailability {
+        plugin_id: String,
+        available: bool,
+    },
+    /// A plugin's self-description, read through `plugin.describe`. Emitted
+    /// whenever the plugin is loaded or the plugin catalogue is reloaded, so
+    /// the GUI can gate a feature on the plugin's declared capabilities without
+    /// knowing what the plugin is.
+    PluginDescriptor {
+        plugin_id: String,
+        descriptor: PluginDescriptor,
     },
 }
 

@@ -12,6 +12,9 @@ on:
       - 'src/**'
       - 'assets/**'
       - 'vendor/**'
+      - 'builtin-plugins/**'
+      - 'plugin-src/**'
+      - 'wit/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/**'
@@ -21,6 +24,9 @@ on:
       - 'src/**'
       - 'assets/**'
       - 'vendor/**'
+      - 'builtin-plugins/**'
+      - 'plugin-src/**'
+      - 'wit/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/**'
@@ -57,6 +63,24 @@ jobs:
             libdbus-1-dev libxkbcommon-dev libx11-dev libxcb1-dev libwayland-dev
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+
+  # The guest Components are separate crates (not part of the root workspace).
+  # Their codecs reference no wit-bindgen, so they compile and test on the host
+  # target — which is where the wire-protocol tests actually run.
+  guest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: plugin-src/llm-provider
+      - run: cargo fmt --manifest-path plugin-src/llm-provider/Cargo.toml --check
+      - run: cargo clippy --manifest-path plugin-src/llm-provider/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path plugin-src/llm-provider/Cargo.toml
 
   test:
     needs: lint

@@ -13,13 +13,14 @@ use tokio::sync::RwLock;
 
 use crate::agent::Agent;
 use crate::context::ContextSettings;
-use crate::error::Result;
+use crate::error::{AgentError, Result};
 use crate::harness::services::native_services;
 use crate::harness::{
     AgentEventSink, JobRuntime, NativeJobRuntime, NestedAgentRuntime, PromptContext,
 };
-use crate::llm::LlmClient;
 use crate::plugins::capabilities::CapabilityHub;
+use crate::plugins::descriptor;
+use crate::plugins::llm::LlmProvider;
 use crate::plugins::providers::WasmEventRuntime;
 use crate::plugins::wasm::tools;
 use crate::plugins::wasm_manifest::Permissions;
@@ -29,15 +30,18 @@ use crate::tools::{JobRegistry, ToolRegistry, ToolSettings};
 
 use super::nested_agent::NativeNestedAgent;
 
+/// What one project's runtime needs to reach a model.
+///
+/// The provider is a shared Wasmtime Component actor rather than a per-project
+/// client: it owns the whole provider configuration, so every project and every
+/// sub-agent drives the same instance. The context settings carry the host's
+/// compaction policy; the window itself is read from the Component's
+/// `describe()` at build time.
 #[derive(Clone)]
 pub struct RuntimeModelSettings {
-    pub base_url: String,
-    pub model: String,
-    pub api_key: String,
+    pub provider: Arc<ComponentActor>,
     pub context: ContextSettings,
-    pub max_output_tokens: Option<u32>,
     pub retry_count: Option<u32>,
-    pub supports_images: bool,
 }
 
 #[derive(Clone)]
@@ -190,21 +194,29 @@ impl ProjectRuntimeFactory {
         model: &RuntimeModelSettings,
         catalogue: Arc<PluginCatalogue>,
     ) -> Result<Arc<ProjectRuntime>> {
-        let client = LlmClient::new(
-            &model.base_url,
-            &model.model,
-            &model.api_key,
-            model.max_output_tokens,
-            model.retry_count,
-        )?;
+        // The Component owns the active profile, so the host asks what it
+        // declares before building anything: image support decides whether
+        // `read_image` is registered, and the context limit seeds compaction.
+        let descriptor = descriptor::describe(model.provider.as_ref()).await?;
+        if !descriptor.ready {
+            return Err(AgentError::llm(
+                "No model provider is configured. Open the `LLM 供应商` plugin to add one.",
+            ));
+        }
+        let supports_images = descriptor.image_input;
+        // The window is the Component's to report; the host only supplies the
+        // compaction policy it acts on.
+        let context_limit = descriptor.context_tokens;
+        let context = model.context;
+        let llm: Arc<LlmProvider> =
+            Arc::new(LlmProvider::new(model.provider.clone(), model.retry_count)?);
 
-        let host = self.host_capabilities(project, model.supports_images);
+        let host = self.host_capabilities(project, supports_images);
         // The built-ins are native: the agent dispatches `read_file`,
         // `apply_patch` and the rest directly. They share the host job registry
         // so the jobs the agent starts are the ones the UI and a Component's
         // `invoke_tool` observe.
-        let mut registry =
-            ToolRegistry::with_builtins_sharing(host.jobs.clone(), model.supports_images);
+        let mut registry = ToolRegistry::with_builtins_sharing(host.jobs.clone(), supports_images);
 
         let plugins = catalogue.for_project(project);
         let capabilities = host.runtime.clone();
@@ -275,10 +287,11 @@ impl ProjectRuntimeFactory {
         // delegating Component registers its tool*, which is what bounds
         // delegation to a single level: a nested agent cannot delegate again.
         let nested: Arc<dyn NestedAgentRuntime> = Arc::new(NativeNestedAgent::new(
-            client.clone(),
+            llm.clone(),
             Arc::new(registry.clone()),
             self.settings.clone(),
-            model.context,
+            context_limit,
+            context,
             project.to_path_buf(),
             jobs.clone(),
             self.sink.clone(),
@@ -295,7 +308,7 @@ impl ProjectRuntimeFactory {
 
         let registry = Arc::new(registry);
         let mut native = native_services(
-            client,
+            llm.clone(),
             registry,
             self.settings.clone(),
             Arc::new(super::prompt::NativePromptProvider::new()),
@@ -329,7 +342,8 @@ impl ProjectRuntimeFactory {
         let agent = Arc::new(Agent::from_services(
             services,
             project.to_path_buf(),
-            model.context,
+            context_limit,
+            context,
             system_prompt,
         ));
 

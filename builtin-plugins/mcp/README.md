@@ -117,8 +117,9 @@ the surface update the live set immediately.
 
 ## Permissions
 
-`plugin.json` declares `processCommands: ["*"]` and `networkHosts: ["*"]`,
-because a generic client cannot know which servers the user will declare. That
-makes `.mcp.json` a trust boundary: a stdio server is an arbitrary command, and
-an HTTP server can be reached over unrestricted network access. Only declare
+`plugin.json` declares `processCommands: ["*"]`, because a generic client cannot
+know which servers the user will declare. HTTP requests are not gated by a
+manifest host allowlist — the host owns the socket and sends the request — so
+that makes `.mcp.json` a trust boundary: a stdio server is an arbitrary command,
+and an HTTP server can be reached over unrestricted network access. Only declare
 servers you trust.

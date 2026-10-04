@@ -64,7 +64,9 @@ pub(super) fn render(
     });
 }
 
-fn render_node(
+/// Renders one validated node, collecting pure actions. Shared with the
+/// composer, which draws a plugin's control inline instead of in a window.
+pub(super) fn render_node(
     ui: &mut egui::Ui,
     node: &UiNode,
     request: &SurfaceRequest,

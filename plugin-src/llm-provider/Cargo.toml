@@ -1,0 +1,18 @@
+[package]
+name = "deluxe-llm-provider"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A model-provider Component. It owns the wire protocol for each supported API
+# and its own provider profiles, but performs no transport: the host owns the
+# socket and pumps response chunks in, so the actor never blocks on I/O. Built
+# as a core module for `wasm32-unknown-unknown` and wrapped into a Component by
+# `plugin-src/componentize`.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wit-bindgen = { version = "0.46", default-features = true }

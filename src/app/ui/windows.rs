@@ -5,13 +5,12 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 use egui::RichText;
 
-use crate::config::InputModality;
 use crate::icons;
 use crate::plugins;
 use crate::session;
 use crate::theme::{self, Palette};
 
-use super::super::{parse_token_count, project_name, App, GuiResources, UiIntent};
+use super::super::{project_name, App, GuiResources, UiIntent};
 use super::messages::draw_reasoning_block;
 use super::primitives::draw_logo;
 use super::transcript::draw_step;
@@ -35,83 +34,32 @@ impl App {
             .collapsible(false)
             .show(ctx, |ui| {
                 ui.heading("模型");
-                ui.weak("任何兼容 OpenAI /chat/completions 的服务都可以。");
+                ui.weak("供应商、协议与密钥由「LLM 供应商」插件管理，本页只保留压缩与重试策略。");
+                ui.horizontal(|ui| {
+                    // The model name lives on the composer's picker now; this
+                    // page only reports readiness and links to the provider
+                    // configuration.
+                    let status = if !self.llm_available {
+                        "供应商插件未启用"
+                    } else if !self.llm_descriptor.ready {
+                        "尚未选择供应商"
+                    } else {
+                        "已就绪"
+                    };
+                    ui.label(format!("状态：{status}"));
+                    if ui.button("配置供应商").clicked() {
+                        intents.push(UiIntent::OpenPluginSurface {
+                            plugin_id: crate::plugins::llm::LLM_PROVIDER_PLUGIN_ID.into(),
+                            surface_id: "providers".into(),
+                        });
+                    }
+                });
+                ui.add_space(6.0);
+
                 egui::Grid::new("llm-settings")
                     .num_columns(2)
                     .spacing([12.0, 6.0])
                     .show(ui, |ui| {
-                        ui.label("Base URL");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.config.llm.base_url)
-                                .desired_width(400.0),
-                        );
-                        ui.end_row();
-
-                        ui.label("模型名");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.config.llm.model)
-                                .desired_width(400.0),
-                        );
-                        ui.end_row();
-
-                        ui.label("输入模态");
-                        ui.horizontal(|ui| {
-                            let mut text = true;
-                            ui.add_enabled(false, egui::Checkbox::new(&mut text, "文本"));
-
-                            let mut supports_image = self.config.llm.supports_images();
-                            if ui.checkbox(&mut supports_image, "图片").changed() {
-                                self.config.llm.input = if supports_image {
-                                    vec![InputModality::Text, InputModality::Image]
-                                } else {
-                                    vec![InputModality::Text]
-                                };
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label("API Key");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.api_key)
-                                .password(true)
-                                .desired_width(400.0),
-                        );
-                        ui.end_row();
-
-                        ui.label("上下文长度");
-                        ui.horizontal(|ui| {
-                            let mut limit = self.context_limit_text.clone();
-                            let response = ui.add(
-                                egui::TextEdit::singleline(&mut limit)
-                                    .desired_width(160.0)
-                                    .hint_text("0 = 不压缩"),
-                            );
-                            if response.changed() && !limit.trim().is_empty() {
-                                if let Some(tokens) = parse_token_count(&limit) {
-                                    self.config.context.context_limit = tokens;
-                                    self.context_limit_text = limit;
-                                }
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label("最大输出长度");
-                        ui.horizontal(|ui| {
-                            let mut budget = self.max_output_tokens_text.clone();
-                            let response = ui.add(
-                                egui::TextEdit::singleline(&mut budget)
-                                    .desired_width(160.0)
-                                    .hint_text("留空 = 不限制"),
-                            );
-                            if response.changed() {
-                                self.max_output_tokens_text = budget.clone();
-                                self.config.llm.max_output_tokens = parse_token_count(&budget)
-                                    .filter(|tokens| *tokens > 0)
-                                    .and_then(|tokens| u32::try_from(tokens).ok());
-                            }
-                        });
-                        ui.end_row();
-
                         ui.label("失败重试次数");
                         ui.horizontal(|ui| {
                             ui.add_enabled(

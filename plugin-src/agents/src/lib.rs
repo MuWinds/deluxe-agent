@@ -36,6 +36,12 @@ impl PluginGuest for AgentsProvider {
         Ok(())
     }
 
+    async fn describe() -> Result<String, String> {
+        // Sub-agents contribute tools, not model metadata; the host ignores
+        // every key this could carry.
+        Ok("{}".into())
+    }
+
     async fn list_tools() -> String {
         let agents = load_agents().await;
         if agents.is_empty() {

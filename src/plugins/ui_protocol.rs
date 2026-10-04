@@ -12,6 +12,13 @@ const MAX_NODES: usize = 512;
 const MAX_DEPTH: usize = 24;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
 
+/// The well-known surface id of a plugin's inline composer control.
+///
+/// A manifest opts in with `ui.composer = true`; the host then opens a surface
+/// with this id and renders its single root node in the input row instead of a
+/// window. The id is a host protocol constant, not a plugin-chosen name.
+pub const COMPOSER_SURFACE_ID: &str = "composer";
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SurfaceRequest {

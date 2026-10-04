@@ -86,8 +86,8 @@ deluxe-agent/
     │   └── ui.rs          # 全部 egui 绘制：布局、调色板取用与自由函数
     ├── agent.rs           # agent 循环：system prompt 组装、工具分发、流式回合
     ├── agent_loop_tests.rs# 循环层的端到端测试
-    ├── llm.rs             # OpenAI 兼容客户端与流式解析
-    ├── config.rs          # config.toml 读写、keyring / API key 解析
+    ├── llm.rs             # 供应商无关的会话类型：Message / AssistantTurn / Usage / ThinkingLevel
+    ├── config.rs          # config.toml 读写、重试策略、通用 secret 解析（get-secret 的后端）
     ├── session.rs         # 会话与步骤的持久化
     ├── context.rs         # 上下文窗口与压缩（compaction）
     ├── ipc.rs             # 主线程 ↔ worker 的 Cmd / Event 消息
@@ -105,6 +105,8 @@ deluxe-agent/
     │   ├── fs.rs  shell.rs  patch.rs  jobs.rs  image.rs  settings.rs
     ├── mcp/               # MCP 客户端与传输（stdio / HTTP）
     └── plugins/           # wasmtime 插件运行时
+        ├── llm.rs         # LlmProvider：宿主侧 socket + 组件 codec 的适配器
+        └── descriptor.rs  # PluginDescriptor：plugin.describe 的通用投影
 ```
 
 线程模型（`main.rs` 顶部注释，全仓库依赖此约定）：
@@ -156,6 +158,65 @@ Transcript renderer（内置默认插件）：
 - renderer 不可用时**退回纯文本**：消息直接画原始正文，工具卡退化为
   「工具名 + 原始输出」的最小折叠。`src/renderer/golden.rs` 的测试断言 guest
   产出的 display-list 形状与内容。
+
+LLM provider（内置默认插件，模型访问的唯一实现）：
+
+- guest 在 `plugin-src/llm-provider/`（独立 crate，不进根 workspace）：
+  `src/lib.rs` 是 `wit-bindgen` 导出，`src/config.rs` 拥有**整份**供应商配置
+  （档案、当前选中、内联密钥），`src/codec/` 是三种协议的全部请求整形与流式解码
+  —— `openai_chat.rs` / `openai_responses.rs` / `anthropic.rs`，共用
+  `canonical.rs` 的供应商无关类型与 `sse.rs` 的行缓冲。`codec/` 不引用
+  wit-bindgen，因此能在宿主 target 上直接 `cargo test`；
+- 它的 ABI 在共享的 `wit/deluxe-harness.wit` 里：`interface llm`
+  （`build-request` / `parse-stream` / `close-stream` / `parse-complete`）与 world
+  `llm-provider`（导出 `plugin` + `llm`，import host 的 `read-plugin-file` /
+  `write-plugin-file` / `get-secret`）。**自描述 `describe` 属于通用 `plugin`
+  接口**（每个 Component 都实现它），不属于 `llm`；
+- **宿主不拥有 endpoint、模型名与密钥**：`src/config.rs` 只剩重试策略，
+  `LlmSettings` 只剩 `context` / `retry_count` / `retry_forever`。宿主通过
+  `plugin.describe()` 拿到一份通用 JSON，只读其中的 `ready` /
+  `capabilities.imageInput` / `limits.contextTokens`（见
+  `src/plugins/descriptor.rs` 的 `PluginDescriptor`），据此决定是否注册
+  `read_image`、如何播种压缩预算；
+- **socket 归宿主、codec 归组件**：`ComponentActor` 严格串行且没有 guest→host
+  回调，若由组件持 socket 会阻塞整个 actor。所以 `src/plugins/llm.rs` 的
+  `LlmProvider` 拥有 `reqwest::Client`：`build_request` 拿到组件整形的
+  `{method,url,headers,body}`，逐块 `parse_stream` 回灌，再把解出的
+  `events` / `turn` 转成 `LlmStreamEvent` 推给 sink。重试、退避与取消都在这里，
+  与旧原生客户端一致；宿主里不再有 `LlmProvider` trait，只有这一个结构体；
+- 它以**普通内置插件**的形式发布：`builtin-plugins/llm-provider/`
+  （`plugin.json` + `plugin.wasm`），`ensure_bundled_defaults` 安装并启用，在
+  插件面板可见、可停用。`plugin.wasm` 是提交进仓库的构建产物（CI 不构建
+  Component）。改了 guest 源码要重新构建并提交它（并升 `plugin.json.version`，
+  否则缓存副本不会被刷新）：
+
+  ```bash
+  rustup target add wasm32-unknown-unknown
+  cargo build --manifest-path plugin-src/llm-provider/Cargo.toml \
+      --release --target wasm32-unknown-unknown
+  cargo run --manifest-path plugin-src/componentize/Cargo.toml -- \
+      plugin-src/llm-provider/target/wasm32-unknown-unknown/release/deluxe_llm_provider.wasm \
+      builtin-plugins/llm-provider/plugin.wasm \
+      wit
+  ```
+- worker 启动时 `load_llm_provider` 从 `catalogue.global()` 找到
+  `llm-provider@deluxe-defaults` 加载一个全局单例；通用的
+  `Event::PluginAvailability` 与 `Event::PluginDescriptor` 报告可用性与
+  `describe` 的投影，插件重载后重发。不可用时每次运行都失败并给出明确提示，
+  GUI 也不会放行发送；
+- 供应商配置由 guest 的 `providers` surface 编辑（`src/surface.rs`），宿主只把
+  声明式 `PluginUiDocument` 画出来；`get-secret` 由 `src/config.rs::resolve_secret`
+  支撑（环境变量 `DELUXE_AGENT_SECRET_<NAME>` 或 OS keyring，服务名
+  `deluxe-agent`）；
+- **输入行的模型选择器是 composer surface，不是宿主 IPC**：manifest 用
+  `ui.composer = true` 声明（见 `src/plugins/wasm_manifest.rs`），worker 为它开一个
+  `surfaceId = COMPOSER_SURFACE_ID`（`"composer"`）的 surface 并绑定全局配置根；
+  GUI 按 `surface_id` 把它画进输入行（`src/app/ui/composer.rs`），不弹窗。guest 的
+  `surface.rs` 按 `surfaceId` 分派出 `composer_document()`（一个 `select` +
+  `select_model` 动作）。composer 的模型切换后，worker 在下次 run 失效全部缓存
+  runtime 并重新 `describe`，宿主不认识任何供应商字段；
+- 端到端测试在 `src/agent_loop_tests.rs`：`provider_for` 把内置组件指向
+  `FakeServer` 的地址加载起来，从而走的是**应用真正发布的同一份 codec**。
 
 ---
 

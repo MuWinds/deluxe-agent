@@ -25,6 +25,12 @@ impl Guest for EchoTool {
         Ok(())
     }
 
+    async fn describe() -> Result<String, String> {
+        // A tool fixture contributes no model metadata; the host ignores every
+        // key this could carry.
+        Ok("{}".into())
+    }
+
     async fn list_tools() -> String {
         r#"[{"name":"wasm_echo","summary":"Echo fixture","description":"Returns a bounded fixture result","guidelines":[],"inputSchema":{"type":"object","properties":{},"required":[]},"hostValidatesArguments":true,"mutating":false}]"#.into()
     }

@@ -48,9 +48,7 @@ static PROCESS_PENDING: OnceLock<Mutex<BTreeMap<String, Vec<u8>>>> = OnceLock::n
 async fn configured_servers() -> Result<BTreeMap<String, ServerState>, String> {
     let bytes = match deluxe::harness::host::read_plugin_file(".mcp.json".into()).await {
         Ok(bytes) => bytes,
-        Err(error) if error.starts_with("plugin_file_not_found:") => {
-            return Ok(BTreeMap::new())
-        }
+        Err(error) if error.starts_with("plugin_file_not_found:") => return Ok(BTreeMap::new()),
         Err(error) => return Err(error),
     };
     let mcp_json = String::from_utf8(bytes)
@@ -428,11 +426,13 @@ async fn request(
     if expects_response {
         state.next_id = state.next_id.saturating_add(1);
         if let Some(config) = MCP_CONFIG.get() {
-            config
+            if let Some(current) = config
                 .lock()
                 .map_err(|_| "MCP provider configuration is poisoned".to_string())?
                 .get_mut(server)
-                .map(|current| current.next_id = state.next_id);
+            {
+                current.next_id = state.next_id;
+            }
         }
     }
     let message = if expects_response {
@@ -514,11 +514,13 @@ async fn initialize(server: &str) -> Result<(), String> {
     }
     request(server, "notifications/initialized", json!({}), false).await?;
     if let Some(config) = MCP_CONFIG.get() {
-        config
+        if let Some(state) = config
             .lock()
             .map_err(|_| "MCP provider configuration is poisoned".to_string())?
             .get_mut(server)
-            .map(|state| state.initialized = true);
+        {
+            state.initialized = true;
+        }
     }
     Ok(())
 }
@@ -737,44 +739,44 @@ fn ui_document_with_revision(request: &Value, revision: u64) -> String {
         })),
         Ok(config) => {
             for (name, state) in config {
-            // The verb is the declared action and the server name rides in the
-            // control id, because a manifest declares its actions as a fixed
-            // list and a server name cannot be known when it is written.
-            let status = if state.stopped {
-                format!(
-                    "[已停止] {} · 该 server 的工具不再可用",
-                    transport_label(&state.transport)
-                )
-            } else {
-                format!("[运行中] {}", transport_label(&state.transport))
-            };
-            children.push(json!({
-                "type": "section",
-                "id": format!("server.{name}"),
-                "title": name,
-                "children": [
-                    {"type": "text", "text": status, "emphasis": "normal"},
-                    {
-                        "type": "row",
-                        "children": [
-                            {
-                                "type": "button",
-                                "id": format!("toggle.{name}"),
-                                "label": if state.stopped { "启动" } else { "停止" },
-                                "action": "toggle_server",
-                                "enabled": true
-                            },
-                            {
-                                "type": "button",
-                                "id": format!("remove.{name}"),
-                                "label": "卸载",
-                                "action": "remove_server",
-                                "enabled": true
-                            }
-                        ]
-                    }
-                ]
-            }));
+                // The verb is the declared action and the server name rides in the
+                // control id, because a manifest declares its actions as a fixed
+                // list and a server name cannot be known when it is written.
+                let status = if state.stopped {
+                    format!(
+                        "[已停止] {} · 该 server 的工具不再可用",
+                        transport_label(&state.transport)
+                    )
+                } else {
+                    format!("[运行中] {}", transport_label(&state.transport))
+                };
+                children.push(json!({
+                    "type": "section",
+                    "id": format!("server.{name}"),
+                    "title": name,
+                    "children": [
+                        {"type": "text", "text": status, "emphasis": "normal"},
+                        {
+                            "type": "row",
+                            "children": [
+                                {
+                                    "type": "button",
+                                    "id": format!("toggle.{name}"),
+                                    "label": if state.stopped { "启动" } else { "停止" },
+                                    "action": "toggle_server",
+                                    "enabled": true
+                                },
+                                {
+                                    "type": "button",
+                                    "id": format!("remove.{name}"),
+                                    "label": "卸载",
+                                    "action": "remove_server",
+                                    "enabled": true
+                                }
+                            ]
+                        }
+                    ]
+                }));
             }
         }
         // The surface still opens when the provider is unconfigured: an empty
@@ -877,6 +879,12 @@ impl Guest for McpProvider {
             .map_err(|_| "MCP provider configuration is poisoned".to_string())?
             .clone_from(&configured);
         Ok(())
+    }
+
+    async fn describe() -> Result<String, String> {
+        // An MCP provider contributes tools, not model metadata; the host
+        // ignores every key this could carry.
+        Ok("{}".into())
     }
 
     async fn list_tools() -> String {
