@@ -478,9 +478,6 @@ pub struct JobView {
     pub state: JobState,
     /// Kind-specific detail, e.g. `exit code: 3`.
     pub detail: Option<String>,
-    pub exit_code: Option<i32>,
-    /// Unix milliseconds the job was registered at, for timing a running row.
-    pub started_ms: u128,
 }
 
 impl JobView {
@@ -511,8 +508,6 @@ impl From<JobSnapshot> for JobView {
             label: snapshot.label,
             state,
             detail: snapshot.detail,
-            exit_code: snapshot.exit_code,
-            started_ms: snapshot.started_ms,
         }
     }
 }
@@ -529,7 +524,6 @@ mod tests {
             status,
             detail: Some("exit code: 0".into()),
             exit_code: Some(0),
-            started_ms: 1234,
         }
     }
 
@@ -542,7 +536,6 @@ mod tests {
         assert!(view.is_subagent(), "the kind is what marks a delegation");
         assert_eq!(view.state, JobState::Completed);
         assert!(view.is_settled(), "a completed job is settled");
-        assert_eq!(view.started_ms, 1234, "the start time crosses the channel");
         assert_eq!(view.detail.as_deref(), Some("exit code: 0"));
     }
 

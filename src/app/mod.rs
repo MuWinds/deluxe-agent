@@ -7,9 +7,12 @@
 //! half stays testable without an egui context.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+#[cfg(test)]
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use eframe::egui;
 use tokio::sync::mpsc;
@@ -18,7 +21,9 @@ use uuid::Uuid;
 use crate::attachments::{self, ImageRef};
 use crate::config::{Config, API_KEY_ENV};
 use crate::image_ops;
-use crate::ipc::{Cmd, Event, JobState, JobView, LlmSettings, RunId, RunState, SecretValue};
+use crate::ipc::{Cmd, Event, LlmSettings, RunId, RunState, SecretValue};
+#[cfg(test)]
+use crate::ipc::{JobState, JobView};
 use crate::llm::UserTurn;
 use crate::plugins::{self, PluginCatalogue};
 use crate::session::{self, Session, Step, ToolResult};
@@ -1495,36 +1500,6 @@ fn event_run_id(event: &Event) -> RunId {
     }
 }
 
-/// The one-line status a job row shows: a running job's elapsed time, else the
-/// settled state (with the process's exit code when there is one).
-fn job_status_text(job: &JobView) -> String {
-    match job.state {
-        JobState::Running => format!("运行中 {}", format_elapsed(job.started_ms)),
-        JobState::Completed => match job.exit_code {
-            Some(0) | None => JobState::Completed.label().to_string(),
-            Some(code) => format!("{}（退出码 {code}）", JobState::Completed.label()),
-        },
-        other => other.label().to_string(),
-    }
-}
-
-/// A running job's age, from its Unix-millisecond start to now, in the shortest
-/// unit that fits: seconds under a minute, then minutes, then hours.
-fn format_elapsed(started_ms: u128) -> String {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or(started_ms);
-    let secs = now_ms.saturating_sub(started_ms) / 1000;
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m{}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
-    }
-}
-
 /// What a thumbnail or a chip says when hovered.
 fn attachment_caption(image: &ImageRef) -> String {
     let label = image.name.clone().unwrap_or_else(|| "图片".into());
@@ -1548,6 +1523,7 @@ fn project_name(project: &str) -> String {
         .to_string()
 }
 
+#[cfg(test)]
 fn shorten(text: &str, max: usize) -> String {
     let flat = text.replace('\n', " ");
     if flat.chars().count() <= max {
@@ -2571,8 +2547,6 @@ mod tests {
             label: format!("{id} label"),
             state,
             detail: None,
-            exit_code: None,
-            started_ms: 0,
         }
     }
 

@@ -1,14 +1,21 @@
 //! UI 层的统一入口。
-//!
-//! 这个目录正在逐步从单文件 ui.rs 拆分而来。
 
 mod common;
+mod composer;
 mod jobs;
-mod sidebar;
+mod messages;
+mod panels;
+mod primitives;
+mod tools;
+mod transcript;
 mod widgets;
+mod windows;
 
-// 主实现文件，包含 impl App 的所有 UI 方法
+// 主实现文件，包含 impl App 的核心 UI 方法
 mod impl_ui;
 
-// 重新导出主实现中的所有内容
-pub use impl_ui::*;
+// 重新导出测试需要的类型和常量
+#[allow(unused_imports)]
+pub use composer::COMPOSER_MAX_WIDTH;
+#[allow(unused_imports)]
+pub use messages::{draw_bubble, Message, BUBBLE_EDGE_GAP, CHAT_MARGIN_X};

@@ -100,9 +100,6 @@ pub struct JobSnapshot {
     pub detail: Option<String>,
     /// A process job's exit code, absent for result jobs and before exit.
     pub exit_code: Option<i32>,
-    /// When the job was registered, as Unix milliseconds. Carried so the window
-    /// can time a still-running job without a second clock of its own.
-    pub started_ms: u128,
 }
 
 impl JobSnapshot {
@@ -178,7 +175,6 @@ impl Job {
             status: self.status(),
             detail: self.detail.lock().map(|d| d.clone()).unwrap_or(None),
             exit_code: self.exit_code.lock().ok().and_then(|code| *code),
-            started_ms: self.started_ms,
         }
     }
 }
