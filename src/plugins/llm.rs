@@ -264,9 +264,8 @@ impl LlmProvider {
 
     /// Whether another attempt is allowed after `retry` failures.
     fn may_retry(&self, retry: u64) -> bool {
-        !self
-            .retry_limit
-            .is_some_and(|limit| retry >= u64::from(limit))
+        self.retry_limit
+            .is_none_or(|limit| retry < u64::from(limit))
     }
 }
 
