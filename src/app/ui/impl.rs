@@ -11,7 +11,7 @@
 //! area sizes itself from what is left; drawn the other way round the two
 //! overlap.
 
-use super::*;
+use super::super::*;
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -41,7 +41,7 @@ use crate::renderer::protocol::{
 use crate::session::{self, Session, Step, ToolResult};
 use crate::theme::{self, Palette, ThemeChoice};
 
-use super::render_cache;
+use super::super::render_cache;
 
 /// Width of the far-left icon rail.
 const RAIL_WIDTH: f32 = 52.0;
@@ -147,7 +147,7 @@ impl App {
         self.draw_settings(&ctx, &p, &mut intents);
         self.draw_about(&ctx, &p);
         self.draw_plugins(&ctx, &mut intents);
-        super::plugin_ui::draw(&ctx, self, &mut intents);
+        super::super::plugin_ui::draw(&ctx, self, &mut intents);
         self.draw_subagent_window(&ctx, &p, resources, &mut intents);
 
         let effects = self.apply_intents(intents);
@@ -1529,7 +1529,7 @@ impl App {
                 ui.add_space(6.0);
 
                 let surfaces =
-                    super::view_model::plugin_surfaces(&self.catalogue, Path::new(&project));
+                    super::super::view_model::plugin_surfaces(&self.catalogue, Path::new(&project));
                 if !surfaces.is_empty() {
                     ui.label(
                         RichText::new(format!("项目界面 · {}", project_name(&project))).strong(),
