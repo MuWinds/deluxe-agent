@@ -1,8 +1,7 @@
 //! Domain state owned by the application controller.
 //!
-//! This module deliberately contains no egui types. GUI-only resources such as
-//! texture handles live in [`super::resources`], while the renderer consumes
-//! this state through the controller methods in the parent module.
+//! This module deliberately contains no egui types. The renderer consumes this
+//! state through the controller methods in the parent module.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -12,7 +11,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::attachments::ImageRef;
+use crate::attachments::Attachment;
 use crate::config::Config;
 use crate::ipc::{Cmd, Event, JobView, RunId};
 use crate::llm::ThinkingLevel;
@@ -74,8 +73,8 @@ pub struct App {
 
     pub(super) config: Config,
     /// The model provider plugin's self-description, read from the plugin. The
-    /// host owns neither the model name nor the key, so the image entry is
-    /// gated on `image_input` and the context gauge reads `context_tokens`.
+    /// host owns neither the model name nor the key, so it only reads the
+    /// context window the gauge shows and whether `read_image` is offered.
     pub(super) llm_descriptor: PluginDescriptor,
     /// Whether the model-provider plugin loaded. False means no run can reach a
     /// model, and the composer says so instead of offering to send.
@@ -97,7 +96,7 @@ pub struct App {
     pub(super) pending_plugin_request: Option<u64>,
 
     pub(super) prompt: String,
-    pub(super) pending_images: Vec<ImageRef>,
+    pub(super) pending_attachments: Vec<Attachment>,
     pub(super) thinking: Option<ThinkingLevel>,
     pub(super) search: String,
     pub(super) expanded_reasoning: HashSet<Uuid>,

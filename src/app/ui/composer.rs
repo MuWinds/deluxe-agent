@@ -3,15 +3,16 @@
 use eframe::egui;
 use egui::{Color32, CornerRadius, Frame, Margin, Pos2, RichText, Stroke, Vec2};
 
-use crate::attachments::ImageRef;
+use crate::attachments::Attachment;
 use crate::icons;
 use crate::llm::ThinkingLevel;
 use crate::session::Session;
 use crate::theme::{self, Palette};
 
-use super::super::{chip_label, format_tokens, App, UiIntent};
+use super::super::{attachment_label, format_tokens, App, UiIntent};
 use super::jobs::draw_job_row;
 use super::primitives::{circle_button, COMPOSER_BUTTON};
+use super::widgets::attachment_icon;
 
 /// The composer stops growing past this, and is centred in the main area.
 pub const COMPOSER_MAX_WIDTH: f32 = 820.0;
@@ -114,8 +115,8 @@ impl App {
                                 }
                             });
 
-                            if !self.pending_images.is_empty() {
-                                self.draw_pending_image_strip(ui, p, intents);
+                            if !self.pending_attachments.is_empty() {
+                                self.draw_pending_attachment_strip(ui, p, intents);
                             }
                         });
 
@@ -294,8 +295,8 @@ impl App {
         response.on_hover_text(summary);
     }
 
-    /// The queued images inside the composer, each removable.
-    fn draw_pending_image_strip(
+    /// The queued attachments inside the composer, each removable.
+    fn draw_pending_attachment_strip(
         &mut self,
         ui: &mut egui::Ui,
         p: &Palette,
@@ -303,12 +304,11 @@ impl App {
     ) {
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
-            for index in (0..self.pending_images.len()).rev() {
-                let id = format!("pending-image-{}", self.pending_images[index].id);
-                if remove_chip(ui, p, &id, &self.pending_images[index]).clicked() {
-                    intents.push(UiIntent::RemovePendingImage(
-                        self.pending_images[index].id.clone(),
-                    ));
+            for index in (0..self.pending_attachments.len()).rev() {
+                let attachment = &self.pending_attachments[index];
+                let id = format!("pending-attachment-{}", attachment.path);
+                if remove_chip(ui, p, &id, attachment).clicked() {
+                    intents.push(UiIntent::RemovePendingAttachment(attachment.path.clone()));
                 }
             }
         });
@@ -369,7 +369,12 @@ impl App {
     }
 }
 
-fn remove_chip(ui: &mut egui::Ui, p: &Palette, id: &str, image: &ImageRef) -> egui::Response {
+fn remove_chip(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    id: &str,
+    attachment: &Attachment,
+) -> egui::Response {
     ui.push_id(id, |ui| {
         Frame::NONE
             .fill(p.hover_bg)
@@ -378,12 +383,12 @@ fn remove_chip(ui: &mut egui::Ui, p: &Palette, id: &str, image: &ImageRef) -> eg
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(icons::IMAGE)
+                        RichText::new(attachment_icon(attachment))
                             .size(theme::font(12.0))
                             .color(p.text_muted),
                     );
                     ui.label(
-                        RichText::new(chip_label(image))
+                        RichText::new(attachment_label(attachment))
                             .size(theme::font(12.0))
                             .color(p.text),
                     );

@@ -2,11 +2,10 @@
 
 use eframe::egui;
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, FontId, TextureHandle};
+use egui::{Color32, FontId};
 
-use std::collections::HashMap;
-
-use crate::attachments::ImageRef;
+use crate::attachments::{self, Attachment};
+use crate::icons;
 
 /// LayoutJob 追加样式化文本。
 pub fn append_run(job: &mut LayoutJob, text: &str, font: &FontId, colour: Color32) {
@@ -21,33 +20,15 @@ pub fn append_run(job: &mut LayoutJob, text: &str, font: &FontId, colour: Color3
     );
 }
 
-/// 将图片加载为缩略图纹理。
-pub fn transcript_thumb(
-    thumbs: &mut HashMap<String, TextureHandle>,
-    ctx: &egui::Context,
-    image: &ImageRef,
-) -> Option<TextureHandle> {
-    use crate::attachments;
-    use crate::image_ops;
-
-    if let Some(cached) = thumbs.get(&image.id) {
-        return Some(cached.clone());
-    }
-
-    let bytes = attachments::load_bytes(image).ok()?;
-    let raster = if image.media_type == "image/jpeg" {
-        image_ops::decode_jpeg(&bytes).ok()?
+/// 附件 chip 的图标：受支持的图片用图片图标，其余用通用文件图标。
+pub fn attachment_icon(attachment: &Attachment) -> &'static str {
+    let extension = std::path::Path::new(&attachment.path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if attachments::media_type_for_extension(extension).is_some() {
+        icons::IMAGE
     } else {
-        image_ops::decode_png(&bytes).ok()?
-    };
-    let texture = ctx.load_texture(
-        format!("thumb://{}", image.id),
-        egui::ColorImage::from_rgba_unmultiplied(
-            [raster.width as usize, raster.height as usize],
-            &raster.rgba,
-        ),
-        egui::TextureOptions::default(),
-    );
-    thumbs.insert(image.id.clone(), texture.clone());
-    Some(texture)
+        icons::FILE
+    }
 }

@@ -3,7 +3,7 @@
 //! Every widget the app draws lives here; the view state it reads and the
 //! [`Cmd`]s it sends are defined in the parent module.
 
-use super::super::{App, GuiResources};
+use super::super::App;
 
 use eframe::egui;
 use egui::Frame;
@@ -16,20 +16,15 @@ impl App {
     /// Intake and polling run before the draw pass so this frame reflects the
     /// freshest state, and the deferred [`UiIntent`] values are applied after it, once
     /// the borrows the widgets held have been released.
-    pub fn ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        _frame: &mut eframe::Frame,
-        resources: &mut GuiResources,
-    ) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let p = theme::palette(self.config.theme);
         let ctx = ui.ctx().clone();
         let mut intents = Vec::new();
 
-        // Image intake is a whole-frame concern, not the composer widget's: the
+        // File intake is a whole-frame concern, not the composer widget's: the
         // chord works wherever the focus is, and a file can be dropped onto any
         // panel. Run before the draw pass so the chips appear this frame.
-        self.intake_pasted_images(&ctx);
+        self.intake_pasted_files(&ctx);
         self.intake_dropped_files(&ctx);
 
         // The composer's task list is a poll against the worker, throttled and
@@ -44,13 +39,13 @@ impl App {
         if self.show_sidebar {
             self.draw_sidebar(ui, &p, &mut intents);
         }
-        self.draw_main(ui, &p, &mut intents, resources);
+        self.draw_main(ui, &p, &mut intents);
 
         self.draw_settings(&ctx, &p, &mut intents);
         self.draw_about(&ctx, &p);
         self.draw_plugins(&ctx, &mut intents);
         super::super::plugin_ui::draw(&ctx, self, &mut intents);
-        self.draw_subagent_window(&ctx, &p, resources, &mut intents);
+        self.draw_subagent_window(&ctx, &p, &mut intents);
 
         let effects = self.apply_intents(intents);
         if effects.close {
@@ -76,13 +71,12 @@ impl App {
         ui: &mut egui::Ui,
         p: &crate::theme::Palette,
         intents: &mut Vec<super::super::UiIntent>,
-        resources: &mut GuiResources,
     ) {
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(p.main_bg))
             .show(ui, |ui| {
                 self.draw_composer(ui, p, intents);
-                self.draw_transcript(ui, p, resources);
+                self.draw_transcript(ui, p);
             });
     }
 }

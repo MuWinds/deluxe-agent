@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use eframe::egui;
-use egui::{Align, TextureHandle};
+use egui::Align;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -12,11 +12,12 @@ use crate::renderer::protocol::{Node, RenderKey, RenderMetrics, ToolRenderReques
 use crate::session::{Step, ToolResult};
 use crate::theme::Palette;
 
-use super::super::{App, Cmd, GuiResources};
+use super::super::{App, Cmd};
 use super::common::{render_metrics, tool_fingerprint, tool_result};
 use super::composer::COMPOSER_MAX_WIDTH;
 use super::messages::{
-    draw_agent_message, draw_bubble, draw_reasoning_block, draw_user_images, Message, CHAT_MARGIN_X,
+    draw_agent_message, draw_bubble, draw_reasoning_block, draw_user_attachments, Message,
+    CHAT_MARGIN_X,
 };
 use super::primitives::draw_empty_state;
 use super::tools::{draw_tool_card, ToolCard};
@@ -54,12 +55,7 @@ pub(super) enum PendingRender {
 
 impl App {
     /// The scrolling transcript for the open session, or the empty state.
-    pub(in crate::app) fn draw_transcript(
-        &mut self,
-        ui: &mut egui::Ui,
-        p: &Palette,
-        resources: &mut GuiResources,
-    ) {
+    pub(in crate::app) fn draw_transcript(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let stick = self.stick_to_bottom;
 
         let Some(index) = self
@@ -82,7 +78,6 @@ impl App {
         let rendered = self.collect_rendered(session_id, index, metrics);
         let steps = &self.sessions[index].steps;
         let expanded_reasoning = &mut self.expanded_reasoning;
-        let thumbs = &mut resources.thumbs;
 
         let output = egui::ScrollArea::vertical()
             .id_salt("transcript")
@@ -107,7 +102,7 @@ impl App {
                                     }
                                 }
                             }
-                            _ => draw_step(ui, p, step, salt, max_width, thumbs, &rendered),
+                            _ => draw_step(ui, p, step, salt, max_width, &rendered),
                         }
                     }
                 });
@@ -256,12 +251,11 @@ pub(super) fn draw_step(
     step: &Step,
     salt: (Uuid, usize),
     max_width: f32,
-    thumbs: &mut HashMap<String, TextureHandle>,
     rendered: &Rendered,
 ) {
     let nodes = rendered.message.get(&salt).map(|nodes| nodes.as_slice());
     match step {
-        Step::User { text, images } => {
+        Step::User { text, attachments } => {
             draw_bubble(
                 ui,
                 p,
@@ -274,7 +268,7 @@ pub(super) fn draw_step(
                 Align::Max,
                 max_width,
             );
-            draw_user_images(ui, salt, images, thumbs);
+            draw_user_attachments(ui, p, salt, attachments);
         }
         Step::Assistant { text } => {
             draw_agent_message(ui, p, Message { text, nodes, salt }, max_width)

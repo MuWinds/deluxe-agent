@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::attachments::ImageRef;
+use crate::attachments::{Attachment, ImageRef};
 use crate::context::summary_turn;
 use crate::error::{AgentError, Result};
 use crate::harness::SessionStore;
@@ -112,13 +112,13 @@ pub struct Session {
 pub enum Step {
     User {
         text: String,
-        /// Images attached to this prompt, as durable references. Empty for
-        /// every prompt the user typed without one.
+        /// Files attached to this prompt, as path references. Empty for every
+        /// prompt the user typed without one.
         ///
         /// `serde(default)` is what keeps a session written before the field
         /// existed loading: an old transcript simply has no attachments.
         #[serde(default)]
-        images: Vec<ImageRef>,
+        attachments: Vec<Attachment>,
     },
     Assistant {
         text: String,
@@ -379,15 +379,15 @@ impl Session {
     /// copy of the same text is a second thing that can go stale.
     pub fn title(&self) -> String {
         for step in &self.steps {
-            if let Step::User { text, images } = step {
-                // A prompt can be an image with no words, so an empty text is
-                // not "no title": fall back to how many pictures it carried
+            if let Step::User { text, attachments } = step {
+                // A prompt can be an attachment with no words, so an empty text
+                // is not "no title": fall back to how many files it carried
                 // rather than showing the empty-session placeholder.
                 if !text.trim().is_empty() {
                     return text.clone();
                 }
-                if !images.is_empty() {
-                    return format!("[{} 张图片]", images.len());
+                if !attachments.is_empty() {
+                    return format!("[{} 个附件]", attachments.len());
                 }
             }
         }
@@ -607,11 +607,11 @@ fn replay_plan(steps: &[Step]) -> Vec<Replayed> {
 
     while index < steps.len() {
         match &steps[index] {
-            Step::User { text, images } => {
+            Step::User { text, attachments } => {
                 plan.push((
                     Message::user_turn(UserTurn {
                         text: text.clone(),
-                        images: images.clone(),
+                        attachments: attachments.clone(),
                     }),
                     index,
                 ));
@@ -1004,7 +1004,7 @@ mod tests {
         let store = JsonSessionStore::new(Some(path.clone()));
         let mut session = session_with(vec![Step::User {
             text: "persist this".into(),
-            images: Vec::new(),
+            attachments: Vec::new(),
         }]);
         session.state = RunState::Running;
 
@@ -1110,7 +1110,7 @@ mod tests {
             },
             Step::User {
                 text: "new request".into(),
-                images: Vec::new(),
+                attachments: Vec::new(),
             },
             Step::Reasoning {
                 id: Uuid::new_v4(),
@@ -1140,7 +1140,7 @@ mod tests {
             },
             Step::User {
                 text: "fix the bug".into(),
-                images: Vec::new(),
+                attachments: Vec::new(),
             },
         ]);
         assert_eq!(session.title(), "fix the bug");
@@ -1151,7 +1151,7 @@ mod tests {
         let session = session_with(vec![
             Step::User {
                 text: "list the directory".into(),
-                images: Vec::new(),
+                attachments: Vec::new(),
             },
             Step::Reasoning {
                 id: Uuid::new_v4(),
@@ -1255,7 +1255,7 @@ mod tests {
         let session = session_with(vec![
             Step::User {
                 text: "read it".into(),
-                images: Vec::new(),
+                attachments: Vec::new(),
             },
             Step::Tool {
                 call_id: "call_7".into(),
@@ -1298,7 +1298,7 @@ mod tests {
         let session = session_with(vec![
             Step::User {
                 text: "read it".into(),
-                images: Vec::new(),
+                attachments: Vec::new(),
             },
             Step::Assistant {
                 text: "on it".into(),
@@ -1371,7 +1371,7 @@ mod tests {
         let session = session_with(vec![
             Step::User {
                 text: "run it".into(),
-                images: Vec::new(),
+                attachments: Vec::new(),
             },
             Step::HostMessage {
                 text: "job 3 finished".into(),
@@ -1588,7 +1588,7 @@ mod tests {
         // the previous process, and the transcript stops with no explanation.
         let mut session = session_with(vec![Step::User {
             text: "跑一下测试".into(),
-            images: Vec::new(),
+            attachments: Vec::new(),
         }]);
         session.state = RunState::Running;
         assert_eq!(session.state, RunState::Running);
@@ -1605,7 +1605,7 @@ mod tests {
     fn a_finished_session_is_left_alone() {
         let mut session = session_with(vec![Step::User {
             text: "你好".into(),
-            images: Vec::new(),
+            attachments: Vec::new(),
         }]);
         session.state = RunState::Finished;
         let before = session.steps.len();
@@ -1620,7 +1620,7 @@ mod tests {
         let mut session = session_with(vec![
             Step::User {
                 text: "fix the build".into(),
-                images: Vec::new(),
+                attachments: Vec::new(),
             },
             Step::Compaction {
                 summary: "Earlier: the user wants the build fixed.".into(),
@@ -1679,7 +1679,7 @@ mod tests {
         let session = session_with(vec![
             Step::User {
                 text: "fix the build".into(),
-                images: Vec::new(),
+                attachments: Vec::new(),
             },
             Step::Compaction {
                 summary: String::new(),
@@ -1700,10 +1700,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn attachments_replay_to_the_same_instruction() {
+        let attachment = crate::attachments::Attachment {
+            path: "/abs/report.pdf".into(),
+            name: "report.pdf".into(),
+            bytes: 42,
+        };
+        let session = session_with(vec![Step::User {
+            text: "summarise this".into(),
+            attachments: vec![attachment.clone()],
+        }]);
+
+        let replayed = session.to_messages();
+        let expected = Message::user_turn(UserTurn {
+            text: "summarise this".into(),
+            attachments: vec![attachment],
+        });
+        assert_eq!(replayed[0].text(), expected.text());
+    }
+
+    #[test]
+    fn the_title_falls_back_to_the_attachment_count() {
+        let session = session_with(vec![Step::User {
+            text: "   ".into(),
+            attachments: vec![crate::attachments::Attachment {
+                path: "/abs/a.png".into(),
+                name: "a.png".into(),
+                bytes: 1,
+            }],
+        }]);
+        assert_eq!(session.title(), "[1 个附件]");
+    }
+
     fn step_user(text: &str) -> Step {
         Step::User {
             text: text.into(),
-            images: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 

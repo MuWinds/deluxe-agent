@@ -112,7 +112,7 @@ strip = true
 #
 # `vendor/egui-winit` is 0.36.2 with that one `return` removed (marked in its
 # `src/lib.rs`), so the press arrives as an ordinary `Event::Key` and
-# `App::intake_pasted_images` reads the image itself. Its text paste is
+# `App::intake_pasted_files` reads the clipboard itself. Its text paste is
 # untouched, so nothing else changes.
 #
 # Drop this patch — and the vendored copy — the moment we are on a release

@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use agent::RunRequest;
-use app::{App, EventSink, GuiResources, Paths, RepaintSignal};
+use app::{App, EventSink, Paths, RepaintSignal};
 use harness::{
     AgentEvent, AgentEventSink, ConfigStore, NativeConfigStore, NativePluginManager, PluginManager,
     SessionStore,
@@ -200,7 +200,6 @@ fn main() -> eframe::Result<()> {
                     catalogue,
                     Paths { config_path },
                 ),
-                resources: GuiResources::default(),
                 runtime: Some(runtime),
             }))
         }),
@@ -1215,7 +1214,6 @@ fn note_surface_snapshot(acted: &AtomicBool, stale: &Mutex<HashSet<PathBuf>>, pr
 /// window instead of being dropped at the end of `main`.
 struct AgentFrame {
     app: App,
-    resources: GuiResources,
     /// Held for the process lifetime. Dropping it at the end of `main` would
     /// stop the agent the moment the window opens, so it lives here instead.
     runtime: Option<tokio::runtime::Runtime>,
@@ -1229,7 +1227,7 @@ impl eframe::App for AgentFrame {
     }
 
     fn ui(&mut self, ui: &mut eframe::egui::Ui, frame: &mut eframe::Frame) {
-        self.app.ui(ui, frame, &mut self.resources);
+        self.app.ui(ui, frame);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

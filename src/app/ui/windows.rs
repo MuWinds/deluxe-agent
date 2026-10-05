@@ -10,7 +10,7 @@ use crate::plugins;
 use crate::session;
 use crate::theme::{self, Palette};
 
-use super::super::{project_name, App, GuiResources, UiIntent};
+use super::super::{project_name, App, UiIntent};
 use super::messages::draw_reasoning_block;
 use super::primitives::draw_logo;
 use super::transcript::draw_step;
@@ -344,7 +344,6 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         p: &Palette,
-        resources: &mut GuiResources,
         intents: &mut Vec<UiIntent>,
     ) {
         let Some(job_id) = self.open_subagent.clone() else {
@@ -370,7 +369,6 @@ impl App {
         let salt = self.subagent_runs[index].salt;
         let steps = &self.subagent_runs[index].steps;
         let expanded_reasoning = &mut self.expanded_reasoning;
-        let thumbs = &mut resources.thumbs;
 
         egui::Window::new(title)
             .id(egui::Id::new(("subagent-window", &job_id)))
@@ -431,7 +429,6 @@ impl App {
                                     step,
                                     step_salt,
                                     max_width,
-                                    thumbs,
                                     &super::transcript::Rendered::default(),
                                 ),
                             }

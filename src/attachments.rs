@@ -1,16 +1,17 @@
-//! Durable image attachments.
+//! Attachments: path references for the user, durable copies for `read_image`.
 //!
-//! An image the model reads is copied into a store under the config directory
-//! and referenced by a small [`ImageRef`] — id, media type, byte size, pixel
-//! dimensions. The bytes never travel inside a reference: the session log keeps
-//! the reference and the bytes are read back only when a request is assembled.
-//! That is what keeps a conversation that read a dozen screenshots from
-//! blowing past the session store's size cap.
+//! A file the user attaches is kept as an [`Attachment`] — a path plus a name
+//! and size for display. Nothing is copied: the user turn carries the path and
+//! the model reads the file with `read_file` (text) or `read_image` (images),
+//! so any format works without the host understanding it.
 //!
-//! The copy is what makes a follow-up question still work. A reference to the
-//! original path would break the moment the file was edited, moved, or deleted;
-//! a copy is immutable, so the image the model saw is the image it sees again
-//! on every later turn.
+//! An image the model reads through `read_image` is a different thing: the tool
+//! copies it into a store under the config directory and returns an
+//! [`ImageRef`] — id, media type, byte size, pixel dimensions — whose bytes are
+//! inlined when the request is assembled. The copy is what makes a follow-up
+//! question still work: a reference to the original path would break the moment
+//! the file was edited, moved, or deleted, while a copy is immutable, so the
+//! image the model saw is the image it sees again on every later turn.
 
 use std::path::{Path, PathBuf};
 
@@ -24,14 +25,25 @@ use crate::image_ops;
 /// The largest image accepted, before base64 inflates it by a third.
 pub const MAX_IMAGE_BYTES: usize = 1_048_576;
 
-/// How many queued bytes the composer will hold before it refuses another
-/// image.
+/// A path reference to a file the user attached to a prompt.
 ///
-/// The whole queue rides in every later request, so an unbounded strip would
-/// quietly eat the context window on the next send. The cap is a multiple of
-/// the per-image limit rather than a round number of megabytes so the two stay
-/// in step if the per-image limit ever moves.
-const MAX_QUEUED_IMAGE_BYTES: usize = 8 * MAX_IMAGE_BYTES;
+/// The bytes never travel: the user turn carries the path and the model reads
+/// it with `read_file` (text) or `read_image` (images).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Attachment {
+    /// The absolute path.
+    ///
+    /// Stored as a `String` rather than a `PathBuf`: `PathBuf` serialises via
+    /// `Path::to_str` and errors on a non-UTF-8 path, and a failed session load
+    /// discards the whole store. A non-UTF-8 path is refused in [`from_paths`]
+    /// instead.
+    pub path: String,
+    /// The file's name, for display.
+    pub name: String,
+    /// The file's size in bytes, for display.
+    pub bytes: u64,
+}
 
 /// A durable reference to a stored image.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,17 +74,6 @@ impl ImageRef {
     fn path_in(&self, dir: &Path) -> PathBuf {
         dir.join(format!("{}.{}", self.id, extension(&self.media_type)))
     }
-}
-
-/// Reads a stored image's bytes back.
-///
-/// `data_url` is the wire form of this; the transcript wants the raw bytes so
-/// it can decode a thumbnail without re-parsing base64.
-pub fn load_bytes(image: &ImageRef) -> Result<Vec<u8>> {
-    let dir = store_dir()
-        .ok_or_else(|| AgentError::internal("No config directory is available on this system"))?;
-    std::fs::read(image.path_in(&dir))
-        .map_err(|error| AgentError::from_io("Failed to read a stored image", error))
 }
 
 /// Encodes bytes as the `data:` URL the OpenAI image part expects.
@@ -190,9 +191,8 @@ pub struct Prepared {
 /// Runs one candidate image through admission, in place, without storing it.
 ///
 /// This is the whole admission rule, shared by both entrances: `read_image`
-/// calls it for a file the model asked about, and the composer's intake —
-/// [`store_from_paths`] and [`store_from_bytes`] — calls it for a pasted or
-/// dropped image. An image already within the pixel budget is kept
+/// calls it for a file the model asked about, and [`store_blob`] calls it for a
+/// pasted bitmap. An image already within the pixel budget is kept
 /// byte-for-byte; an over-budget PNG or JPEG is decoded, downscaled, and
 /// re-encoded, with the budget halved and retried a bounded number of times —
 /// a lossless re-encode of a photograph can still land over the byte cap.
@@ -264,104 +264,83 @@ pub fn save_prepared(prepared: Prepared, name: Option<String>) -> Result<ImageRe
     )
 }
 
-/// Reads one dropped or picked path into an admitted candidate, without
-/// storing it.
+/// Builds one path reference per file, all-or-nothing.
 ///
-/// The resolution mirrors `read_image`'s: a path with no extension lets the
-/// content decide, a path whose extension names something other than a
-/// supported image is a mistake worth reporting by name, and an extension that
-/// disagrees with the content is refused rather than silently trusted. Nothing
-/// reaches the store until [`prepare`] has cleared the budgets.
-fn prepare_from_path(path: &Path) -> Result<(Prepared, Option<String>)> {
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("");
-    let declared = if extension.is_empty() {
-        None
-    } else {
-        match media_type_for_extension(extension) {
-            Some(media_type) => Some(media_type),
-            None => {
-                return Err(AgentError::invalid_params(format!(
-                    "`{}` has a `.{extension}` extension, which is not a supported image \
-                     format; PNG/JPEG/WebP/GIF are accepted",
-                    path.display()
-                )))
-            }
-        }
-    };
-
-    let bytes = std::fs::read(path).map_err(|error| {
-        AgentError::from_io(&format!("Failed to read `{}`", path.display()), error)
-    })?;
-
-    let media_type = match (declared, sniff(&bytes)) {
-        (Some(declared), Some(sniffed)) if declared != sniffed => {
-            return Err(AgentError::invalid_params(format!(
-                "`{}` has a `.{extension}` extension ({declared}) but its content is \
-                 {sniffed}; rename it to match its format",
-                path.display()
-            )))
-        }
-        (Some(declared), _) => declared,
-        (None, Some(sniffed)) => sniffed,
-        (None, None) => {
-            return Err(AgentError::invalid_params(format!(
-                "`{}` is not a supported image; PNG/JPEG/WebP/GIF are accepted",
-                path.display()
-            )))
-        }
-    };
-
-    let (width, height) = image_ops::dimensions(media_type, &bytes).unwrap_or((0, 0));
-    let prepared = prepare(media_type, &bytes, width, height)?;
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .map(str::to_string);
-    Ok((prepared, name))
-}
-
-/// Admits and stores a batch of dropped or picked files.
-///
-/// `queued_bytes` is what the composer already holds. The batch is checked as
-/// a whole against [`MAX_QUEUED_IMAGE_BYTES`] before anything is written, so a
-/// refusal leaves the strip exactly as it was — the all-or-nothing shape the
-/// composer's intake promises.
-pub fn store_from_paths(paths: &[PathBuf], queued_bytes: usize) -> Result<Vec<ImageRef>> {
-    let mut total = queued_bytes;
-    let mut admitted = Vec::with_capacity(paths.len());
+/// A directory, a missing path, or a path that is not valid UTF-8 is refused
+/// with a message that names it — a bad entry leaves the composer exactly as it
+/// was rather than attaching half a batch.
+pub fn from_paths(paths: &[PathBuf]) -> Result<Vec<Attachment>> {
+    let mut attachments = Vec::with_capacity(paths.len());
     for path in paths {
-        let (prepared, name) = prepare_from_path(path)?;
-        total = total.saturating_add(prepared.bytes.len());
-        if total > MAX_QUEUED_IMAGE_BYTES {
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            AgentError::from_io(&format!("Failed to read `{}`", path.display()), error)
+        })?;
+        if metadata.is_dir() {
             return Err(AgentError::invalid_params(format!(
-                "the queued images would pass the {} byte limit; send or remove some first",
-                MAX_QUEUED_IMAGE_BYTES
+                "`{}` is a directory; attach a file",
+                path.display()
             )));
         }
-        admitted.push((prepared, name));
+        let path = path
+            .to_str()
+            .ok_or_else(|| {
+                AgentError::invalid_params(format!(
+                    "`{}` is not valid UTF-8 and cannot be attached",
+                    path.display()
+                ))
+            })?
+            .to_string();
+        let name = Path::new(&path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(path.as_str())
+            .to_string();
+        attachments.push(Attachment {
+            path,
+            name,
+            bytes: metadata.len(),
+        });
     }
-
-    admitted
-        .into_iter()
-        .map(|(prepared, name)| save_prepared(prepared, name))
-        .collect()
+    Ok(attachments)
 }
 
-/// Admits and stores one image that arrived as bytes rather than as a path.
+/// Stores one clipboard bitmap that has no path of its own, returning a
+/// reference to the copy under the store.
 ///
-/// This is the clipboard's bitmap case: a screenshot or a "copy image" hands
-/// over pixels, which the caller has already re-encoded as a PNG, so there is
-/// no extension to check and nothing to name.
-pub fn store_from_bytes(bytes: &[u8], name: Option<String>) -> Result<Vec<ImageRef>> {
+/// A screenshot or a "copy image" hands over pixels, which the caller has
+/// already re-encoded as a PNG, so there is no extension to check and nothing
+/// to name. The bytes still run through [`prepare`], so an oversized image is
+/// downscaled here rather than refused later by `read_image`.
+pub fn store_blob(bytes: &[u8], name: Option<String>) -> Result<Attachment> {
     let media_type = sniff(bytes).ok_or_else(|| {
         AgentError::invalid_params("the pasted image is not a supported PNG/JPEG/WebP/GIF")
     })?;
     let (width, height) = image_ops::dimensions(media_type, bytes).unwrap_or((0, 0));
     let prepared = prepare(media_type, bytes, width, height)?;
-    Ok(vec![save_prepared(prepared, name)?])
+
+    let dir = store_dir()
+        .ok_or_else(|| AgentError::internal("No config directory is available on this system"))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| AgentError::from_io("Failed to create the attachment store", error))?;
+
+    let file_name = format!(
+        "{}.{}",
+        uuid::Uuid::new_v4(),
+        extension(prepared.media_type)
+    );
+    std::fs::write(dir.join(&file_name), &prepared.bytes)
+        .map_err(|error| AgentError::from_io("Failed to store a pasted image", error))?;
+
+    let path = dir
+        .join(&file_name)
+        .to_str()
+        .ok_or_else(|| AgentError::internal("the attachment path is not valid UTF-8"))?
+        .to_string();
+    Ok(Attachment {
+        path,
+        name: name.unwrap_or(file_name),
+        bytes: prepared.bytes.len() as u64,
+    })
 }
 
 /// Narrows a runtime media-type string to one of the known static ones.
@@ -471,10 +450,54 @@ mod tests {
     }
 
     #[test]
-    fn bytes_that_are_not_an_image_are_refused_before_anything_is_stored() {
+    fn from_paths_builds_a_reference_for_each_file() {
+        let dir = tempfile::tempdir().expect("a temp directory is available");
+        let first = dir.path().join("notes.txt");
+        let second = dir.path().join("shot.png");
+        std::fs::write(&first, b"hello").expect("the file writes");
+        std::fs::write(&second, b"png").expect("the file writes");
+
+        let attachments =
+            from_paths(&[first.clone(), second.clone()]).expect("both files are attached");
+
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].name, "notes.txt");
+        assert_eq!(attachments[0].bytes, 5);
+        assert_eq!(attachments[0].path, first.to_str().unwrap());
+        assert_eq!(attachments[1].name, "shot.png");
+    }
+
+    #[test]
+    fn from_paths_refuses_a_directory() {
+        let dir = tempfile::tempdir().expect("a temp directory is available");
+        let error = from_paths(&[dir.path().to_path_buf()]).unwrap_err();
+        assert!(error.to_string().contains("directory"), "{error}");
+    }
+
+    #[test]
+    fn from_paths_refuses_a_missing_path() {
+        let dir = tempfile::tempdir().expect("a temp directory is available");
+        let missing = dir.path().join("gone.txt");
+        assert!(from_paths(&[missing]).is_err());
+    }
+
+    #[test]
+    fn store_blob_writes_the_png_under_the_store() {
+        let config_dir = tempfile::tempdir().expect("a temp directory is available");
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, config_dir.path());
+        let bytes = png_of(8, 8);
+
+        let attachment = store_blob(&bytes, None).expect("the pasted image stores");
+
+        assert!(std::path::Path::new(&attachment.path).exists());
+        assert_eq!(attachment.bytes, bytes.len() as u64);
+    }
+
+    #[test]
+    fn a_blob_that_is_not_an_image_is_refused_before_anything_is_stored() {
         // The paste path's guard: a clipboard that holds neither files nor a
         // bitmap must fail with a clear message, not write a garbage attachment.
-        let error = store_from_bytes(b"not an image", None).unwrap_err();
+        let error = store_blob(b"not an image", None).unwrap_err();
         assert!(error.to_string().contains("supported"), "{error}");
     }
 }

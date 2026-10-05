@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::attachments::ImageRef;
+use crate::attachments::{Attachment, ImageRef};
 
 /// How much reasoning effort to ask a reasoning model for.
 ///
@@ -107,16 +107,16 @@ pub struct Message {
     pub tool_call_id: Option<String>,
 }
 
-/// A user turn's body: text plus, optionally, the attached images.
+/// A user turn's body: text plus the paths of any attached files.
 ///
 /// Carried as a struct rather than a bare string so the GUI can hand the
 /// composer's text and its attachments over in one value, and so history replay
-/// round-trips the attachments — an image pinned to one prompt travels with
-/// that prompt on every later turn.
+/// round-trips the attachments — a file pinned to one prompt travels with that
+/// prompt on every later turn.
 #[derive(Debug, Clone, Default)]
 pub struct UserTurn {
     pub text: String,
-    pub images: Vec<ImageRef>,
+    pub attachments: Vec<Attachment>,
 }
 
 /// A text-only turn, which is what most callers mean.
@@ -127,7 +127,7 @@ impl From<&str> for UserTurn {
     fn from(text: &str) -> Self {
         Self {
             text: text.to_string(),
-            images: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 }
@@ -136,7 +136,7 @@ impl From<String> for UserTurn {
     fn from(text: String) -> Self {
         Self {
             text,
-            images: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 }
@@ -191,42 +191,30 @@ impl MessageContent {
 }
 
 impl Message {
-    /// A user turn that may carry images.
+    /// A user turn, with any attached files listed as paths for the model.
     ///
-    /// Text-only turns keep the bare-string shape that has always gone over the
-    /// wire; only a turn with an image becomes a content-parts array. An image
-    /// whose stored bytes can no longer be read back degrades to a text note
-    /// rather than failing the run — the model loses the picture, not the turn.
+    /// Always a plain text body: an attachment is a path, not content, so the
+    /// message keeps the bare-string shape it has always had and the model
+    /// reads the file itself with `read_file` (text) or `read_image` (images).
+    /// The listing is deterministic, so a live turn and its replay produce
+    /// byte-identical text and the provider's prefix cache stays valid.
     pub fn user_turn(turn: UserTurn) -> Self {
-        if turn.images.is_empty() {
-            return Self::user(turn.text);
-        }
-
-        let mut parts = Vec::with_capacity(turn.images.len() + 1);
-        if !turn.text.is_empty() {
-            parts.push(ContentPart::Text { text: turn.text });
-        }
-        for image in &turn.images {
-            match image.data_url() {
-                Ok(url) => parts.push(ContentPart::ImageUrl {
-                    image_url: ImageUrl { url },
-                }),
-                Err(error) => {
-                    tracing::warn!(id = %image.id, %error, "a stored image could not be read back");
-                    let label = image.name.as_deref().unwrap_or(image.id.as_str());
-                    parts.push(ContentPart::Text {
-                        text: format!("[image {label} is no longer readable]"),
-                    });
-                }
+        let mut content = turn.text;
+        if !turn.attachments.is_empty() {
+            if !content.trim().is_empty() {
+                content.push_str("\n\n");
+            }
+            content.push_str(
+                "The user attached the following file(s). Read text files with `read_file` \
+                 and images with `read_image`:\n",
+            );
+            for attachment in &turn.attachments {
+                content.push_str("- ");
+                content.push_str(&attachment.path);
+                content.push('\n');
             }
         }
-
-        Self {
-            role: "user".into(),
-            content: Some(MessageContent::Parts(parts)),
-            tool_calls: None,
-            tool_call_id: None,
-        }
+        Self::user(content)
     }
 
     /// A `system` message — the assembled prompt, sent once at the head of a
@@ -482,6 +470,41 @@ mod tests {
     #[test]
     fn a_text_only_message_still_serialises_as_a_bare_string() {
         let value = serde_json::to_value(Message::user("hello")).unwrap();
+        assert_eq!(value["content"], "hello");
+    }
+
+    #[test]
+    fn a_user_turn_with_attachments_lists_their_paths() {
+        let turn = UserTurn {
+            text: "look".into(),
+            attachments: vec![
+                crate::attachments::Attachment {
+                    path: "/abs/a.pdf".into(),
+                    name: "a.pdf".into(),
+                    bytes: 12,
+                },
+                crate::attachments::Attachment {
+                    path: "/abs/b.png".into(),
+                    name: "b.png".into(),
+                    bytes: 34,
+                },
+            ],
+        };
+        let message = Message::user_turn(turn);
+        let Some(MessageContent::Text(text)) = message.content else {
+            panic!("attachments must stay a plain text body");
+        };
+        assert!(text.contains("look"), "{text}");
+        assert!(text.contains("read_file"), "{text}");
+        assert!(text.contains("read_image"), "{text}");
+        assert!(text.contains("- /abs/a.pdf"), "{text}");
+        assert!(text.contains("- /abs/b.png"), "{text}");
+    }
+
+    #[test]
+    fn a_user_turn_without_attachments_is_just_the_text() {
+        let message = Message::user_turn("hello".into());
+        let value = serde_json::to_value(&message).unwrap();
         assert_eq!(value["content"], "hello");
     }
 

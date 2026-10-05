@@ -1,21 +1,20 @@
 //! 消息绘制：气泡、代理消息、推理块
 
-use std::collections::HashMap;
 use std::hash::Hash;
 
 use eframe::egui;
-use egui::{Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, TextureHandle, Vec2};
+use egui::{Align, Color32, CornerRadius, Frame, Layout, Margin, RichText};
 use uuid::Uuid;
 
-use crate::attachments::ImageRef;
+use crate::attachments::Attachment;
 use crate::icons;
 use crate::renderer::present;
 use crate::renderer::protocol::Node;
 use crate::theme::{self, Palette};
 
-use super::super::attachment_caption;
+use super::super::attachment_label;
 use super::primitives::selectable_code;
-use super::widgets::transcript_thumb;
+use super::widgets::attachment_icon;
 
 /// The margin the chat column keeps from the panel's edges, shared by the
 /// transcript and the composer so their columns start and end on the same x.
@@ -27,9 +26,6 @@ pub const BUBBLE_EDGE_GAP: f32 = 14.0;
 
 /// Horizontal padding inside a bubble, between its edge and the text.
 const BUBBLE_PADDING_X: f32 = 12.0;
-
-/// What a user-message attachment renders as in the transcript.
-const TRANSCRIPT_THUMB: (f32, f32) = (180.0, 130.0);
 
 /// One transcript message as the drawing code needs it.
 pub struct Message<'a> {
@@ -210,30 +206,38 @@ pub(super) fn draw_reasoning_block(
     clicked
 }
 
-/// The images one user step was sent with, as thumbnails under its bubble.
-pub(super) fn draw_user_images(
+/// The files one user step was sent with, as chips under its bubble.
+pub(super) fn draw_user_attachments(
     ui: &mut egui::Ui,
+    p: &Palette,
     salt: (Uuid, usize),
-    images: &[ImageRef],
-    thumbs: &mut HashMap<String, TextureHandle>,
+    attachments: &[Attachment],
 ) {
-    if images.is_empty() {
+    if attachments.is_empty() {
         return;
     }
     ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
         ui.add_space(10.0);
-        for (image_index, image) in images.iter().enumerate() {
-            let Some(texture) = transcript_thumb(thumbs, ui.ctx(), image) else {
-                tracing::warn!(id = %image.id, "an attached image could no longer be rendered");
-                continue;
-            };
-            ui.push_id((salt, image_index), |ui| {
-                ui.add(
-                    egui::Image::from_texture(&texture)
-                        .max_size(Vec2::new(TRANSCRIPT_THUMB.0, TRANSCRIPT_THUMB.1))
-                        .corner_radius(CornerRadius::same(8)),
-                )
-                .on_hover_text(attachment_caption(image));
+        for (index, attachment) in attachments.iter().enumerate() {
+            ui.push_id((salt, index), |ui| {
+                Frame::NONE
+                    .fill(p.hover_bg)
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin::symmetric(8, 3))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(attachment_icon(attachment))
+                                    .size(theme::font(12.0))
+                                    .color(p.text_muted),
+                            );
+                            ui.label(
+                                RichText::new(attachment_label(attachment))
+                                    .size(theme::font(12.0))
+                                    .color(p.text),
+                            );
+                        });
+                    });
             });
         }
     });

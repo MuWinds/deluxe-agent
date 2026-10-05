@@ -18,7 +18,7 @@ use eframe::egui;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::attachments::{self, ImageRef};
+use crate::attachments::{self, Attachment};
 use crate::config::Config;
 use crate::image_ops;
 use crate::ipc::{Cmd, Event, LlmSettings, RunId, RunState};
@@ -34,7 +34,6 @@ mod events;
 mod intents;
 mod plugin_ui;
 mod render_cache;
-mod resources;
 mod state;
 mod ui;
 mod view_model;
@@ -42,7 +41,6 @@ mod view_model;
 use intents::{UiEffects, UiIntent};
 
 pub use events::{EventSink, RepaintSignal};
-pub use resources::GuiResources;
 use state::{ActiveRun, ConfigSurface, SubagentRun};
 pub use state::{App, Paths};
 
@@ -168,7 +166,7 @@ impl App {
             config_save_requests: HashMap::new(),
             pending_plugin_request: None,
             prompt: String::new(),
-            pending_images: Vec::new(),
+            pending_attachments: Vec::new(),
             thinking: None,
             search: String::new(),
             expanded_reasoning: HashSet::new(),
@@ -383,7 +381,7 @@ impl App {
                 // the job label's first line cannot.
                 run.steps.push(Step::User {
                     text: prompt,
-                    images: Vec::new(),
+                    attachments: Vec::new(),
                 });
                 return;
             }
@@ -750,7 +748,7 @@ impl App {
     /// question, asked where the button is drawn: the composer is a Stop button
     /// in that state, and one session running must not disable another.
     fn can_send(&self) -> bool {
-        !self.prompt.trim().is_empty() || !self.pending_images.is_empty()
+        !self.prompt.trim().is_empty() || !self.pending_attachments.is_empty()
     }
 
     /// Opens a fresh, empty session and shows the empty state.
@@ -850,14 +848,14 @@ impl App {
         let project = self.sending_project();
 
         let text = self.prompt.trim().to_string();
-        if text.is_empty() && self.pending_images.is_empty() {
+        if text.is_empty() && self.pending_attachments.is_empty() {
             return;
         }
         // The turn is built once here so the one recorded in the transcript and
         // the one sent to the worker cannot drift apart.
         let turn = UserTurn {
             text,
-            images: std::mem::take(&mut self.pending_images),
+            attachments: std::mem::take(&mut self.pending_attachments),
         };
         if !self.llm_available {
             self.notice_error(None, "LLM 供应商插件未启用，请在插件面板中启用它");
@@ -902,7 +900,7 @@ impl App {
                 // actually show up in the transcript — and survive a restart.
                 session.steps.push(Step::User {
                     text: turn.text.clone(),
-                    images: turn.images.clone(),
+                    attachments: turn.attachments.clone(),
                 });
                 // So the sidebar marks the session as running for the whole
                 // follow-up, not just for a session's first prompt.
@@ -921,7 +919,7 @@ impl App {
                 fresh.thinking = thinking;
                 fresh.steps.push(Step::User {
                     text: turn.text.clone(),
-                    images: turn.images.clone(),
+                    attachments: turn.attachments.clone(),
                 });
                 let id = fresh.id;
                 self.sessions.push(fresh);
@@ -940,7 +938,7 @@ impl App {
             },
         );
         self.prompt.clear();
-        self.pending_images.clear();
+        self.pending_attachments.clear();
         self.stick_to_bottom = true;
         self.mark_dirty();
 
@@ -1307,8 +1305,9 @@ impl App {
                 }
                 UiIntent::UninstallPlugin { id, scope } => self.uninstall_plugin(&id, &scope),
                 UiIntent::AddProject => self.add_project(),
-                UiIntent::RemovePendingImage(id) => {
-                    self.pending_images.retain(|image| image.id != id);
+                UiIntent::RemovePendingAttachment(path) => {
+                    self.pending_attachments
+                        .retain(|attachment| attachment.path != path);
                 }
                 UiIntent::SaveSettings => self.save_settings(),
                 UiIntent::CancelRun => self.cancel_run(),
@@ -1330,8 +1329,8 @@ impl App {
         effects
     }
 
-    /// Ctrl+V when the clipboard holds an image — the one paste egui-winit
-    /// cannot serve.
+    /// Ctrl+V when the clipboard holds files or an image — the one paste
+    /// egui-winit cannot serve.
     ///
     /// egui-winit owns Ctrl+V and forwards egui only the clipboard's *text*
     /// format. With an image on the clipboard — a screenshot, or a file copied
@@ -1340,7 +1339,7 @@ impl App {
     /// The vendored copy of egui-winit (see `[patch.crates-io]` in the root
     /// `Cargo.toml`) drops that swallow, so the press arrives here as an
     /// ordinary `Event::Key` — carrying the modifiers that were actually held —
-    /// and the image is read from this side. Without that patch this method
+    /// and the files are read from this side. Without that patch this method
     /// never fires at all.
     ///
     /// Matching the *press* is the whole point. The release carries whatever
@@ -1352,10 +1351,10 @@ impl App {
     ///
     /// `repeat` is filtered out because the swallow that used to sit in front of
     /// this also absorbed the auto-repeat: without the filter, holding the chord
-    /// down would queue the image once per repeat. egui fills the flag in from
+    /// down would queue the file once per repeat. egui fills the flag in from
     /// its own `keys_down` set, so `false` here means "the press that started
     /// this chord" and not "winit said not-a-repeat".
-    fn intake_pasted_images(&mut self, ctx: &egui::Context) {
+    fn intake_pasted_files(&mut self, ctx: &egui::Context) {
         let chord = ctx.input(|input| {
             input.events.iter().any(|event| {
                 matches!(
@@ -1376,24 +1375,24 @@ impl App {
         // A clipboard that also carries text was already served by egui-winit
         // on the same press. Some sources put both — a spreadsheet cell, a
         // "copy image address", a file copied by an app that also exports its
-        // path — and handling it here as well would attach the image *and*
-        // paste the text. Text wins; a clipboard with nothing but image data (a
-        // screenshot, "copy image") is exactly the case egui-winit dropped.
+        // path — and handling it here as well would attach the file *and* paste
+        // the text. Text wins; a clipboard with nothing but file or image data
+        // is exactly the case egui-winit dropped.
         if clipboard_has_text() {
             return;
         }
         // The chord fired, so the user meant to paste *something*: take the
-        // image when there is one, and say so in the conversation when there is
-        // not — the image problems belong where the conversation is.
-        if let Some(source) = clipboard_image() {
-            self.intake_image_source(source);
+        // files when there are any, and say so in the conversation when there
+        // are not — the paste problems belong where the conversation is.
+        if let Some(source) = clipboard_files() {
+            self.intake_attachment_source(source);
         } else {
-            self.notice_error(None, "剪贴板里没有图片或图片文件");
+            self.notice_error(None, "剪贴板里没有可附加的文件或图片");
         }
     }
 
-    /// Files dragged onto the window. The drop arrives as paths on every
-    /// native platform; anything that is not a readable image is skipped.
+    /// Files dragged onto the window. The drop arrives as paths on every native
+    /// platform; each is attached as a path reference.
     fn intake_dropped_files(&mut self, ctx: &egui::Context) {
         let paths: Vec<PathBuf> = ctx.input(|input| {
             input
@@ -1404,36 +1403,37 @@ impl App {
                 .collect()
         });
         if !paths.is_empty() {
-            self.intake_image_source(ClipboardImage::Paths(paths));
+            self.intake_attachment_source(AttachmentSource::Paths(paths));
         }
     }
 
-    /// Admits one batch of images into the composer, by path or by bytes.
+    /// Adds one batch of attachments to the composer, by path or by bytes.
     ///
-    /// The Harness shape: check the budget, refuse with one clear message, and
-    /// only then store. Nothing is half-admitted — a refusal leaves the strip
-    /// exactly as it was.
-    fn intake_image_source(&mut self, source: ClipboardImage) {
-        // The active provider profile declares its input modalities, and a
-        // text-only one cannot take a picture. Refusing here — the way the
-        // Harness refuses with `does not support image input` — beats queueing
-        // an image that would later fail at the provider, mid-turn.
-        if !self.llm_descriptor.image_input {
-            self.notice_error(
-                None,
-                "当前模型未开启图片输入；请在「LLM 供应商」里勾选「图片」",
-            );
-            return;
-        }
-        let total: usize = self.pending_images.iter().map(|image| image.bytes).sum();
+    /// All-or-nothing: a bad entry is reported with one clear message and
+    /// nothing is attached. A path already queued is skipped, because the path
+    /// is what the chip is keyed by.
+    fn intake_attachment_source(&mut self, source: AttachmentSource) {
         let result = match source {
-            ClipboardImage::Paths(paths) => attachments::store_from_paths(&paths, total),
-            ClipboardImage::Bytes { bytes, name } => attachments::store_from_bytes(&bytes, name),
+            AttachmentSource::Paths(paths) => attachments::from_paths(&paths),
+            AttachmentSource::Bytes { bytes, name } => {
+                attachments::store_blob(&bytes, name).map(|attachment| vec![attachment])
+            }
         };
         match result {
-            Ok(added) => self.pending_images.extend(added),
+            Ok(added) => {
+                let mut known: HashSet<String> = self
+                    .pending_attachments
+                    .iter()
+                    .map(|attachment| attachment.path.clone())
+                    .collect();
+                for attachment in added {
+                    if known.insert(attachment.path.clone()) {
+                        self.pending_attachments.push(attachment);
+                    }
+                }
+            }
             Err(error) => {
-                tracing::warn!(%error, "failed to store an attached image");
+                tracing::warn!(%error, "failed to attach a file");
                 self.notice_error(None, error.to_string());
             }
         }
@@ -1494,15 +1494,22 @@ fn event_run_id(event: &Event) -> RunId {
     }
 }
 
-/// What a thumbnail or a chip says when hovered.
-fn attachment_caption(image: &ImageRef) -> String {
-    let label = image.name.clone().unwrap_or_else(|| "图片".into());
-    format!(
-        "{label}\n{}×{} · {} KB",
-        image.width,
-        image.height,
-        image.bytes / 1024
-    )
+/// What a file chip shows: the name and size.
+fn attachment_label(attachment: &Attachment) -> String {
+    format!("{} · {}", attachment.name, format_bytes(attachment.bytes))
+}
+
+/// A byte size with the largest unit that keeps it readable.
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// The last path component, for the project list.
@@ -1527,12 +1534,12 @@ fn shorten(text: &str, max: usize) -> String {
     format!("{head}…")
 }
 
-/// A pasted or dropped image, before it is admitted to the store.
+/// Files offered by a paste or a drop, before they are admitted.
 ///
 /// Two shapes because the clipboard offers two: a list of file paths (a file
 /// copied in Explorer / Finder) and raw bitmap pixels (a screenshot, or "copy
 /// image"). A drop is always the first shape — the OS hands over paths.
-enum ClipboardImage {
+enum AttachmentSource {
     Paths(Vec<PathBuf>),
     Bytes {
         bytes: Vec<u8>,
@@ -1540,25 +1547,25 @@ enum ClipboardImage {
     },
 }
 
-/// The clipboard as an image, if it holds one.
+/// The clipboard as files or an image, if it holds either.
 ///
 /// Two shapes, in the order the platforms offer them: copied *files* arrive as
 /// a path list (Windows `CF_HDROP`, macOS `NSFilenamesPboard`, Linux
-/// `text/uri-list`) and are read from disk; a screenshot or "copy image" has no
-/// path at all and arrives as raw bitmap pixels, which arboard hands over as
-/// straight RGBA8 and [`image_ops::encode_png`] turns into the one shape the
-/// rest of the intake understands. `None` means the clipboard holds no image —
-/// the caller then leaves the key to egui's own text paste.
+/// `text/uri-list`) and are attached by path; a screenshot or "copy image" has
+/// no path at all and arrives as raw bitmap pixels, which arboard hands over as
+/// straight RGBA8 and [`image_ops::encode_png`] turns into a PNG that
+/// [`attachments::store_blob`] writes to the store. `None` means the clipboard
+/// holds neither — the caller then leaves the key to egui's own text paste.
 ///
 /// The file list is tried before the bitmap on purpose: a copied file keeps its
-/// name and is read straight from disk, while the bitmap a file also puts on
-/// the clipboard would be a lossy re-encode of the same picture.
-fn clipboard_image() -> Option<ClipboardImage> {
+/// name and its path, while the bitmap a file also puts on the clipboard would
+/// be a lossy re-encode of the same picture.
+fn clipboard_files() -> Option<AttachmentSource> {
     let mut clipboard = arboard::Clipboard::new().ok()?;
 
     if let Ok(paths) = clipboard.get().file_list() {
         if !paths.is_empty() {
-            return Some(ClipboardImage::Paths(paths));
+            return Some(AttachmentSource::Paths(paths));
         }
     }
 
@@ -1569,31 +1576,22 @@ fn clipboard_image() -> Option<ClipboardImage> {
         rgba: image.bytes.into_owned(),
     };
     let bytes = image_ops::encode_png(&raster).ok()?;
-    Some(ClipboardImage::Bytes { bytes, name: None })
+    Some(AttachmentSource::Bytes {
+        bytes,
+        name: Some("粘贴的图片.png".into()),
+    })
 }
 
 /// Whether the clipboard holds plain text.
 ///
 /// egui-winit reads the text format for every Ctrl+V, so text is the one case
 /// it already serves. Distinguishing it here is what keeps a file copy from
-/// being handled twice — see [`App::intake_pasted_images`].
+/// being handled twice — see [`App::intake_pasted_files`].
 fn clipboard_has_text() -> bool {
     arboard::Clipboard::new()
         .and_then(|mut clipboard| clipboard.get_text())
         .map(|text| !text.is_empty())
         .unwrap_or(false)
-}
-
-/// What a queued image is called in the composer strip.
-///
-/// A pasted file keeps its name; a pasted bitmap has none, so it is described
-/// by the only things known about it.
-fn chip_label(image: &ImageRef) -> String {
-    match &image.name {
-        Some(name) => name.clone(),
-        None if image.width > 0 && image.height > 0 => format!("{}×{}", image.width, image.height),
-        None => format!("{} KB", image.bytes / 1024),
-    }
 }
 
 #[cfg(test)]
@@ -1632,7 +1630,7 @@ mod tests {
         let mut session = Session::new("project");
         session.steps.push(Step::User {
             text: "继续".into(),
-            images: Vec::new(),
+            attachments: Vec::new(),
         });
         session.steps.push(Step::Notice {
             text: "https://tierflow.cn/v1/chat/completions returned 429 Too Many Requests".into(),
@@ -1654,8 +1652,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        let mut resources = GuiResources::default();
-        let mut output = ctx.run_ui(input, |ui| app.draw_transcript(ui, &p, &mut resources));
+        let mut output = ctx.run_ui(input, |ui| app.draw_transcript(ui, &p));
 
         // The bubble is the rect painted in the user's fill; the reply is
         // plain text, so the column's left edge is where its text starts.
@@ -3015,5 +3012,22 @@ mod tests {
             Some(Step::Reasoning { id: second, .. }) => assert_ne!(*second, first),
             other => panic!("expected a second reasoning step, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn attachment_labels_carry_name_and_size() {
+        let image = Attachment {
+            path: "/abs/shot.png".into(),
+            name: "shot.png".into(),
+            bytes: 2048,
+        };
+        let source = Attachment {
+            path: "/abs/main.rs".into(),
+            name: "main.rs".into(),
+            bytes: 512,
+        };
+        assert_eq!(attachment_label(&image), "shot.png · 2 KB");
+        assert_eq!(attachment_label(&source), "main.rs · 512 B");
+        assert_eq!(format_bytes(3 * 1024 * 1024), "3.0 MB");
     }
 }
