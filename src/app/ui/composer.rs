@@ -17,17 +17,13 @@ use super::widgets::attachment_icon;
 /// The composer stops growing past this, and is centred in the main area.
 pub const COMPOSER_MAX_WIDTH: f32 = 820.0;
 
+/// The input editor grows with its text only up to this, then scrolls.
+///
+/// Without the cap a large paste would push the controls out of the window.
+const EDITOR_MAX_HEIGHT: f32 = 160.0;
+
 /// Space between the gauge ring and its percentage.
 const GAUGE_RING_GAP: f32 = 7.0;
-
-/// Upper bound of the gauge box.
-const CONTEXT_GAUGE_RESERVE: f32 = 64.0;
-
-/// Upper bound of the thinking picker on the composer's input row.
-const THINKING_PICKER_RESERVE: f32 = 84.0;
-
-/// Space reserved on the input row for a plugin-contributed composer control.
-const COMPOSER_CONTROL_RESERVE: f32 = 150.0;
 
 /// Straight-line segments used to draw the gauge ring.
 const SEGMENTS_PER_RING: usize = 24;
@@ -66,53 +62,59 @@ impl App {
                         .show(ui, |ui| {
                             ui.set_width(width);
 
-                            ui.horizontal(|ui| {
-                                let composer_reserve = if self.composer.is_some() {
-                                    COMPOSER_CONTROL_RESERVE
-                                } else {
-                                    0.0
-                                };
-                                let editor_width = (ui.available_width()
-                                    - CONTEXT_GAUGE_RESERVE
-                                    - THINKING_PICKER_RESERVE
-                                    - COMPOSER_BUTTON
-                                    - composer_reserve
-                                    - 8.0)
-                                    .max(120.0);
-                                let editor = ui.add(
-                                    egui::TextEdit::multiline(&mut self.prompt)
-                                        .frame(Frame::NONE)
-                                        .desired_rows(1)
-                                        .desired_width(editor_width)
-                                        .hint_text("随心输入")
-                                        .margin(Margin::symmetric(2, 6)),
-                                );
-                                let enter = ui.input(|input| {
-                                    input.key_pressed(egui::Key::Enter) && !input.modifiers.shift
-                                });
-                                if editor.has_focus() && enter {
-                                    intents.push(UiIntent::SendPrompt);
-                                }
+                            // The editor takes the full width and grows with
+                            // its text only up to a cap, after which it scrolls.
+                            let editor = egui::ScrollArea::vertical()
+                                .id_salt("composer-editor")
+                                .max_height(EDITOR_MAX_HEIGHT)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut self.prompt)
+                                            .frame(Frame::NONE)
+                                            .desired_rows(1)
+                                            .desired_width(ui.available_width())
+                                            .hint_text("随心输入")
+                                            .margin(Margin::symmetric(2, 6)),
+                                    )
+                                })
+                                .inner;
+                            let enter = ui.input(|input| {
+                                input.key_pressed(egui::Key::Enter) && !input.modifiers.shift
+                            });
+                            if editor.has_focus() && enter {
+                                intents.push(UiIntent::SendPrompt);
+                            }
 
+                            // The controls live on their own row pinned to the
+                            // composer's bottom edge, so a tall editor never
+                            // floats them in its middle.
+                            ui.horizontal(|ui| {
                                 self.draw_composer_control(ui, intents);
                                 self.draw_thinking_picker(ui);
-                                self.draw_context_gauge(ui, p);
-
-                                if running {
-                                    if ui
-                                        .add(circle_button(icons::STOP_CIRCLE, p))
-                                        .on_hover_text("停止")
-                                        .clicked()
-                                    {
-                                        intents.push(UiIntent::CancelRun);
-                                    }
-                                } else if ui
-                                    .add_enabled(can_send, circle_button(icons::ARROW_UP, p))
-                                    .on_hover_text("发送")
-                                    .clicked()
-                                {
-                                    intents.push(UiIntent::SendPrompt);
-                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if running {
+                                            if ui
+                                                .add(circle_button(icons::STOP_CIRCLE, p))
+                                                .on_hover_text("停止")
+                                                .clicked()
+                                            {
+                                                intents.push(UiIntent::CancelRun);
+                                            }
+                                        } else if ui
+                                            .add_enabled(
+                                                can_send,
+                                                circle_button(icons::ARROW_UP, p),
+                                            )
+                                            .on_hover_text("发送")
+                                            .clicked()
+                                        {
+                                            intents.push(UiIntent::SendPrompt);
+                                        }
+                                        self.draw_context_gauge(ui, p);
+                                    },
+                                );
                             });
 
                             if !self.pending_attachments.is_empty() {

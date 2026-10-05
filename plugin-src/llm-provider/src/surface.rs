@@ -47,12 +47,6 @@ fn providers_document(request: &Value, revision: u64) -> String {
 
     let mut children = vec![
         json!({"type": "text", "text": "供应商", "emphasis": "strong"}),
-        json!({
-            "type": "text",
-            "text": "每个供应商是一份档案，切换「设为当前」即可更换。协议决定请求与流的形状；\
-                     密钥留空时按档案 id 向宿主取（环境变量 DELUXE_AGENT_SECRET_<ID> 或系统凭据库）。",
-            "emphasis": "muted"
-        }),
     ];
 
     let active = config
