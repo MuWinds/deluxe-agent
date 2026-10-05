@@ -45,9 +45,7 @@ fn providers_document(request: &Value, revision: u64) -> String {
     let surface_id = surface_id(request).unwrap_or_else(|| "providers".to_string());
     let config = config::snapshot().unwrap_or_default();
 
-    let mut children = vec![
-        json!({"type": "text", "text": "供应商", "emphasis": "strong"}),
-    ];
+    let mut children = vec![json!({"type": "text", "text": "供应商", "emphasis": "strong"})];
 
     let active = config
         .providers
