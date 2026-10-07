@@ -240,13 +240,6 @@ impl Tool for ListDir {
         let raw_path = required_str(&arguments, "path")?;
         let root = settings.resolve(&raw_path)?;
 
-        if !root.is_dir() {
-            return Err(AgentError::invalid_params(format!(
-                "`{}` is not a directory",
-                root.display()
-            )));
-        }
-
         let recursive = optional_bool(&arguments, "recursive", false);
         let include_hidden = optional_bool(&arguments, "includeHidden", false);
         let max_entries = clamp_u64(optional_u64(&arguments, "maxEntries", 500), 1, 5000) as usize;
@@ -260,73 +253,23 @@ impl Tool for ListDir {
             None => None,
         };
 
-        let mut lines: Vec<String> = Vec::new();
-        let mut count = 0usize;
-        let mut hit_limit = false;
-
-        if recursive {
-            // `max_depth` is unbounded on purpose: the entry cap is what bounds
-            // the walk, so a deep tree still terminates promptly.
-            let walker = walkdir::WalkDir::new(&root).follow_links(false).into_iter();
-            for entry in walker.filter_entry(|entry| include_hidden || !is_hidden(entry.path())) {
-                let Ok(entry) = entry else { continue };
-                if entry.path() == root {
-                    continue;
-                }
-                if let Some(matcher) = &filter {
-                    let relative = entry.path().strip_prefix(&root).unwrap_or(entry.path());
-                    if !matcher.is_match(relative) {
-                        continue;
-                    }
-                }
-                if count >= max_entries {
-                    hit_limit = true;
-                    break;
-                }
-                lines.push(describe_entry(
-                    entry.path(),
-                    entry.file_type().is_dir(),
-                    &root,
-                ));
-                count += 1;
-            }
-        } else {
-            let mut reader = tokio::fs::read_dir(&root)
-                .await
-                .map_err(|error| AgentError::from_io("Failed to read directory", error))?;
-            while let Some(entry) = reader
-                .next_entry()
-                .await
-                .map_err(|error| AgentError::from_io("Failed to read directory entry", error))?
-            {
-                let path = entry.path();
-                if !include_hidden && is_hidden(&path) {
-                    continue;
-                }
-                if let Some(matcher) = &filter {
-                    let name = entry.file_name();
-                    if !matcher.is_match(std::path::Path::new(&name)) {
-                        continue;
-                    }
-                }
-                if count >= max_entries {
-                    hit_limit = true;
-                    break;
-                }
-                let is_dir = entry
-                    .file_type()
-                    .await
-                    .map(|kind| kind.is_dir())
-                    .unwrap_or(false);
-                lines.push(describe_entry(&path, is_dir, &root));
-                count += 1;
-            }
-        }
-
-        lines.sort();
+        let root_display = root.display().to_string();
+        // The walk, each entry's `metadata`, and the sort all touch the disk;
+        // one blocking worker keeps them off the async runtime's threads.
+        let (lines, count, hit_limit) = tokio::task::spawn_blocking(move || {
+            collect_entries(
+                &root,
+                recursive,
+                include_hidden,
+                max_entries,
+                filter.as_ref(),
+            )
+        })
+        .await
+        .map_err(|error| AgentError::internal(format!("list_dir worker failed: {error}")))??;
         let header = format!(
             "{} — {} entr{}{}\n",
-            root.display(),
+            root_display,
             count,
             if count == 1 { "y" } else { "ies" },
             if hit_limit {
@@ -348,6 +291,84 @@ impl Tool for ListDir {
             hunks: Vec::new(),
         })
     }
+}
+
+/// Walks `root`, returning the sorted entry lines, the count, and whether the
+/// cap cut the walk short.
+///
+/// Blocking throughout — `std::fs` and `walkdir` — so it runs on a blocking
+/// worker, never on an async thread.
+fn collect_entries(
+    root: &std::path::Path,
+    recursive: bool,
+    include_hidden: bool,
+    max_entries: usize,
+    filter: Option<&globset::GlobMatcher>,
+) -> Result<(Vec<String>, usize, bool)> {
+    if !root.is_dir() {
+        return Err(AgentError::invalid_params(format!(
+            "`{}` is not a directory",
+            root.display()
+        )));
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut count = 0usize;
+    let mut hit_limit = false;
+
+    if recursive {
+        // `max_depth` is unbounded on purpose: the entry cap is what bounds the
+        // walk, so a deep tree still terminates promptly.
+        let walker = walkdir::WalkDir::new(root).follow_links(false).into_iter();
+        for entry in walker.filter_entry(|entry| include_hidden || !is_hidden(entry.path())) {
+            let Ok(entry) = entry else { continue };
+            if entry.path() == root {
+                continue;
+            }
+            if let Some(matcher) = filter {
+                let relative = entry.path().strip_prefix(root).unwrap_or(entry.path());
+                if !matcher.is_match(relative) {
+                    continue;
+                }
+            }
+            if count >= max_entries {
+                hit_limit = true;
+                break;
+            }
+            lines.push(describe_entry(
+                entry.path(),
+                entry.file_type().is_dir(),
+                root,
+            ));
+            count += 1;
+        }
+    } else {
+        let reader = std::fs::read_dir(root)
+            .map_err(|error| AgentError::from_io("Failed to read directory", error))?;
+        for entry in reader {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if !include_hidden && is_hidden(&path) {
+                continue;
+            }
+            if let Some(matcher) = filter {
+                let name = entry.file_name();
+                if !matcher.is_match(std::path::Path::new(&name)) {
+                    continue;
+                }
+            }
+            if count >= max_entries {
+                hit_limit = true;
+                break;
+            }
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            lines.push(describe_entry(&path, is_dir, root));
+            count += 1;
+        }
+    }
+
+    lines.sort();
+    Ok((lines, count, hit_limit))
 }
 
 fn is_hidden(path: &std::path::Path) -> bool {

@@ -55,6 +55,12 @@ const MAX_WAIT_MS: u64 = 600_000;
 /// blow up the transcript.
 const MAX_LABEL_CHARS: usize = 120;
 
+/// How many jobs the registry retains. Once exceeded, the oldest *settled* jobs
+/// are dropped — a running job is never dropped. Without this a long-lived
+/// window that starts many background jobs would hold every one of their
+/// (up to 512 KB) output buffers for the life of the process.
+const MAX_JOBS: usize = 64;
+
 pub type JobId = String;
 
 /// How a job ended, or that it has not.
@@ -360,10 +366,22 @@ impl JobRegistry {
             reported: AtomicBool::new(false),
             payload,
         });
-        self.jobs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(Arc::clone(&job));
+        let dropped = {
+            let mut jobs = self
+                .jobs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            jobs.push(Arc::clone(&job));
+            prune_jobs(&mut jobs)
+        };
+        if !dropped.is_empty() {
+            // A dropped job's completion notice goes with it: the model must
+            // not be told to `job_output` an id that no longer resolves.
+            self.pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|(id, _)| !dropped.contains(id));
+        }
         job
     }
 
@@ -520,6 +538,31 @@ impl JobRegistry {
             .map(|(_, notice)| notice)
             .collect()
     }
+}
+
+/// Drops the oldest settled jobs once `jobs` is over [`MAX_JOBS`], returning
+/// the ids it dropped.
+///
+/// Oldest-first by registration order, which is also the order `job_list`
+/// shows, so the jobs the model is most likely to still reference survive.
+/// A running job is skipped: it still owns a process or a future.
+fn prune_jobs(jobs: &mut Vec<Arc<Job>>) -> Vec<JobId> {
+    if jobs.len() <= MAX_JOBS {
+        return Vec::new();
+    }
+
+    let mut drop_budget = jobs.len() - MAX_JOBS;
+    let mut dropped = Vec::new();
+    jobs.retain(|job| {
+        if drop_budget > 0 && job.status().is_settled() {
+            drop_budget -= 1;
+            dropped.push(job.id.clone());
+            false
+        } else {
+            true
+        }
+    });
+    dropped
 }
 
 /// Which pipe a pump is draining.
@@ -823,6 +866,65 @@ mod tests {
 
     fn registry() -> Arc<JobRegistry> {
         Arc::new(JobRegistry::new())
+    }
+
+    /// A job already in a terminal state, for pruning tests that need no task.
+    fn settled_job(id: &str) -> Arc<Job> {
+        let (status, _) = watch::channel(JobStatus::Completed);
+        Arc::new(Job {
+            id: id.to_string(),
+            kind: "test",
+            label: id.to_string(),
+            started_ms: 0,
+            status,
+            detail: Mutex::new(None),
+            exit_code: Mutex::new(None),
+            cancel: CancellationToken::new(),
+            reported: AtomicBool::new(false),
+            payload: JobPayload::Result(Mutex::new(None)),
+        })
+    }
+
+    #[test]
+    fn pruning_drops_the_oldest_settled_jobs() {
+        let mut jobs: Vec<Arc<Job>> = (0..MAX_JOBS)
+            .map(|i| settled_job(&format!("j{i}")))
+            .collect();
+        jobs.push(settled_job("newest"));
+
+        let dropped = prune_jobs(&mut jobs);
+
+        assert_eq!(dropped, vec!["j0".to_string()], "the oldest job goes first");
+        assert_eq!(jobs.len(), MAX_JOBS, "the registry is back at its cap");
+        assert!(jobs.iter().any(|job| job.id == "newest"));
+    }
+
+    #[test]
+    fn pruning_never_drops_a_running_job() {
+        let (status, _) = watch::channel(JobStatus::Running);
+        let running = Arc::new(Job {
+            id: "running".to_string(),
+            kind: "test",
+            label: "running".to_string(),
+            started_ms: 0,
+            status,
+            detail: Mutex::new(None),
+            exit_code: Mutex::new(None),
+            cancel: CancellationToken::new(),
+            reported: AtomicBool::new(false),
+            payload: JobPayload::Result(Mutex::new(None)),
+        });
+        let mut jobs = vec![running.clone()];
+        jobs.extend((0..MAX_JOBS).map(|i| settled_job(&format!("j{i}"))));
+
+        let dropped = prune_jobs(&mut jobs);
+
+        assert_eq!(jobs.len(), MAX_JOBS);
+        assert!(
+            jobs.iter().any(|job| Arc::ptr_eq(job, &running)),
+            "a running job must survive pruning"
+        );
+        assert!(!dropped.contains(&"running".to_string()));
     }
 
     /// Runs `script` through the platform shell, the way `exec` does.

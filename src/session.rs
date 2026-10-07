@@ -519,15 +519,26 @@ impl Session {
     }
 
     /// Records a compaction whose brief replaces everything before the last
-    /// `keep` replayed messages, inserting the marker at that boundary.
+    /// `keep` replayed messages.
     ///
-    /// The marker must land *before* the kept tail, not at the end: the replay
-    /// cuts at the last non-empty marker, so a marker appended after the tail
-    /// would drop the very turns the compacting run kept. A marker with no
-    /// summary — a failed compaction — is appended instead, because nothing
-    /// was actually cut.
+    /// The folded prefix is *dropped*, not just marked: only the newest brief
+    /// is ever replayed (see [`to_messages`](Self::to_messages)), and that brief
+    /// already summarises every earlier brief, so keeping the folded steps would
+    /// grow a long session without bound while never reaching the model. The
+    /// marker therefore lands at the head of the transcript, before the kept
+    /// tail, which is exactly where the replay cuts.
+    ///
+    /// A marker with no summary — a failed compaction — is appended instead,
+    /// because nothing was actually cut.
     pub fn record_compaction(&mut self, summary: String, keep: usize) {
-        if summary.trim().is_empty() || keep == 0 {
+        if summary.trim().is_empty() {
+            self.steps.push(Step::Compaction { summary });
+            return;
+        }
+
+        // A zero tail folds the entire surface, including any earlier brief.
+        if keep == 0 {
+            self.steps.clear();
             self.steps.push(Step::Compaction { summary });
             return;
         }
@@ -539,15 +550,15 @@ impl Session {
 
         if keep >= plan.len() {
             // The whole surface is the kept tail: the run folded only the
-            // previous brief. The new marker goes right after that brief, so
-            // it is the last marker and the whole surface still replays after
-            // it. With no previous marker this cannot happen — a kept tail is
-            // always shorter than the surface.
+            // previous brief, which the new one replaces. With no previous
+            // brief this cannot happen — a kept tail is always shorter than
+            // the surface — so the marker is appended and nothing is cut.
             if start == 0 {
                 self.steps.push(Step::Compaction { summary });
                 return;
             }
-            self.steps.insert(start, Step::Compaction { summary });
+            self.steps.drain(..start);
+            self.steps.insert(0, Step::Compaction { summary });
             return;
         }
 
@@ -562,7 +573,8 @@ impl Session {
             self.steps.push(Step::Compaction { summary });
             return;
         }
-        self.steps.insert(boundary, Step::Compaction { summary });
+        self.steps.drain(..boundary);
+        self.steps.insert(0, Step::Compaction { summary });
     }
 
     /// Where the last compaction that actually produced a brief sits.
@@ -1776,8 +1788,10 @@ mod tests {
             ],
             "the brief must replace the folded prefix and keep the tail"
         );
-        // The marker sits at the boundary, not at the end.
-        assert!(matches!(session.steps[4], Step::Compaction { .. }));
+        // The folded prefix is dropped, not merely marked: only the brief and
+        // the kept tail remain, which is what bounds a long session's memory.
+        assert_eq!(session.steps.len(), 4, "the folded prefix must be gone");
+        assert!(matches!(session.steps[0], Step::Compaction { .. }));
     }
 
     #[test]
@@ -1812,9 +1826,10 @@ mod tests {
                 .iter()
                 .filter(|step| matches!(step, Step::Compaction { .. }))
                 .count(),
-            2,
-            "the old marker stays in the transcript"
+            1,
+            "the new brief replaces the old marker rather than stacking on it"
         );
+        assert_eq!(session.steps.len(), 4, "the folded prefix is dropped");
     }
 
     #[test]
@@ -1847,6 +1862,10 @@ mod tests {
                 "prompt".to_string(),
             ]
         );
+        // The old brief and everything before it is gone; the new brief heads
+        // the transcript.
+        assert_eq!(session.steps.len(), 6, "the old surface is dropped");
+        assert!(matches!(session.steps[0], Step::Compaction { .. }));
     }
 
     #[test]
@@ -1871,6 +1890,32 @@ mod tests {
         session.record_compaction("brief".into(), 0);
 
         assert_eq!(rendered(&session), vec![summary_turn("brief").text()]);
+        assert_eq!(session.steps.len(), 1, "the whole transcript is folded");
+        assert!(matches!(session.steps[0], Step::Compaction { .. }));
+    }
+
+    #[test]
+    fn repeated_compactions_do_not_grow_the_transcript() {
+        let mut session = session_with(Vec::new());
+        for round in 0..5 {
+            for turn in 0..4 {
+                session.steps.push(step_user(&format!("u{round}{turn}")));
+                session
+                    .steps
+                    .push(step_assistant(&format!("a{round}{turn}")));
+            }
+            session.record_compaction(format!("brief {round}"), 2);
+        }
+
+        // Every round folds all but the two kept turns, so the transcript is a
+        // brief plus a short tail no matter how many rounds ran. Before the
+        // prefix was dropped this grew by eight steps per round.
+        assert!(
+            session.steps.len() <= 4,
+            "the transcript grew across compactions: {} steps",
+            session.steps.len()
+        );
+        assert!(matches!(session.steps[0], Step::Compaction { .. }));
     }
 
     #[test]

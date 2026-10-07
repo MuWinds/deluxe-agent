@@ -138,19 +138,28 @@ impl Tool for ReadImage {
             }
         };
 
-        let (width, height) = image_ops::dimensions(media_type, &bytes).unwrap_or((0, 0));
-        let prepared =
-            attachments::prepare(media_type, &bytes, width, height).map_err(|error| {
-                // A refusal to downscale is the model's to fix, so it is a tool
-                // error rather than a failed run.
-                AgentError::invalid_params(format!("cannot read `{}`: {error}", path.display()))
-            })?;
-
         let name = path
             .file_name()
             .and_then(|value| value.to_str())
             .map(str::to_string);
-        let image = attachments::save_prepared(prepared, name)?;
+        let display = path.display().to_string();
+        let original_bytes = bytes.len();
+        let media_type = media_type.to_string();
+        // Decoding, resampling and re-encoding are CPU-bound, and storing the
+        // copy is blocking IO. Both belong on a blocking worker rather than
+        // stalling one of the runtime's async threads.
+        let image = tokio::task::spawn_blocking(move || {
+            let (width, height) = image_ops::dimensions(&media_type, &bytes).unwrap_or((0, 0));
+            let prepared =
+                attachments::prepare(&media_type, &bytes, width, height).map_err(|error| {
+                    // A refusal to downscale is the model's to fix, so it is a
+                    // tool error rather than a failed run.
+                    AgentError::invalid_params(format!("cannot read `{display}`: {error}"))
+                })?;
+            attachments::save_prepared(prepared, name)
+        })
+        .await
+        .map_err(|error| AgentError::internal(format!("read_image worker failed: {error}")))??;
 
         Ok(ToolOutput {
             content: vec![
@@ -167,7 +176,7 @@ impl Tool for ReadImage {
             ],
             is_error: false,
             truncated: false,
-            original_bytes: Some(bytes.len()),
+            original_bytes: Some(original_bytes),
             duration_ms: Some(started.elapsed().as_millis() as u64),
             hunks: Vec::new(),
         })

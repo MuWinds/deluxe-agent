@@ -1,8 +1,11 @@
 //! Component actors own their stores and service bounded calls on worker threads.
 
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -65,13 +68,13 @@ mod llm_bindings {
 pub fn validate_component_file(path: &Path) -> Result<()> {
     let bytes = std::fs::read(path)
         .map_err(|error| AgentError::from_io("Read Wasmtime component", error))?;
-    compile_component(&bytes).map(|_| ())
+    compile_cached(&bytes).map(|_| ())
 }
 
 /// Compiles embedded Component bytes without instantiating or granting them
 /// capabilities.
 pub fn validate_component_bytes(bytes: &[u8]) -> Result<()> {
-    compile_component(bytes).map(|_| ())
+    compile_cached(bytes).map(|_| ())
 }
 
 fn compile_component(bytes: &[u8]) -> Result<(Engine, Component)> {
@@ -84,6 +87,51 @@ fn compile_component(bytes: &[u8]) -> Result<(Engine, Component)> {
     let engine = Engine::new(&config).map_err(load_error)?;
     let component = Component::from_binary(&engine, bytes).map_err(load_error)?;
     Ok((engine, component))
+}
+
+/// Compiled components, keyed by a hash of their bytes.
+///
+/// Compilation is the expensive part of loading a Component, and the bundled
+/// ones — the agents provider and each prompt scope — are loaded on every
+/// runtime build (first run, a settings change, a model switch, an idle
+/// eviction). The bytes are immutable, so a compiled form is safe to reuse.
+static COMPILED: OnceLock<Mutex<HashMap<u64, (Engine, Component)>>> = OnceLock::new();
+
+/// How many distinct components stay compiled. Evicting one only costs a
+/// recompile, so a small cap covers the bundled plugins plus a few installed.
+const MAX_COMPILED: usize = 32;
+
+fn compiled_cache() -> &'static Mutex<HashMap<u64, (Engine, Component)>> {
+    COMPILED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Compiles `bytes`, reusing a cached compilation when the same bytes were
+/// compiled before. Blocking; call from a blocking worker.
+fn compile_cached(bytes: &[u8]) -> Result<(Engine, Component)> {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let key = hasher.finish();
+
+    if let Some((engine, component)) = compiled_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+    {
+        return Ok((engine.clone(), component.clone()));
+    }
+
+    let compiled = compile_component(bytes)?;
+    let mut cache = compiled_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= MAX_COMPILED {
+        // Evict an arbitrary entry; a wrong guess only costs a recompile.
+        if let Some(victim) = cache.keys().next().copied() {
+            cache.remove(&victim);
+        }
+    }
+    cache.insert(key, compiled.clone());
+    Ok(compiled)
 }
 
 struct StoreState {
@@ -441,7 +489,7 @@ impl ComponentActor {
     /// plugins that are shipped inside the host executable.
     pub async fn load_bytes(bytes: &[u8], capabilities: CapabilityHub) -> Result<Arc<Self>> {
         let bytes = bytes.to_vec();
-        let (engine, component) = tokio::task::spawn_blocking(move || compile_component(&bytes))
+        let (engine, component) = tokio::task::spawn_blocking(move || compile_cached(&bytes))
             .await
             .map_err(|error| AgentError::internal(format!("Component loader failed: {error}")))??;
         let mut instance = instantiate(&engine, &component, capabilities.clone()).await?;
@@ -719,4 +767,27 @@ fn guest_error(message: String) -> AgentError {
 
 fn cancelled_error() -> AgentError {
     AgentError::new(code::PLUGIN_CANCELLED, "Component call was cancelled")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_compiled_component_is_cached_by_its_bytes() {
+        let bytes = include_bytes!("../../plugin-src/echo-tool/plugin.wasm");
+        compile_cached(bytes).expect("the fixture component compiles");
+
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        let key = hasher.finish();
+
+        assert!(
+            compiled_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&key),
+            "a compiled component must be cached under its content hash"
+        );
+    }
 }

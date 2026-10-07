@@ -15,6 +15,15 @@ use uuid::Uuid;
 
 use crate::renderer::protocol::{Node, RenderKey};
 
+/// How many rendered items the cache holds before it evicts.
+///
+/// One entry per transcript item ever rendered, across every session opened
+/// this process, would otherwise grow without bound. The cap is generous
+/// relative to a session's step count, so switching between a few sessions
+/// stays warm; exceeding it costs a re-render, never correctness, because a
+/// served entry must still match its fingerprint.
+const MAX_ENTRIES: usize = 4096;
+
 /// Where one transcript item's render stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RenderStatus {
@@ -39,12 +48,21 @@ pub struct Entry {
     pub status: RenderStatus,
     /// The decoded display list, once ready.
     pub nodes: Option<Arc<Vec<Node>>>,
+    /// When this entry was last written, for the eviction order. Higher is more
+    /// recent; only the relative order matters.
+    pub seq: u64,
+    /// The cheap content signature last seen for this key, and the fingerprint
+    /// it produced. Lets a frame reuse the fingerprint of an unchanged item
+    /// instead of re-hashing its content. See [`RenderCache::fingerprint_for`].
+    pub memo: Option<(u64, u64)>,
 }
 
 /// In-memory only; never written to the session file.
 #[derive(Debug, Default)]
 pub struct RenderCache {
     entries: HashMap<RenderKey, Entry>,
+    /// Monotonic counter stamped onto an entry on every write.
+    tick: u64,
 }
 
 impl RenderCache {
@@ -73,30 +91,39 @@ impl RenderCache {
 
     /// Records that a request at `revision` is in flight for `key`.
     pub fn begin(&mut self, key: &RenderKey, revision: u64, fingerprint: u64) {
+        let seq = self.next_seq();
         let entry = self.entries.entry(key.clone()).or_default();
         entry.latest_revision = revision;
         entry.fingerprint = fingerprint;
         entry.status = RenderStatus::Pending;
+        entry.seq = seq;
+        self.prune();
     }
 
     /// Stores a display list if it is not stale.
     pub fn store(&mut self, key: &RenderKey, revision: u64, nodes: Arc<Vec<Node>>) {
+        let seq = self.next_seq();
         let entry = self.entries.entry(key.clone()).or_default();
         if revision >= entry.latest_revision {
             entry.latest_revision = revision;
             entry.nodes = Some(nodes);
             entry.status = RenderStatus::Ready;
+            entry.seq = seq;
         }
+        self.prune();
     }
 
     /// Marks a render as failed if it is not stale.
     pub fn fail(&mut self, key: &RenderKey, revision: u64) {
+        let seq = self.next_seq();
         let entry = self.entries.entry(key.clone()).or_default();
         if revision >= entry.latest_revision {
             entry.latest_revision = revision;
             entry.status = RenderStatus::Failed;
             entry.nodes = None;
+            entry.seq = seq;
         }
+        self.prune();
     }
 
     /// Drops entries whose session is no longer open.
@@ -115,6 +142,75 @@ impl RenderCache {
     /// retried, so the transcript would stay on the fallback forever.
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    /// Drops a session's message renders.
+    ///
+    /// A compaction rewrites the transcript and shifts step indices, so a
+    /// message entry keyed by index no longer describes the step now at that
+    /// index — and its memo would hand out the old fingerprint. Tool entries
+    /// are keyed by call id and survive a shift untouched.
+    pub fn clear_session_messages(&mut self, session: Uuid) {
+        self.entries.retain(
+            |key, _| !matches!(key, RenderKey::Message { session: s, .. } if *s == session),
+        );
+    }
+
+    /// The content fingerprint for `key`, recomputed by `compute` only when
+    /// `signature` differs from the last one seen for this key.
+    ///
+    /// `signature` is a cheap proxy for the item's render inputs — a length, or
+    /// a small tuple of lengths — that changes whenever the content does. This
+    /// is what stops `collect_rendered` from re-hashing every message and
+    /// serialising every tool result on every frame: an unchanged item reuses
+    /// the fingerprint it produced last time. It never touches `nodes` or
+    /// `status`, so it cannot serve a stale display list.
+    pub fn fingerprint_for(
+        &mut self,
+        key: &RenderKey,
+        signature: u64,
+        compute: impl FnOnce() -> u64,
+    ) -> u64 {
+        let entry = self.entries.entry(key.clone()).or_default();
+        match entry.memo {
+            Some((seen, fingerprint)) if seen == signature => fingerprint,
+            _ => {
+                let fingerprint = compute();
+                entry.memo = Some((signature, fingerprint));
+                fingerprint
+            }
+        }
+    }
+
+    /// The next recency stamp.
+    fn next_seq(&mut self) -> u64 {
+        self.tick = self.tick.wrapping_add(1);
+        self.tick
+    }
+
+    /// Evicts the least-recently-written entries once the cache is over
+    /// [`MAX_ENTRIES`].
+    ///
+    /// It evicts down to half the cap rather than to the cap, so an insert at
+    /// the limit does not sort on every call — pruning is rare instead. An
+    /// evicted entry that is still on screen is simply re-requested.
+    pub(super) fn prune(&mut self) {
+        if self.entries.len() <= MAX_ENTRIES {
+            return;
+        }
+
+        let target = MAX_ENTRIES / 2;
+        let mut order: Vec<(u64, RenderKey)> = self
+            .entries
+            .iter()
+            .map(|(key, entry)| (entry.seq, key.clone()))
+            .collect();
+        order.sort_unstable_by_key(|(seq, _)| *seq);
+
+        let drop_count = self.entries.len() - target;
+        for (_, key) in order.into_iter().take(drop_count) {
+            self.entries.remove(&key);
+        }
     }
 }
 
@@ -212,5 +308,120 @@ mod tests {
                 step: 0
             })
             .is_none());
+    }
+
+    #[test]
+    fn the_cache_stays_bounded_as_items_accumulate() {
+        let mut cache = RenderCache::default();
+        for step in 0..(MAX_ENTRIES + 10) {
+            let key = RenderKey::Message {
+                session: Uuid::nil(),
+                step,
+            };
+            cache.begin(&key, 1, step as u64);
+            cache.store(&key, 1, nodes());
+        }
+
+        assert!(
+            cache.entries.len() <= MAX_ENTRIES,
+            "the cache grew past its cap: {} entries",
+            cache.entries.len()
+        );
+    }
+
+    #[test]
+    fn pruning_keeps_the_most_recently_written_entry() {
+        let mut cache = RenderCache::default();
+        for step in 0..MAX_ENTRIES {
+            cache.begin(
+                &RenderKey::Message {
+                    session: Uuid::nil(),
+                    step,
+                },
+                1,
+                step as u64,
+            );
+        }
+
+        // Rewrite the oldest key, then overflow the cache: recency must protect
+        // it even though its step index is the smallest.
+        let keep = RenderKey::Message {
+            session: Uuid::nil(),
+            step: 0,
+        };
+        cache.begin(&keep, 2, u64::MAX);
+
+        for step in MAX_ENTRIES..(MAX_ENTRIES + 10) {
+            cache.begin(
+                &RenderKey::Message {
+                    session: Uuid::nil(),
+                    step,
+                },
+                1,
+                step as u64,
+            );
+        }
+
+        assert!(
+            cache.get(&keep).is_some(),
+            "the most recently written entry was evicted"
+        );
+    }
+
+    #[test]
+    fn a_fingerprint_is_reused_until_its_signature_changes() {
+        let mut cache = RenderCache::default();
+        let mut computes = 0;
+
+        let first = cache.fingerprint_for(&key(), 1, || {
+            computes += 1;
+            42
+        });
+        let same = cache.fingerprint_for(&key(), 1, || {
+            computes += 1;
+            99
+        });
+        let changed = cache.fingerprint_for(&key(), 2, || {
+            computes += 1;
+            7
+        });
+
+        assert_eq!(first, 42);
+        assert_eq!(same, 42, "an unchanged signature reuses the fingerprint");
+        assert_eq!(changed, 7, "a changed signature recomputes");
+        assert_eq!(computes, 2, "the expensive compute ran only on change");
+    }
+
+    #[test]
+    fn a_compaction_drops_only_the_sessions_message_renders() {
+        let mut cache = RenderCache::default();
+        let session = Uuid::new_v4();
+        cache.store(&RenderKey::Message { session, step: 0 }, 1, nodes());
+        cache.store(
+            &RenderKey::Tool {
+                session,
+                call_id: "call".into(),
+            },
+            1,
+            nodes(),
+        );
+
+        cache.clear_session_messages(session);
+
+        assert!(
+            cache
+                .get(&RenderKey::Message { session, step: 0 })
+                .is_none(),
+            "index-keyed message renders are dropped"
+        );
+        assert!(
+            cache
+                .get(&RenderKey::Tool {
+                    session,
+                    call_id: "call".into()
+                })
+                .is_some(),
+            "call-id-keyed tool renders survive the shift"
+        );
     }
 }

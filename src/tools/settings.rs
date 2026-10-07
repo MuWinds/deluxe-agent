@@ -7,6 +7,7 @@
 //! irreversibly, because that is the one mistake a user cannot undo.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -55,7 +56,12 @@ impl Default for ToolSettings {
     }
 }
 
-/// Commands refused when `block_destructive_commands` is on.
+/// Commands refused when `block_destructive_commands` is on, as
+/// `(pattern, reason)`.
+///
+/// The patterns are compiled once by [`destructive_regexes`], not per command:
+/// the common case (a safe command) matches none of them, so compiling eagerly
+/// on every call was pure overhead on the `exec` path.
 const DESTRUCTIVE_PATTERNS: &[(&str, &str)] = &[
     (
         r"(?i)\brm\s+(-[a-z]*\s+)*-[a-z]*[rf]",
@@ -101,13 +107,32 @@ impl ToolSettings {
             return None;
         }
 
-        DESTRUCTIVE_PATTERNS.iter().find_map(|(pattern, name)| {
-            Regex::new(pattern)
-                .ok()
-                .filter(|regex| regex.is_match(command))
-                .map(|_| *name)
-        })
+        destructive_regexes()
+            .iter()
+            .find_map(|(name, regex)| regex.is_match(command).then_some(*name))
     }
+}
+
+/// The compiled denylist, built on first use.
+///
+/// A pattern that fails to compile is logged and skipped: the table is a
+/// hard-coded constant, so a failure is a programming error, and refusing to
+/// run any command because one entry was malformed would be worse than dropping
+/// that entry.
+fn destructive_regexes() -> &'static [(&'static str, Regex)] {
+    static COMPILED: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
+    COMPILED.get_or_init(|| {
+        DESTRUCTIVE_PATTERNS
+            .iter()
+            .filter_map(|(pattern, name)| match Regex::new(pattern) {
+                Ok(regex) => Some((*name, regex)),
+                Err(error) => {
+                    tracing::warn!(pattern, %error, "ignoring an uncompilable denylist pattern");
+                    None
+                }
+            })
+            .collect()
+    })
 }
 
 /// Expands a leading `~` into the user's home directory.
@@ -201,5 +226,16 @@ mod tests {
             ..Default::default()
         };
         assert!(settings.destructive_reason("rm -rf /").is_none());
+    }
+
+    #[test]
+    fn every_denylist_pattern_compiles() {
+        // A pattern that failed to compile is skipped, silently widening the
+        // gap in the guard; the table is a constant, so this must never happen.
+        assert_eq!(
+            destructive_regexes().len(),
+            DESTRUCTIVE_PATTERNS.len(),
+            "a denylist pattern failed to compile"
+        );
     }
 }

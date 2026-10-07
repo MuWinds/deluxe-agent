@@ -545,6 +545,10 @@ impl App {
                     // the tail the compacting run kept verbatim.
                     session.record_compaction(summary.clone(), keep);
                 }
+                // The fold drops the prefix, so every later step moves down;
+                // the cached message renders no longer name the step at their
+                // index and must be dropped.
+                self.render_cache.clear_session_messages(session_id);
                 self.mark_dirty();
             }
 

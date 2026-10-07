@@ -13,7 +13,9 @@
 //! the file was edited, moved, or deleted, while a copy is immutable, so the
 //! image the model saw is the image it sees again on every later turn.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -61,13 +63,31 @@ pub struct ImageRef {
 
 impl ImageRef {
     /// The stored bytes as a `data:` URL, which is what the wire format wants.
+    ///
+    /// The encoding is cached: the bytes behind an id are written once and never
+    /// change, and this is called for every historical image on every send. The
+    /// read + base64 used to run on the egui thread each time, stalling the
+    /// window for as long as the disk took.
     pub fn data_url(&self) -> Result<String> {
+        if let Some(url) = data_url_cache()
+            .lock()
+            .unwrap_or_else(poison_guard)
+            .get(&self.id)
+        {
+            return Ok(url);
+        }
+
         let dir = store_dir().ok_or_else(|| {
             AgentError::internal("No config directory is available on this system")
         })?;
         let bytes = std::fs::read(self.path_in(&dir))
             .map_err(|error| AgentError::from_io("Failed to read a stored image", error))?;
-        Ok(data_url_from(&bytes, &self.media_type))
+        let url = data_url_from(&bytes, &self.media_type);
+        data_url_cache()
+            .lock()
+            .unwrap_or_else(poison_guard)
+            .insert(self.id.clone(), url.clone());
+        Ok(url)
     }
 
     /// Where the bytes live under `dir`.
@@ -80,6 +100,58 @@ impl ImageRef {
 pub fn data_url_from(bytes: &[u8], media_type: &str) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     format!("data:{media_type};base64,{encoded}")
+}
+
+/// Encoded data URLs, keyed by image id.
+///
+/// An id's bytes are immutable, so its encoding is too. The cache is populated
+/// when an image is stored (on the worker) and consulted by [`ImageRef::data_url`]
+/// (on the egui thread), so a picture read this session never touches the disk
+/// again. Bounded so reading many images does not pin them all; the least
+/// recently used goes first.
+static DATA_URLS: OnceLock<Mutex<DataUrls>> = OnceLock::new();
+
+/// At most this many encoded images are kept. Each is capped at
+/// [`MAX_IMAGE_BYTES`], so the cache stays within a few tens of MiB.
+const MAX_CACHED_IMAGES: usize = 16;
+
+#[derive(Default)]
+struct DataUrls {
+    entries: HashMap<String, (String, u64)>,
+    tick: u64,
+}
+
+impl DataUrls {
+    fn get(&mut self, id: &str) -> Option<String> {
+        self.tick = self.tick.wrapping_add(1);
+        let tick = self.tick;
+        let (url, seen) = self.entries.get_mut(id)?;
+        *seen = tick;
+        Some(url.clone())
+    }
+
+    fn insert(&mut self, id: String, url: String) {
+        self.tick = self.tick.wrapping_add(1);
+        self.entries.insert(id, (url, self.tick));
+        if self.entries.len() > MAX_CACHED_IMAGES {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, seen))| *seen)
+                .map(|(id, _)| id.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+}
+
+fn data_url_cache() -> &'static Mutex<DataUrls> {
+    DATA_URLS.get_or_init(|| Mutex::new(DataUrls::default()))
+}
+
+fn poison_guard<T>(poisoned: std::sync::PoisonError<T>) -> T {
+    poisoned.into_inner()
 }
 
 /// Where stored images live. Created on demand by [`save`].
@@ -124,6 +196,13 @@ pub fn save_in(
 
     std::fs::write(image.path_in(dir), bytes)
         .map_err(|error| AgentError::from_io("Failed to store an image", error))?;
+
+    // Warm the encoding cache now, on the worker, so the egui thread never reads
+    // this file back when it replays the conversation.
+    data_url_cache()
+        .lock()
+        .unwrap_or_else(poison_guard)
+        .insert(image.id.clone(), data_url_from(bytes, media_type));
 
     Ok(image)
 }
@@ -447,6 +526,40 @@ mod tests {
             data_url_from(&bytes, "image/png"),
             "data:image/png;base64,iVBORw0KGgo="
         );
+    }
+
+    #[test]
+    fn a_stored_image_is_encoded_without_reading_the_file_back() {
+        let dir = tempfile::tempdir().expect("a temp directory is available");
+        let bytes = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let image = save_in(dir.path(), &bytes, "image/png", None, 1, 1).expect("the image stores");
+
+        // Storing warmed the cache, so the encoding survives even once the file
+        // is gone — which is what keeps a send from blocking on the disk.
+        std::fs::remove_file(image.path_in(dir.path())).expect("the file removes");
+        assert_eq!(
+            image.data_url().expect("the cache serves it"),
+            data_url_from(&bytes, "image/png")
+        );
+    }
+
+    #[test]
+    fn the_data_url_cache_evicts_the_least_recently_used() {
+        let mut cache = DataUrls::default();
+        for i in 0..MAX_CACHED_IMAGES {
+            cache.insert(format!("id{i}"), format!("url{i}"));
+        }
+
+        // Touch the oldest so it is no longer the least recently used.
+        assert_eq!(cache.get("id0"), Some("url0".to_string()));
+        cache.insert("overflow".to_string(), "url".to_string());
+
+        assert_eq!(
+            cache.get("id0"),
+            Some("url0".to_string()),
+            "the touched entry survives"
+        );
+        assert_eq!(cache.get("id1"), None, "the least recently used is evicted");
     }
 
     #[test]

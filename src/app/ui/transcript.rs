@@ -1,6 +1,8 @@
 //! 转录区和渲染相关
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use eframe::egui;
@@ -129,7 +131,11 @@ impl App {
         let mut requests = Vec::new();
         {
             let steps = &self.sessions[index].steps;
+            // Split the borrow: `steps` reads the session, `cache` writes the
+            // render cache. They are disjoint fields of `self`.
+            let cache = &mut self.render_cache;
             for (step_index, step) in steps.iter().enumerate() {
+                let signature = render_signature(step, bucket);
                 match step {
                     Step::Assistant { text }
                     | Step::Notice { text }
@@ -138,12 +144,14 @@ impl App {
                             session: session_id,
                             step: step_index,
                         };
-                        let fp = render_cache::fingerprint((text, bucket));
-                        match self.render_cache.rendered(&key, fp) {
+                        let fp = cache.fingerprint_for(&key, signature, || {
+                            render_cache::fingerprint((text.as_str(), bucket))
+                        });
+                        match cache.rendered(&key, fp) {
                             Some(nodes) => {
                                 rendered.message.insert((session_id, step_index), nodes);
                             }
-                            None if !self.render_cache.was_requested(&key, fp) => {
+                            None if !cache.was_requested(&key, fp) => {
                                 requests.push(PendingRender::Message {
                                     key,
                                     fp,
@@ -165,15 +173,17 @@ impl App {
                             session: session_id,
                             call_id: call_id.clone(),
                         };
-                        let fp = render_cache::fingerprint((
-                            tool_fingerprint(name, arguments, result.as_ref()),
-                            bucket,
-                        ));
-                        match self.render_cache.rendered(&key, fp) {
+                        let fp = cache.fingerprint_for(&key, signature, || {
+                            render_cache::fingerprint((
+                                tool_fingerprint(name, arguments, result.as_ref()),
+                                bucket,
+                            ))
+                        });
+                        match cache.rendered(&key, fp) {
                             Some(nodes) => {
                                 rendered.tool.insert((session_id, call_id.clone()), nodes);
                             }
-                            None if !self.render_cache.was_requested(&key, fp) => {
+                            None if !cache.was_requested(&key, fp) => {
                                 requests.push(PendingRender::Tool {
                                     key,
                                     fp,
@@ -189,6 +199,7 @@ impl App {
                     _ => {}
                 }
             }
+            cache.prune();
         }
         for request in requests {
             self.dispatch_render(request);
@@ -242,6 +253,42 @@ impl App {
             .unwrap_or(0)
             + 1
     }
+}
+
+/// A cheap proxy for the inputs a step's render depends on.
+///
+/// It changes whenever the content the renderer sees changes, so
+/// [`App::collect_rendered`] can reuse a step's fingerprint instead of hashing
+/// it again. It hashes only lengths — no allocation, no JSON — which is the
+/// whole point: the real fingerprint has to serialise tool arguments and
+/// results, and doing that for every step on every frame was the cost.
+///
+/// It is faithful because of how steps mutate: an assistant or notice text is
+/// only ever appended to (its length changes), and a tool's result is only ever
+/// set once (`None` → `Some`, which the `None` arm distinguishes). The layout
+/// width bucket is folded in so a resize re-fingerprints everything.
+fn render_signature(step: &Step, bucket: u32) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bucket.hash(&mut hasher);
+    match step {
+        Step::Assistant { text } | Step::Notice { text } | Step::HostMessage { text } => {
+            text.len().hash(&mut hasher);
+        }
+        Step::Tool { name, result, .. } => {
+            name.len().hash(&mut hasher);
+            match result {
+                Some(result) => {
+                    result.output.len().hash(&mut hasher);
+                    result.hunks.len().hash(&mut hasher);
+                    result.images.len().hash(&mut hasher);
+                    result.duration_ms.hash(&mut hasher);
+                }
+                None => 0u8.hash(&mut hasher),
+            }
+        }
+        _ => {}
+    }
+    hasher.finish()
 }
 
 /// Renders one transcript step.
